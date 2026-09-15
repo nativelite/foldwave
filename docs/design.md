@@ -301,6 +301,7 @@ Candidates, each proven by benchmark before it ships:
 | Rendering | Vulkan (§8.6) |
 | Local AI: summaries, error clustering, embeddings for semantic search, explaining a failed block | out-of-process model server |
 | Bulk scans over history the index can't answer: substring, regex, highlighting | Vulkan compute (vendor-neutral), CUDA optional |
+| **Index construction** over log segments (trigram build), continuous and batchable | Vulkan compute, CUDA optional |
 | Compressing and decompressing cold log segments | our own compute kernels, measured against CPU |
 | Colour and highlight passes over large visible regions, and diff rendering | Vulkan compute |
 | Image output in panes (sixel/kitty-style images) | decode and scale on the GPU |
@@ -316,6 +317,16 @@ Candidates, each proven by benchmark before it ships:
   - The index answers most queries on the CPU.
   - GPU scanning stays only if an end-to-end benchmark (transfer included)
     beats a multithreaded CPU scan.
+- **Index construction is the strongest new candidate** (added 2026-09-15).
+  - The indexer trigram-indexes every byte of every pane's log, continuously, at
+    the §4 throughput target — a steady multi-core load landing exactly when the
+    agents have already taken the CPU (§8.7b).
+  - It is bulk, batchable and latency-tolerant: nothing waits on it, so a
+    transfer hop costs nothing the user can feel. That is the opposite of the
+    bulk-search case, where transfer decides the answer.
+  - Same rule as everything else here: it ships only if an end-to-end benchmark
+    beats the multithreaded CPU build while leaving frame time inside §4
+    (experiment E3, §8.7b).
 - **If GPU scanning is kept:** CUDA through the Driver API (`nvcuda.dll` /
   `libcuda.so`, both installed with the driver) with prebuilt kernels, so
   nothing NVIDIA is redistributed. Vulkan compute for AMD/Intel, Metal on macOS,
@@ -324,12 +335,76 @@ Candidates, each proven by benchmark before it ships:
   and CUDA for parsing, input or rendering.
 - **Rule:** CUDA is one optional backend, detected at runtime, never required.
 
+### 8.7b Work placement: what can and cannot move off the CPU
+
+**Founder observation (2026-09-15):** the CPU sits at 80–99% while the GPU
+reads 0–4%. The instinct is right — the silicon is idle — but offload has to
+be aimed at work that is genuinely GPU-shaped, and most of what pins the CPU on
+an agentic machine is not.
+
+*Measured while writing this section (reference machine, 2026-09-15):*
+`nvidia-smi` reported **0% GPU utilization and 1975 MiB of 8192 MiB used**, while
+two runaway `find / -iname ... -path *tree-sitter-rust*` processes left over from
+an earlier agent session had burned **6.85 and 6.82 CPU-hours** since 10:39,
+pinning 2 of 16 logical cores and thrashing the filesystem. The machine was not
+CPU-bound by work a GPU could absorb; it was CPU-bound by a bug that nothing
+surfaced. That is an argument for per-pane resource accounting (§8.7), not for
+GPU compute.
+
+| Work | Placement | Why |
+| --- | --- | --- |
+| Agent processes, compilers, test runs (`rustc`, `node`, `pytest`) | **CPU, permanently** | Not ours to move, and not data-parallel. Nothing offloads `rustc` to a GPU. Our duty is to *not add* to the load (§8.8) and to make runaway work visible (§8.7) |
+| Local AI over agent output | **GPU, out of process** | The largest genuine CPU→GPU transfer available: on the GPU it costs ~0 CPU, on the CPU it would take 8–16 threads |
+| Index construction over log segments | **GPU candidate, measure** | Bulk, batchable, latency-tolerant, embarrassingly data-parallel, and it runs continuously *while* agents already own the CPU. The best-shaped non-AI candidate (§8.7a) |
+| Bulk unindexed scans | **GPU spike, measure** | Transfer-bound below a threshold; see [`compute.md`](compute.md) |
+| Damage/diff and colour passes over large visible regions | **GPU, small win** | Data-parallel but small next to the rows above |
+| Glyph rasterization | **CPU, cached** | One cost per glyph, then it lives in the atlas. Only a large CJK font load makes it interesting |
+| Cold-segment compression | **CPU first** | [`compute.md`](compute.md) verdict; revisit only if measured |
+| VT parsing | **CPU, decided** | A sequential, branchy state machine. 16 panes is 16-way parallelism; a GPU wants thousands of threads. Transfer alone would exceed the parse cost |
+| Line-index / newline scanning | **CPU, decided** | Data-parallel, but CPU SIMD does it at tens of GB/s — PCIe transfer would dominate |
+| Input handling | **CPU, decided** | Already sub-millisecond; any GPU hop makes it worse |
+
+**The rule this yields:** the goal is not to raise GPU utilization. It is that
+**foldwave adds near-zero CPU to a machine the agents have already taken.** GPU
+offload is one way to get there. Not doing the work at all (hidden panes keep no
+live screen, §8.2) and backing off under pressure (§8.8) are the others, and
+they are cheaper.
+
+Every row marked *measure* follows the §8.7a rule: a CPU path, a GPU path, and a
+benchmark that picks between them on this machine, right now.
+
+**Experiment E3: CPU attribution (part of M0).** Where does the CPU actually go
+during a representative agentic session on the reference machine?
+
+| Step | Measure |
+| --- | --- |
+| Baseline | A representative session (N agents building, testing, emitting output), CPU time attributed per process tree: agents, compilers, shells, and foldwave itself |
+| foldwave internals | Within foldwave, CPU split by stage: pty read, parse, log write, index build, render, governor |
+| Under flood | The same during the §4 throughput load, to find which stage grows fastest |
+| Offload trial | Index construction moved to the GPU: CPU seconds returned, and the frame-time cost measured against E1's contention numbers ([`compute.md`](compute.md)) |
+
+Output: a table saying what share of a pinned CPU foldwave is responsible for,
+and which stage is worth moving. Until E3 runs, the *measure* rows above stay
+proposals.
+
 ### 8.8 The resource governor
-- Inputs: available memory and commit, pane RSS (job/cgroup), disk write
-  latency, frame time, CPU load, which panes are visible and focused.
+**CPU pressure is the first input, not one of many.** On an agentic machine the
+agents have already taken the CPU (§8.7b, measured). The governor's primary job
+is to keep foldwave's own cost near zero under that load; balancing the GPU comes
+second. Earlier drafts of this section had it the other way round.
+
+- Inputs, in priority order: **CPU pressure** (load per core, run-queue depth,
+  and foldwave's own share of it), then available memory and commit, pane RSS
+  (job/cgroup), disk write latency, frame time, and which panes are visible and
+  focused.
 - Outputs: RAM budgets per pane, flush cadence, how many parse workers, frame
-  rate per pane, whether a hidden pane keeps a live screen, build or agent
+  rate per pane, whether a hidden pane keeps a live screen, **whether index
+  construction runs on the CPU, runs on the GPU, or waits**, build or agent
   limits, and GPU time shared between rendering and compute.
+- **Under CPU pressure, shed in this order:** stop keeping live screens for
+  hidden panes; move index construction to the GPU or defer it; lower background
+  pane frame rates; lengthen the flush cadence; cut parse workers. The focused
+  pane's input and frames are never traded.
 - How much compute slows rendering on a shared GPU is **unknown**: no official
   guidance exists, so experiment E1 in `compute.md` measures it and sets the
   governor's rule.
@@ -417,7 +492,7 @@ One concern each; names are placeholders.
 
 | Milestone | Deliverable | Proof |
 | --- | --- | --- |
-| **M0 Harness** | throughput and latency benchmark: N panes of recorded agent output, timestamped key echo, frame timing, RSS, disk rate. vtebench (MIT/Apache) supplies workloads, but it measures only PTY read speed, not latency or frames, so it can't be the harness. Includes experiments E1, GPU contention (`compute.md`), and E2, built-in console host vs OpenConsole (§11) | a baseline table for atrium today and for 1–2 existing terminals; the E1 contention table on the RTX 3070 |
+| **M0 Harness** | throughput and latency benchmark: N panes of recorded agent output, timestamped key echo, frame timing, RSS, disk rate. vtebench (MIT/Apache) supplies workloads, but it measures only PTY read speed, not latency or frames, so it can't be the harness. Includes experiments E1, GPU contention (`compute.md`), E2, built-in console host vs OpenConsole (§11), and **E3, CPU attribution** (§8.7b) | a baseline table for atrium today and for 1–2 existing terminals; the E1 contention table on the RTX 3070; the E3 attribution table that says which stage is worth offloading |
 | **M1 Headless core** | `panelog` + fast parser + `vterm` checkpoints, driven by the harness with no UI | throughput and history targets met headless |
 | **M2 atrium adopts it** | unbounded history, search and crash replay inside atrium | atrium benchmarks don't regress; replay after a kill |
 | **M3 Renderer spike** | one platform (Windows, D3D11), glyph atlas, damaged-row redraw, CPU fallback | frame time and latency under flood vs. baseline |
@@ -439,6 +514,7 @@ Founder answers of 2026-09-15.
 | 6 | Console host | **Decide by measurement (experiment E2).** Founder wants the most performant option | Built-in host vs bundled OpenConsole, below. Either way agents run headless over pipes where they document it, and Linux/macOS use ptys |
 | 7 | GPU compute | **Use the GPU wherever it helps**, balanced across SSD, RAM, GPU and CPU | Every GPU path gets a CPU path and a benchmark; §8.7a lists the candidates; local AI stays out of process |
 | 8 | Targets | **Confirmed**, plus **fault isolation**: a crash recovers without taking the ship down | §4 targets; §8.8a design |
+| 9 | Leveraging the whole machine | **Aim offload at work that is GPU-shaped, not at the utilization number.** The governor's first input is CPU pressure | Founder observation 2026-09-15: CPU 80–99% while the GPU idles. §8.7b places every stage and names what will never move; index construction (§8.7a) is the new GPU candidate; E3 measures it |
 
 **Experiment E2: built-in console host vs OpenConsole (part of M0).**
 

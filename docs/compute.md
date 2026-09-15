@@ -24,6 +24,10 @@ work on AMD, Intel and Apple GPUs and with no GPU.
 - The founder's machine has an **NVIDIA GeForce RTX 3070 with 8 GB** of video memory, driver 616.92 (`nvidia-smi`).
 - `C:\Windows\System32\nvcuda.dll` is present, and the display-driver package also contains `nvptxJitCompiler64.dll`.
 - No CUDA Toolkit is installed: no `CUDA_PATH`, no `nvrtc*.dll`.
+- **Hybrid graphics, confirmed 2026-09-15:** an Intel integrated GPU runs alongside the 3070 (`IntelGraphicsSoftware` resident). The Optimus caveat below — D3D starting before CUDA can put rendering on the integrated GPU and break interop — applies to the reference machine itself, not only to laptops.
+- **Idle snapshot (2026-09-15, measured):** `nvidia-smi` reported **0% GPU utilization, 1975 MiB of 8192 MiB used**, while the CPU carried two runaway `find` processes at 6.8 CPU-hours each ([design §8.7b](design.md)).
+- **Trust `nvidia-smi`, not Task Manager,** for utilization: Task Manager's GPU figure defaults to the 3D engine and under-reports compute.
+- **Shader toolchain (measured 2026-09-15, `C:\Windows\System32`):** `vulkan-1.dll` and `d3dcompiler_47.dll` are present; `dxcompiler.dll` is not. So D3D11 can compile HLSL at runtime from a system DLL, while a Vulkan backend needs SPIR-V compiled ahead of time and checked in — a build-time step, not a runtime dependency. Recorded for the M3 renderer decision ([design §8.6](design.md)); it does not change the Vulkan-first recommendation.
 
 ## CUDA without the toolkit: the Driver API
 
