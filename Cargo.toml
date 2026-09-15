@@ -1,0 +1,18 @@
+# foldwave workspace.
+#
+# nativelite core rule: ZERO third-party dependencies, everywhere in this tree.
+# The dependency guard (tools/dep_guard.py) enforces it across every member.
+[workspace]
+resolver = "2"
+members = ["crates/resmon"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.70"
+repository = "https://github.com/nativelite/foldwave"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

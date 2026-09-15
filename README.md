@@ -3,8 +3,9 @@
 A GPU-rendered, high-throughput terminal for agentic work: many agents with heavy
 output, steered by one human.
 
-**Status: design.** There is no code yet. The design lives in [`docs/`](docs/),
-and building happens with [atrium](https://github.com/nativelite/atrium) fleets.
+**Status: design, with M0 underway.** The design lives in [`docs/`](docs/); the
+first code is the M0 measurement harness in [`crates/`](crates/). Building
+happens with [atrium](https://github.com/nativelite/atrium) fleets.
 
 One of three products that each own a key piece of agentic development:
 
@@ -24,6 +25,20 @@ One of three products that each own a key piece of agentic development:
 
 The competitive landscape for the whole suite is in
 [nativelite/ops `roadmap/competitive-landscape.md`](https://github.com/nativelite/ops/blob/main/roadmap/competitive-landscape.md).
+
+## Crates
+
+| Crate | Concern | License |
+| --- | --- | --- |
+| [`crates/resmon`](crates/resmon) | attribute CPU, RAM, disk I/O and GPU use to process trees (M0 experiment E3) | MIT |
+
+## Develop
+
+```
+python dev.py check     # dependency guard + docs gate + cargo fmt --check + tests
+```
+
+There is no CI, so this local check is the sole gate and runs before every push.
 
 ## Principles (from the design)
 
