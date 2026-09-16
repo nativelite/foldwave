@@ -86,6 +86,50 @@ reader thread): key echo p50 0.4–0.6 ms against 0.1 ms for bare `cmd`, idle CP
 1–2% of a core. atrium keeps no history on disk, and nothing like the
 throughput target has been measured.
 
+### 4.1 Measured ceilings on the reference machine
+
+*Measured 2026-09-15/16, release builds, M0 harness and direct probes. These are
+what each leg can do in isolation, so a plan for using them together starts from
+facts rather than intuition.*
+
+| Leg | Ceiling | Against the 273 MiB/s aggregate target |
+| --- | --- | --- |
+| RAM, `memcpy`, 1 core | 23,235 MiB/s | 85× |
+| Transport: headless pipe, 16 panes | ≥ 1854 MiB/s | 6.8× (a floor: generator-bound, §8.9) |
+| Parse: `vterm` full emulation, 16 threads | 723 MiB/s | 2.6× |
+| Storage: durable write, C: SK hynix NVMe | 660 MiB/s, fsync p50 1.38 ms | 2.4× |
+| Storage: durable write, E: Samsung 990 PRO NVMe | 520 MiB/s, fsync p50 2.69 ms | 1.9× |
+| Transport: ConPTY, 16 panes | 139 MiB/s | **0.51× — misses** |
+| Storage: durable write, D: WD 8 TB **spinning disk** | 124 MiB/s, fsync p50 26.5 ms | **0.45× — misses** |
+| GPU | not yet measured (experiment E1, [`compute.md`](compute.md)) | — |
+
+**What this says about the architecture:**
+
+- **The §4 targets are reachable, but the margin is thin.** With agents headless
+  and the log on a real SSD, every leg clears 273 MiB/s — parse by 2.6× and
+  storage by about 2×. Nothing here has orders of magnitude to spare.
+- **Parse and storage are the binding pair,** within 1.4× of each other, and both
+  are far below the transport. RAM is irrelevant as a constraint. So the
+  engineering effort belongs in the parser and the log, not in moving bytes.
+- **This is the quantified case for §8.7b's index-construction offload.** The CPU
+  is the scarce resource: 723 MiB/s aggregate is *parsing alone*, with every
+  core busy. A background indexer would take those same cores. Moving it to a
+  GPU that measured 0% utilization is no longer an aesthetic preference about
+  idle silicon — it is the only place the work can go without taking cores away
+  from parsing.
+- **Buffered write figures are meaningless here.** Both NVMe drives and the
+  spinning disk all reported ≈3.6 GB/s buffered, because that is the OS page
+  cache, not the device. Only the durable (`fsync`) numbers above are real, and
+  they differ by 5× in throughput and 19× in latency.
+- **Parsing scales sublinearly:** 111 MiB/s on one thread, 723 on sixteen, so
+  6.5× for 16× the threads, with per-thread throughput falling from 111 to 45
+  MiB/s. Budget cores accordingly; do not assume linear fan-out.
+- **Counterintuitive, unexplained:** the modest OEM boot NVMe (C:) beat the
+  Samsung 990 PRO (E:) on both durable throughput and fsync latency. Not
+  investigated. It does not change any decision — both are in the same band, and
+  the outlier that matters is the spinning disk — but it is recorded rather than
+  explained away.
+
 ## 5. Principles
 
 1. **Nothing slow on the input or render path.** Every blocking source gets its
@@ -238,6 +282,14 @@ Per pane, an append-only log, in segments:
   reads first; memory-mapping needs our own FFI and is a measured decision).
 - Crash safety: append-only, and the index and checkpoints are rebuildable from
   data segments.
+- **Where the log lives is a measured decision, not the working directory.**
+  On the reference machine the repo sits on a spinning disk whose fsync p50 is
+  26.5 ms against 1.4–2.7 ms for either NVMe, and whose durable throughput is
+  124 MiB/s against 520–660 (§4.1). A log placed next to the project would miss
+  the §4 target on its own. So the log writer **probes candidate locations for
+  durable write latency at startup and chooses**, records which it picked, and
+  surfaces it; the governor's existing write-latency watch (§8.8) then keeps it
+  honest. Never assume the current directory is fast.
 
 ### 8.5 Search and queries (CPU + SSD)
 - A background indexer over data segments: an n-gram (e.g. trigram) index per
