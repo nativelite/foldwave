@@ -46,10 +46,10 @@ key echo through `cmd`, 25 ms between keys
   n=120 p50=0.06ms p90=0.09ms p99=11.74ms (min 0.02ms max 11.81ms mean 0.26ms)
 ```
 
-Against §4: per-pane throughput is **12 MiB/s versus the 17.1 MiB/s** a
-1 GB/min pane needs, so ConPTY is roughly 70% of target. Key echo p50 is
-comfortably inside the 1 ms target even under the flood; **p99 is not**, for a
-reason that is not ours to fix — see below.
+Key echo p50 is comfortably inside the §4 1 ms target even under the flood;
+**p99 is not**, for a reason that is not ours to fix — see the coalescing tick
+below. For where the throughput figure sits against §4, see the transport table
+next: this run used ConPTY, which is the slow path.
 
 ## Transport: ConPTY vs headless pipes
 
