@@ -106,6 +106,7 @@ const RULES: &[(&str, Class)] = &[
     // The terminal under test, and the terminals we benchmark against.
     ("foldwave", Class::Foldwave),
     ("resmon", Class::Foldwave),
+    ("fwbench", Class::Foldwave),
     ("atrium", Class::Foldwave),
     ("windowsterminal", Class::Foldwave),
     ("alacritty", Class::Foldwave),
@@ -272,6 +273,7 @@ mod tests {
     #[test]
     fn classify_covers_each_class() {
         assert_eq!(classify("foldwave.exe"), Class::Foldwave);
+        assert_eq!(classify("fwbench.exe"), Class::Foldwave);
         assert_eq!(classify("claude.exe"), Class::Agent);
         assert_eq!(classify("rustc.exe"), Class::Compiler);
         assert_eq!(classify("bash.exe"), Class::Shell);

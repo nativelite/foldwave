@@ -122,6 +122,9 @@ pub fn render(at: &Attribution, top_trees: usize) -> String {
     out.push_str(
         "note: disk-read/disk-write count every read and write a process makes, including\n      pipes, sockets and console handles, not only disk.\n",
     );
+    out.push_str(
+        "note: a process that started AND exited inside the window is not in the closing\n      snapshot, so its cost is not counted here. Short-lived work (compiler\n      invocations, one-shot commands, flood panes) is therefore undercounted.\n",
+    );
     out
 }
 
@@ -246,6 +249,12 @@ mod tests {
     fn report_always_carries_the_io_caveat() {
         let text = render(&attribution(), 0);
         assert!(text.contains("not only disk"));
+    }
+
+    #[test]
+    fn report_always_admits_it_misses_processes_that_exited() {
+        let text = render(&attribution(), 0);
+        assert!(text.contains("started AND exited inside the window"));
     }
 
     #[test]

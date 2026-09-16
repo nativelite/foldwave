@@ -31,6 +31,7 @@ The competitive landscape for the whole suite is in
 | Crate | Concern | License |
 | --- | --- | --- |
 | [`crates/resmon`](crates/resmon) | attribute CPU, RAM, disk I/O and GPU use to process trees (M0 experiment E3) | MIT |
+| [`crates/fwbench`](crates/fwbench) | M0 harness: pty pane floods, key-echo latency, resource attribution | MIT |
 
 ## Develop
 

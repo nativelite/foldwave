@@ -1,0 +1,21 @@
+[package]
+name = "nativelite-fwbench"
+version = "0.1.0"
+description = "foldwave M0 harness: drive N pty panes of agent-like output and measure throughput, key-echo latency and resource attribution."
+license = "MIT"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# nativelite rule: zero THIRD-PARTY dependencies; org crates only.
+[dependencies]
+pty = { package = "nativelite-pty", version = "0.4.1", path = "../../../pty-rs" }
+resmon = { package = "nativelite-resmon", version = "0.1.0", path = "../resmon" }
+
+[lib]
+name = "fwbench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fwbench"
+path = "src/main.rs"

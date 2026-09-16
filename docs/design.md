@@ -440,6 +440,42 @@ take the ship down.
 ### 8.9 Platform notes
 - **Windows:** console apps need ConPTY, so a console host always sits between
   us and the agent CLI. Measured consequences:
+  - **the console coalesces output on a ≈15.2 ms tick** (*measured 2026-09-15,
+    M0 harness, reference machine*). Key-echo latency through `cmd` follows
+    `p50 ≈ 15.16 ms – gap` for keystroke gaps below the tick, and collapses to
+    ≈0.1 ms once the gap clears it:
+
+    | Gap between keys | p50 | p90 |
+    | --- | --- | --- |
+    | 0 ms | 15.52 ms | 16.12 ms |
+    | 1 ms | 14.10 ms | 14.62 ms |
+    | 5 ms | 10.19 ms | 10.65 ms |
+    | 8 ms | 7.15 ms | 7.65 ms |
+    | 10 ms | 5.16 ms | 5.70 ms |
+    | 13 ms | 2.16 ms | 2.65 ms |
+    | 15 ms | 0.14 ms | 0.42 ms |
+    | 16 ms | 0.06 ms | 0.17 ms |
+
+    n=60 per row, `fwbench echo`, timestamped on arrival on a reader thread.
+
+    Consequences:
+    - The 0.1 ms "bare `cmd`" figure in §4 is real, but only at **human typing
+      cadence**, where the console is idle between keys. It is not a floor that
+      survives fast input.
+    - Input arriving faster than the tick – pasted text, a held key, an agent
+      driving a TUI – pays up to a full tick. No terminal on top of ConPTY can
+      undercut this, because the wait happens before we ever see the bytes.
+    - It shows up in the tail even at a comfortable cadence: at a 25 ms gap,
+      p50 was 0.06 ms but p99 was 11.74 ms (*measured, under an 8-pane flood*).
+      **The §4 p99 < 5 ms target is therefore not reachable through ConPTY**,
+      only on the headless and pty transports.
+    - Which strengthens the headless-over-pipes preference in the transport
+      table below: it is not only the fastest path, it is the only one without
+      this floor.
+    - **Not yet isolated:** whether the tick is ConPTY's own render timer, the
+      Windows scheduler's ≈15.6 ms timer resolution, or `cmd`'s input
+      handling. Experiment E2 (§11) should now answer a sharper question:
+      does OpenConsole show the same period?
   - keep every pane's output drained at all times, or its input stalls
   - spawn suspended so a pane joins its job before it runs
 
@@ -493,6 +529,7 @@ One concern each; names are placeholders.
 | Milestone | Deliverable | Proof |
 | --- | --- | --- |
 | **M0 Harness** | throughput and latency benchmark: N panes of recorded agent output, timestamped key echo, frame timing, RSS, disk rate. vtebench (MIT/Apache) supplies workloads, but it measures only PTY read speed, not latency or frames, so it can't be the harness. Includes experiments E1, GPU contention (`compute.md`), E2, built-in console host vs OpenConsole (§11), and **E3, CPU attribution** (§8.7b) | a baseline table for atrium today and for 1–2 existing terminals; the E1 contention table on the RTX 3070; the E3 attribution table that says which stage is worth offloading |
+| M0 status (2026-09-15) | **Partly delivered.** `resmon` (four-resource attribution, E3) and `fwbench` (pty pane flood + key-echo latency) are in `crates/`. First numbers on the reference machine: 8 panes sustained **94.9 MiB/s** aggregate (≈12 MiB/s per pane, against a 17.1 MiB/s per-pane target), key echo under that flood **p50 0.06 ms / p99 11.74 ms**. Still to build: frame timing (needs M3), E1, E2, and a disk throughput/latency probe | see `crates/fwbench/README.md` |
 | **M1 Headless core** | `panelog` + fast parser + `vterm` checkpoints, driven by the harness with no UI | throughput and history targets met headless |
 | **M2 atrium adopts it** | unbounded history, search and crash replay inside atrium | atrium benchmarks don't regress; replay after a kill |
 | **M3 Renderer spike** | one platform (Windows, D3D11), glyph atlas, damaged-row redraw, CPU fallback | frame time and latency under flood vs. baseline |
@@ -523,6 +560,7 @@ Founder answers of 2026-09-15.
 | Hosts compared | Windows' built-in `conhost.exe` (10.0.26100.1 on the reference machine) and `OpenConsole.exe` from Windows Terminal 1.24, already installed there (measured 2026-09-15) |
 | Measured through each | flood throughput, key echo p50/p99 during a flood, and console-host CPU and memory |
 | Cost of testing OpenConsole | the standard pseudo-console call always starts the built-in host, so it needs our own launch code, inspired by Windows Terminal's `winconpty` (MIT) |
+| Sharpened by M0 (2026-09-15) | the built-in host coalesces output on a ≈15.2 ms tick (§8.9, measured). The first question for OpenConsole is whether it shows the same period, since that tick, not our code, sets the p99 floor for every ConPTY pane |
 | Decision rule | bundle it (optional, falling back to the built-in host) only if it is clearly better on throughput or p99 latency; otherwise don't |
 
 **Naming: foldwave (founder, 2026-09-15).**
