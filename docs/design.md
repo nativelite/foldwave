@@ -130,6 +130,9 @@ each leg does in isolation, so a plan for using them together starts from facts.
 - **Ignore buffered write figures.** Every drive tested reported ≈3.6 GB/s
   buffered, because that is the OS page cache, not the device. Only durable
   (`fsync`) figures are real.
+- **These are ceilings measured alone; how they compose is §8.0.** Used naively
+  they do not add up. The pattern that keeps parsing off the ingest path — and
+  the core budget that follows from it — is derived there.
 
 ## 5. Principles
 
@@ -230,6 +233,159 @@ Lessons carried over from atrium (each *measured* this session):
                     └─► indexer (background): full-text + marks, across panes
 ```
 
+### 8.0 How the four legs compose
+
+*§4.1 measures each leg **alone**. This section is the pattern that uses them
+**together**: what runs where, what is allowed to block what, and what the whole
+thing costs at the §4 target of 273 MiB/s (16 panes, 17.1 MiB/s each). Every
+constant below is a measured §4.1 number; everything derived from them is marked
+**derived**, and every assumption is marked **unmeasured**. Nothing here has been
+measured in composition yet — experiments E4 and E5 below are exactly that.*
+
+**The invariant the rest of this section falls out of:**
+
+> **The log is the truth. Screens, indexes and frames are caches of it.**
+
+A screen can be rebuilt from a checkpoint plus log bytes. An index can be rebuilt
+by re-reading segments. A frame can be drawn again. None of the three is
+load-bearing for correctness, so each may be delayed, degraded or dropped
+independently — and **no derived stage may ever block ingest.** That single rule
+is what turns four legs into a pipeline instead of a chain.
+
+**1. The ingest path is two legs, and neither of them is the CPU.**
+
+A byte is safe once it is in RAM and on its way to the log. Parsing is not on
+that path (§8.1: raw bytes are logged *before* parsing), so the ingest ceiling is
+the slowest of the legs that *are* on it:
+
+| Ingest leg | Ceiling | vs 273 MiB/s |
+| --- | --- | --- |
+| headless pipe transport | ≥ 1854 MiB/s | 6.8× |
+| RAM, one copy into a slab | 23,235 MiB/s | 85× |
+| **SSD, log append at a 16 MiB cadence** | **479 MiB/s** | **1.75×** |
+
+**Ingest is SSD-bound at 479 MiB/s — 1.75× the target — and the 723 MiB/s parse
+ceiling does not appear in the bound at all.** That is the whole trick: the
+binding pair of §4.1 stops being a pair, because only one of the two sits on the
+critical path.
+
+The measured flush optimum also explains its own ceiling, which is a good sign
+the number is real (**derived**):
+
+| | Fill 16 MiB | `fsync` p50 | writer duty p50 | `fsync` p99 | writer duty p99 |
+| --- | --- | --- | --- | --- | --- |
+| at the 273 MiB/s target | 58.6 ms | 26.7 ms | **46 %** | 47.3 ms | 81 % |
+| at the 479 MiB/s ceiling | 33.4 ms | 26.7 ms | 80 % | 47.3 ms | **142 % — over** |
+
+One dedicated writer thread sustains the target with the p99 still inside its
+budget, and saturates at exactly the rate we measured as the ceiling. It needs
+one segment filling and one in flight: **32 MiB of buffer**, against 64 GB.
+
+**2. Fan-out is free, so every consumer reads the same bytes.**
+
+Parsing, log writing, indexing and rendering all read the *same* slab; nothing is
+copied twice. Three concurrent consumers at target cost 819 MiB/s of read
+bandwidth — **3.5 % of a single core's memcpy rate** (**derived**). RAM is not a
+stage in the pipeline, it is the place the other three legs meet, and adding a
+consumer is nearly free. RAM is the only leg with orders of magnitude to spare
+(85×), and this is what we spend that headroom on.
+
+**3. The CPU parses what is *observed*, not what *arrives*.**
+
+§8.2 already says hidden panes keep no live screen. Priced out, that is the
+largest single lever in the design (**derived**, 16 panes at target, 4 visible):
+
+| Panes | Bytes/s | Work | CPU |
+| --- | --- | --- | --- |
+| 4 visible | 68.3 MiB/s | full VT parse | **under one core** at the measured 111 MiB/s single-thread rate |
+| 12 hidden | 204.8 MiB/s | structural scan only — line starts, marks | ~20 % of a core at an assumed 1 GiB/s scan (**unmeasured**) |
+
+**foldwave never parses 273 MiB/s, so the 723 MiB/s ceiling never binds.** We
+parse the visible fraction, which at 4 visible panes fits in roughly one core
+rather than the six-plus that full-parsing every pane would demand.
+
+**4. Checkpoint interval is the knob between pane-switch latency and write
+amplification.**
+
+The cost of not parsing a hidden pane is paid when someone looks at it: rebuild
+from the last checkpoint by replaying log bytes. For checkpoint interval `I` and
+the measured single-thread parse rate `p` = 111 MiB/s, rebuild ≈ `I / p`, so
+holding a pane switch to one 60 Hz frame gives (**derived**):
+
+`I ≤ 16 ms × 111 MiB/s` → **checkpoint every ≈1.8 MiB of pane output**, which at
+17.1 MiB/s per pane is one checkpoint per ≈104 ms.
+
+That is paid for in log traffic: at an **unmeasured** checkpoint size of 200 KiB
+it is 11 % write amplification, taking the log from 273 to ≈303 MiB/s — still
+inside the 479 MiB/s ceiling. Both constants in that trade are unmeasured, so the
+governor (§8.8) owns the interval and adapts it. The formula, not the number, is
+the design.
+
+**5. The GPU is never on the ingest path.**
+
+Everything placed on the GPU in §8.7b — index construction, bulk scans, damage
+passes — is re-derivable from the log and latency-tolerant. So a GPU stall (TDR,
+contention with rendering, a driver reset, §8.8a) degrades search or a frame; it
+can never stall ingest or lose a byte. This is a placement *rule*, not just a
+list: **work moves to the GPU only if losing the GPU entirely would cost nothing
+but time.**
+
+**6. The composed budget at the §4 target.**
+
+Every stage on its own threads and its own queue, nothing ever waiting on a
+device it does not own (**derived** — and the thing E5 exists to check):
+
+| Stage | Threads | Cost at 273 MiB/s |
+| --- | --- | --- |
+| pane readers | 16, blocking | a few % of one core in total (the copy is 1.2 %; syscall overhead **unmeasured**) |
+| log writer | 1, owns E: | 46 % duty |
+| parse, visible panes | 1–2 | ~68 MiB/s, under one core |
+| structural scan, hidden panes | shared | ~20 % of a core (**unmeasured**) |
+| renderer | 1 | GPU-bound |
+| indexer | GPU, or deferred | 0 on the CPU when offloaded (E1) |
+
+**≈3 of 16 logical cores at full target load.** That is §8.7b's rule — *foldwave
+adds near-zero CPU to a machine the agents have already taken* — put in numbers
+for the first time.
+
+**7. Backpressure is a choice of which cache to let go stale.**
+
+The shed order in §8.8 is not a list of tricks, it is this invariant applied.
+Each step drops a *cache*, never the truth, in increasing order of what the user
+notices: hidden-pane screens, then index construction, then background frame
+rates, then flush cadence, then parse workers. Ingest and the focused pane's
+input are never traded — the first is correctness, the second is the product.
+
+**What this is not yet.** The composition above is arithmetic over six numbers
+measured in isolation. Legs that do not interfere on paper routinely interfere in
+practice: the page cache, the memory controller and the Windows scheduler all get
+a vote. Two experiments settle it, and E4 feeds E5's parameters.
+
+**Experiment E4: the parse budget (part of M0).** §4.1 measured parsing at 1
+thread and at 16; §8.0 interpolates between them.
+
+| Step | Measure |
+| --- | --- |
+| Scaling curve | full VT parse at 1, 2, 4, 6, 8, 12, 16 threads — locate the knee, since the budget above assumes near-single-thread efficiency at 1–2 threads |
+| Structural scan | the hidden-pane path (line starts + marks, no state machine) in MiB/s per core — assumed ≥1 GiB/s above, never measured |
+| Checkpoint | serialized screen + parser state: its size in bytes, and the wall time to rebuild a screen from a checkpoint plus `I` bytes of log |
+
+Output: the real constants behind points 3 and 4, and therefore whether one core
+really does cover visible-pane parsing.
+
+**Experiment E5: the composed pipeline (part of M0).** The first measurement of
+the legs *running together* instead of one at a time.
+
+| Step | Measure |
+| --- | --- |
+| Composed rate | read + log + parse + scan concurrently, 16 panes, ramping past the predicted 479 MiB/s ceiling: where it actually breaks, and which leg breaks first |
+| Interference | each leg's solo rate re-measured while the others run — how much of §4.1 survives composition |
+| **One log stream or sixteen** | §8.4 specifies a log *per pane*, but the 479 MiB/s optimum was measured on **one** sequential stream with a single `fsync` cadence. Sixteen interleaved streams with sixteen cadences is unmeasured and may be far worse. Measure both; if a single device-level log with pane-tagged records wins, §8.4 changes, and per-pane line indexes and checkpoints stay separate files |
+| Latency under load | key-echo p50/p99 and pane-switch time while all of the above runs, against the §4 targets |
+
+Until E4 and E5 run, everything in §8.0 is **a proposal with arithmetic behind
+it**, not a measured result.
+
 ### 8.1 I/O (CPU)
 - One blocking reader thread per pane (`PtyReader`), a bounded inbox, one wake
   signal to the core. This is atrium's `events.rs`, proven.
@@ -266,7 +422,11 @@ Lessons carried over from atrium (each *measured* this session):
   pattern).
 
 ### 8.4 Storage (SSD)
-Per pane, an append-only log, in segments:
+Per pane, an append-only log, in segments — though **whether that is one
+log per pane or a single device-level log with pane-tagged records is open:** the
+479 MiB/s figure below was measured on a *single* sequential stream, and
+experiment E5 (§8.0) decides it.
+
 
 | Part | Content |
 | --- | --- |
@@ -648,7 +808,7 @@ One concern each; names are placeholders.
 | Milestone | Deliverable | Proof |
 | --- | --- | --- |
 | **M0 Harness** | throughput and latency benchmark: N panes of recorded agent output, timestamped key echo, frame timing, RSS, disk rate. vtebench (MIT/Apache) supplies workloads, but it measures only PTY read speed, not latency or frames, so it can't be the harness. Includes experiments E1, GPU contention (`compute.md`), E2, built-in console host vs OpenConsole (§11), and **E3, CPU attribution** (§8.7b) | a baseline table for atrium today and for 1–2 existing terminals; the E1 contention table on the RTX 3070; the E3 attribution table that says which stage is worth offloading |
-| M0 status (2026-09-15) | **Partly delivered.** `resmon` (four-resource attribution, E3) and `fwbench` (pane floods over ConPTY *and* headless pipes, key-echo latency) are in `crates/`. Headline numbers: 16 panes sustain **139 MiB/s over ConPTY** vs **1854 MiB/s over pipes** (13.3×), against a 273 MiB/s target; key echo under an 8-pane flood p50 **0.06 ms**, p99 **11.74 ms**. Still to build: frame timing (needs M3), E1, E2, and a disk throughput/latency probe | see `crates/fwbench/README.md` and §8.9 |
+| M0 status (2026-09-15) | **Partly delivered.** `resmon` (four-resource attribution, E3) and `fwbench` (pane floods over ConPTY *and* headless pipes, key-echo latency) are in `crates/`. Headline numbers: 16 panes sustain **139 MiB/s over ConPTY** vs **1854 MiB/s over pipes** (13.3×), against a 273 MiB/s target; key echo under an 8-pane flood p50 **0.06 ms**, p99 **11.74 ms**. Still to build: frame timing (needs M3), E1, E2, a disk throughput/latency probe, and **E4 and E5** (§8.0 — the parse budget, and the first measurement of the legs running composed rather than one at a time) | see `crates/fwbench/README.md` and §8.9 |
 | **M1 Headless core** | `panelog` + fast parser + `vterm` checkpoints, driven by the harness with no UI | throughput and history targets met headless |
 | **M2 atrium adopts it** | unbounded history, search and crash replay inside atrium | atrium benchmarks don't regress; replay after a kill |
 | **M3 Renderer spike** | one platform (Windows, D3D11), glyph atlas, damaged-row redraw, CPU fallback | frame time and latency under flood vs. baseline |
