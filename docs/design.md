@@ -68,8 +68,19 @@ across panes. That is this design's opening.
 
 ## 4. Targets (confirmed by the founder, 2026-09-15)
 
-Reference machine: the founder's Windows box (64 GB RAM, NVMe, RTX 3070 8 GB).
-Every target gets a reproducible benchmark before it is claimed.
+Reference machine (founder, confirmed 2026-09-16) — the four resources foldwave
+is built to use together:
+
+| Resource | Part |
+| --- | --- |
+| CPU | 16 logical cores |
+| RAM | 64 GB |
+| SSD | **Samsung 990 PRO 1 TB NVMe, drive `E:`** — the log lives here |
+| GPU | NVIDIA RTX 3070, 8 GB |
+
+The machine has other drives; they are not part of the target configuration and
+no target is stated against them. Every target gets a reproducible benchmark
+before it is claimed.
 
 | Area | Target |
 | --- | --- |
@@ -88,47 +99,37 @@ throughput target has been measured.
 
 ### 4.1 Measured ceilings on the reference machine
 
-*Measured 2026-09-15/16, release builds, M0 harness and direct probes. These are
-what each leg can do in isolation, so a plan for using them together starts from
-facts rather than intuition.*
+*Measured 2026-09-15/16, release builds, M0 harness and direct probes, against
+the §4 aggregate target of 273 MiB/s (16 panes at 1 GB/min each). These are what
+each leg does in isolation, so a plan for using them together starts from facts.*
 
-| Leg | Ceiling | Against the 273 MiB/s aggregate target |
+| Leg | Ceiling | vs target |
 | --- | --- | --- |
-| RAM, `memcpy`, 1 core | 23,235 MiB/s | 85× |
-| Transport: headless pipe, 16 panes | ≥ 1854 MiB/s | 6.8× (a floor: generator-bound, §8.9) |
-| Parse: `vterm` full emulation, 16 threads | 723 MiB/s | 2.6× |
-| Storage: durable write, C: SK hynix NVMe | 660 MiB/s, fsync p50 1.38 ms | 2.4× |
-| Storage: durable write, E: Samsung 990 PRO NVMe | 520 MiB/s, fsync p50 2.69 ms | 1.9× |
-| Transport: ConPTY, 16 panes | 139 MiB/s | **0.51× — misses** |
-| Storage: durable write, D: WD 8 TB **spinning disk** | 124 MiB/s, fsync p50 26.5 ms | **0.45× — misses** |
-| GPU | not yet measured (experiment E1, [`compute.md`](compute.md)) | — |
+| **RAM** — `memcpy`, 1 core | 23,235 MiB/s | 85× |
+| **CPU** — `vterm` full emulation, 16 threads | 723 MiB/s | 2.6× |
+| **SSD (E:)** — sustained log append, 16 MiB flush cadence | 479 MiB/s | 1.75× |
+| **GPU** — RTX 3070 | not yet measured (experiment E1, [`compute.md`](compute.md)) | — |
+| *transport:* headless pipe, 16 panes | ≥ 1854 MiB/s | 6.8× (a floor, §8.9) |
+| *transport:* ConPTY, 16 panes | 139 MiB/s | **0.51× — misses** |
 
 **What this says about the architecture:**
 
-- **The §4 targets are reachable, but the margin is thin.** With agents headless
-  and the log on a real SSD, every leg clears 273 MiB/s — parse by 2.6× and
-  storage by about 2×. Nothing here has orders of magnitude to spare.
-- **Parse and storage are the binding pair,** within 1.4× of each other, and both
-  are far below the transport. RAM is irrelevant as a constraint. So the
-  engineering effort belongs in the parser and the log, not in moving bytes.
-- **This is the quantified case for §8.7b's index-construction offload.** The CPU
-  is the scarce resource: 723 MiB/s aggregate is *parsing alone*, with every
-  core busy. A background indexer would take those same cores. Moving it to a
-  GPU that measured 0% utilization is no longer an aesthetic preference about
-  idle silicon — it is the only place the work can go without taking cores away
-  from parsing.
-- **Buffered write figures are meaningless here.** Both NVMe drives and the
-  spinning disk all reported ≈3.6 GB/s buffered, because that is the OS page
-  cache, not the device. Only the durable (`fsync`) numbers above are real, and
-  they differ by 5× in throughput and 19× in latency.
-- **Parsing scales sublinearly:** 111 MiB/s on one thread, 723 on sixteen, so
-  6.5× for 16× the threads, with per-thread throughput falling from 111 to 45
-  MiB/s. Budget cores accordingly; do not assume linear fan-out.
-- **Counterintuitive, unexplained:** the modest OEM boot NVMe (C:) beat the
-  Samsung 990 PRO (E:) on both durable throughput and fsync latency. Not
-  investigated. It does not change any decision — both are in the same band, and
-  the outlier that matters is the spinning disk — but it is recorded rather than
-  explained away.
+- **The §4 targets are reachable, and the margin is thin.** With agents headless,
+  every leg clears 273 MiB/s: CPU by 2.6×, the SSD by 1.75×. Nothing has orders
+  of magnitude to spare, and ConPTY misses outright.
+- **CPU and SSD are the binding pair,** within 1.5× of each other and far below
+  the transport. RAM is not a constraint at any point. Engineering effort
+  belongs in the parser and the log, not in moving bytes.
+- **This quantifies §8.7b's index-construction offload.** 723 MiB/s is *parsing
+  alone*, with all 16 threads busy. A background indexer would compete for
+  exactly those cores. Moving it to a GPU measured at 0% utilization is now the
+  only place that work can go without taking cores from parsing.
+- **Parsing scales sublinearly:** 111 MiB/s on one thread, 723 on sixteen — 6.5×
+  for 16× the threads, per-thread falling from 111 to 45 MiB/s. Budget cores
+  accordingly; do not assume linear fan-out.
+- **Ignore buffered write figures.** Every drive tested reported ≈3.6 GB/s
+  buffered, because that is the OS page cache, not the device. Only durable
+  (`fsync`) figures are real.
 
 ## 5. Principles
 
@@ -282,14 +283,33 @@ Per pane, an append-only log, in segments:
   reads first; memory-mapping needs our own FFI and is a measured decision).
 - Crash safety: append-only, and the index and checkpoints are rebuildable from
   data segments.
-- **Where the log lives is a measured decision, not the working directory.**
-  On the reference machine the repo sits on a spinning disk whose fsync p50 is
-  26.5 ms against 1.4–2.7 ms for either NVMe, and whose durable throughput is
-  124 MiB/s against 520–660 (§4.1). A log placed next to the project would miss
-  the §4 target on its own. So the log writer **probes candidate locations for
-  durable write latency at startup and chooses**, records which it picked, and
-  surfaces it; the governor's existing write-latency watch (§8.8) then keeps it
-  honest. Never assume the current directory is fast.
+- **Flush cadence has a sharp optimum, measured on E: (Samsung 990 PRO).**
+  Sustained 256 KiB appends with a periodic `fsync`, 2 GiB written:
+
+  | Flush every | Sustained | fsync p50 | p90 | p99 |
+  | --- | --- | --- | --- | --- |
+  | 4 MiB | 190 MiB/s | 7.8 ms | 10.2 ms | 709 ms |
+  | **16 MiB** | **479 MiB/s** | 26.7 ms | 31.4 ms | 47.3 ms |
+  | 64 MiB | 445 MiB/s | 115 ms | 153 ms | 162 ms |
+  | 256 MiB | 126 MiB/s | 417 ms | 12,760 ms | 12,760 ms |
+
+  Both directions off the optimum are bad, and the slow direction is
+  catastrophic: at a 256 MiB cadence the drive stalls for **12.7 seconds** at the
+  tail, which would be visible as a frozen pane. At 16 MiB the log sustains
+  479 MiB/s, 1.75× the §4 target.
+  - **The governor's flush rule starts at ≈16 MiB** and adapts from measured
+    write latency (§8.8), never from a constant.
+  - **`fsync` must never block a pane.** Even at the optimum, p50 is 26.7 ms and
+    p99 is 47 ms — two orders of magnitude above the input-latency target. The
+    log writer is therefore asynchronous to the reader: bytes reach the log
+    buffer on the read path, but durability is a background cadence, and "the
+    history up to the last flush replays" (§4) is exactly what that buys.
+- **On other machines, where the log lives is a measured decision.** The
+  reference configuration fixes it to E: (§4), but elsewhere the log writer
+  probes candidate locations for durable write latency at startup, picks,
+  records which it chose and surfaces it. Never assume the working directory is
+  fast: a spinning disk measured on this same machine gave a 26.5 ms fsync p50
+  and 124 MiB/s durable, which would miss the §4 target on storage alone.
 
 ### 8.5 Search and queries (CPU + SSD)
 - A background indexer over data segments: an n-gram (e.g. trigram) index per
