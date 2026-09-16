@@ -25,7 +25,8 @@ pub fn render(run: &Run) -> String {
 
     if let Some(f) = &run.flood {
         out.push_str(&format!(
-            "throughput: {} panes, {} requested each, over {:.2} s\n",
+            "throughput over {}: {} panes, {} requested each, over {:.2} s\n",
+            f.transport.label(),
             f.panes.len(),
             mib(f.requested_per_pane),
             f.elapsed.as_secs_f64(),
@@ -158,6 +159,7 @@ mod tests {
             elapsed: Duration::from_secs_f64(secs),
             requested_per_pane: requested,
             read_sizes: Summary::of(&[]),
+            transport: crate::flood::Transport::Pty,
         }
     }
 
@@ -178,6 +180,16 @@ mod tests {
         assert_eq!(mib_per_sec(0.0), "0.0 MiB/s");
         assert_eq!(mib_per_sec(f64::NAN), "0.0 MiB/s");
         assert_eq!(mib_per_sec(-1.0), "0.0 MiB/s");
+    }
+
+    #[test]
+    fn the_throughput_section_names_the_transport() {
+        let run = Run {
+            flood: Some(flood(1024, 1024, 1.0, false)),
+            echo: None,
+            attribution: None,
+        };
+        assert!(render(&run).contains("ConPTY"));
     }
 
     #[test]
@@ -205,7 +217,7 @@ mod tests {
             attribution: None,
         };
         let text = render(&run);
-        assert!(text.contains("throughput:"));
+        assert!(text.contains("throughput over"));
         assert!(text.contains("2.0 MiB/s"));
     }
 

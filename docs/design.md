@@ -523,9 +523,36 @@ take the ship down.
   | Linux tools under WSL | a real Linux pty inside WSL | Still bridged to Windows through WSL's relay (cost to measure in M0) |
   | Windows programs that only read and write stdio (build tools, many CLIs) | plain pipes | None, but they see no TTY and may drop colour or progress output |
 
+  **Measured 2026-09-15 (M0 harness, reference machine, release):** the two
+  transports are not close. Aggregate throughput, panes of synthetic agent
+  output, 32 MiB each:
+
+  | Panes | ConPTY | per pane | Headless pipe | per pane | Pipe advantage |
+  | --- | --- | --- | --- | --- | --- |
+  | 1 | 17.2 MiB/s | 17.2 | 238.9 MiB/s | 238.9 | 13.9× |
+  | 2 | 32.7 MiB/s | 16.4 | 459.0 MiB/s | 229.5 | 14.0× |
+  | 4 | 65.4 MiB/s | 16.4 | 818.2 MiB/s | 204.6 | 12.5× |
+  | 8 | 96.6 MiB/s | 12.1 | 1338.7 MiB/s | 167.3 | 13.9× |
+  | 16 | 139.4 MiB/s | 8.7 | 1854.3 MiB/s | 115.9 | 13.3× |
+
+  Against the §4 target of 16 panes at 1 GB/min each (17.07 MiB/s per pane,
+  273 MiB/s aggregate):
+  - **ConPTY misses it by about 2×** and degrades with concurrency: a single
+    pane just reaches the per-pane target, 16 panes reach half of it.
+  - **The headless pipe exceeds it by ≈6.8×**, and that is a floor, not a
+    ceiling: our own workload generator tops out at ≈266 MiB/s per core
+    (*measured, output discarded*), and the one-pane pipe figure of 238.9 MiB/s
+    is 88% of that. The pipe path is **generator-bound in this harness, not
+    transport-bound**, so its real ceiling is higher and has not been found.
+  - ConPTY at one pane reaches only 6.5% of what the generator can produce, so
+    there the console host is unambiguously the limit.
+  - None of this includes parsing, rendering or logging. These are transport
+    ceilings, not foldwave's speed.
+
   Design consequence: foldwave supports all three transports (ConPTY,
   pipes/headless, pty) behind one pane interface. Agent integrations prefer
-  headless where the agent documents it.
+  headless where the agent documents it — now backed by a measured 13×—14×
+  throughput margin as well as the absence of the coalescing tick above.
 
 ## 9. Package plan
 
@@ -549,7 +576,7 @@ One concern each; names are placeholders.
 | Milestone | Deliverable | Proof |
 | --- | --- | --- |
 | **M0 Harness** | throughput and latency benchmark: N panes of recorded agent output, timestamped key echo, frame timing, RSS, disk rate. vtebench (MIT/Apache) supplies workloads, but it measures only PTY read speed, not latency or frames, so it can't be the harness. Includes experiments E1, GPU contention (`compute.md`), E2, built-in console host vs OpenConsole (§11), and **E3, CPU attribution** (§8.7b) | a baseline table for atrium today and for 1–2 existing terminals; the E1 contention table on the RTX 3070; the E3 attribution table that says which stage is worth offloading |
-| M0 status (2026-09-15) | **Partly delivered.** `resmon` (four-resource attribution, E3) and `fwbench` (pty pane flood + key-echo latency) are in `crates/`. First numbers on the reference machine: 8 panes sustained **94.9 MiB/s** aggregate (≈12 MiB/s per pane, against a 17.1 MiB/s per-pane target), key echo under that flood **p50 0.06 ms / p99 11.74 ms**. Still to build: frame timing (needs M3), E1, E2, and a disk throughput/latency probe | see `crates/fwbench/README.md` |
+| M0 status (2026-09-15) | **Partly delivered.** `resmon` (four-resource attribution, E3) and `fwbench` (pane floods over ConPTY *and* headless pipes, key-echo latency) are in `crates/`. Headline numbers: 16 panes sustain **139 MiB/s over ConPTY** vs **1854 MiB/s over pipes** (13.3×), against a 273 MiB/s target; key echo under an 8-pane flood p50 **0.06 ms**, p99 **11.74 ms**. Still to build: frame timing (needs M3), E1, E2, and a disk throughput/latency probe | see `crates/fwbench/README.md` and §8.9 |
 | **M1 Headless core** | `panelog` + fast parser + `vterm` checkpoints, driven by the harness with no UI | throughput and history targets met headless |
 | **M2 atrium adopts it** | unbounded history, search and crash replay inside atrium | atrium benchmarks don't regress; replay after a kill |
 | **M3 Renderer spike** | one platform (Windows, D3D11), glyph atlas, damaged-row redraw, CPU fallback | frame time and latency under flood vs. baseline |

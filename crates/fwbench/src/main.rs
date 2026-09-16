@@ -1,5 +1,6 @@
 //! `fwbench` — the foldwave M0 harness.
 
+use fwbench::flood::Transport;
 use fwbench::{echo, emit, flood, report, Run};
 use std::io::{self, Write};
 use std::time::Duration;
@@ -21,6 +22,7 @@ options:
   --gap-ms N    milliseconds between keystrokes (default 25; below ~16 the
                 Windows console's coalescing tick dominates the measurement)
   --shell NAME  shell to measure (default: cmd on Windows, sh elsewhere)
+  --transport T pty (default, a real console) or pipe (headless, no console host)
   --no-attrib   skip resource attribution
   -h, --help    this message
 
@@ -45,6 +47,7 @@ struct Args {
     gap: Duration,
     shell: Option<String>,
     attribution: bool,
+    transport: Transport,
 }
 
 fn parse(argv: &[String]) -> Result<Args, String> {
@@ -55,6 +58,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut gap_ms = 25u64;
     let mut shell = None;
     let mut attribution = true;
+    let mut transport = Transport::Pty;
     let mut emit_bytes: Option<u64> = None;
 
     let mut i = 0;
@@ -116,6 +120,14 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                 gap_ms = v.parse().map_err(|_| format!("bad --gap-ms {v:?}"))?;
             }
             "--shell" => shell = Some(value(&mut i, "--shell")?),
+            "--transport" => {
+                let v = value(&mut i, "--transport")?;
+                transport = match v.as_str() {
+                    "pty" => Transport::Pty,
+                    "pipe" => Transport::Pipe,
+                    other => return Err(format!("bad --transport {other:?}, want pty or pipe")),
+                };
+            }
             "--no-attrib" => {
                 attribution = false;
                 i += 1;
@@ -140,6 +152,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         gap: Duration::from_millis(gap_ms),
         shell,
         attribution,
+        transport,
     })
 }
 
@@ -208,7 +221,14 @@ fn main() {
         Mode::Flood => {
             eprintln!("flooding {} panes x {} MiB...", args.panes, args.mib);
             Run {
-                flood: Some(flood::run(&exe, args.panes, bytes_per_pane, 24, 80)),
+                flood: Some(flood::run(
+                    &exe,
+                    args.panes,
+                    bytes_per_pane,
+                    24,
+                    80,
+                    args.transport,
+                )),
                 echo: None,
                 attribution: None,
             }
@@ -228,8 +248,9 @@ fn main() {
             );
             let exe_for_flood = exe.clone();
             let panes = args.panes;
+            let transport = args.transport;
             let flooder = std::thread::spawn(move || {
-                flood::run(&exe_for_flood, panes, bytes_per_pane, 24, 80)
+                flood::run(&exe_for_flood, panes, bytes_per_pane, 24, 80, transport)
             });
             let echo = measure_echo(&shell, args.samples, args.gap);
             let flood = flooder.join().ok();
@@ -332,6 +353,18 @@ mod tests {
         assert!(parse(&argv(&["flood", "--panes", "0"])).is_err());
         assert!(parse(&argv(&["flood", "--mib", "0"])).is_err());
         assert!(parse(&argv(&["echo", "--samples", "0"])).is_err());
+    }
+
+    #[test]
+    fn transport_parses_and_rejects_nonsense() {
+        assert_eq!(parse(&argv(&["flood"])).unwrap().transport, Transport::Pty);
+        assert_eq!(
+            parse(&argv(&["flood", "--transport", "pipe"]))
+                .unwrap()
+                .transport,
+            Transport::Pipe
+        );
+        assert!(parse(&argv(&["flood", "--transport", "carrier-pigeon"])).is_err());
     }
 
     #[test]

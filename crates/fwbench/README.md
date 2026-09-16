@@ -51,6 +51,32 @@ Against §4: per-pane throughput is **12 MiB/s versus the 17.1 MiB/s** a
 comfortably inside the 1 ms target even under the flood; **p99 is not**, for a
 reason that is not ours to fix — see below.
 
+## Transport: ConPTY vs headless pipes
+
+The comparison that decides where throughput comes from. Panes of synthetic
+agent output, 32 MiB each, release build, reference machine, 2026-09-15:
+
+| Panes | ConPTY | per pane | Headless pipe | per pane | Pipe advantage |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 17.2 MiB/s | 17.2 | 238.9 MiB/s | 238.9 | 13.9× |
+| 2 | 32.7 MiB/s | 16.4 | 459.0 MiB/s | 229.5 | 14.0× |
+| 4 | 65.4 MiB/s | 16.4 | 818.2 MiB/s | 204.6 | 12.5× |
+| 8 | 96.6 MiB/s | 12.1 | 1338.7 MiB/s | 167.3 | 13.9× |
+| 16 | 139.4 MiB/s | 8.7 | 1854.3 MiB/s | 115.9 | 13.3× |
+
+Against §4 (16 panes × 1 GB/min = 17.07 MiB/s per pane, 273 MiB/s aggregate):
+ConPTY **misses by ~2×** and degrades with concurrency; the headless pipe
+**exceeds by ~6.8×**.
+
+The pipe figures are a **floor, not a ceiling**: this harness's own generator
+produces only ~266 MiB/s per core (measured with output discarded), and the
+one-pane pipe result is 88% of that. The pipe path is generator-bound here, so
+its real limit has not been found. ConPTY at one pane, by contrast, reaches just
+6.5% of what the generator can produce — there the console host is clearly the
+limit.
+
+Run both with `--transport pty` (default) and `--transport pipe`.
+
 ## The ConPTY coalescing tick
 
 The most consequential thing this harness has found (design §8.9). The Windows

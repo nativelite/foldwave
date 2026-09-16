@@ -54,6 +54,8 @@ pub struct FloodResult {
     pub requested_per_pane: u64,
     /// Distribution of per-read sizes, as a proxy for how output arrives.
     pub read_sizes: Summary,
+    /// Transport the panes used.
+    pub transport: Transport,
 }
 
 impl FloodResult {
@@ -88,6 +90,96 @@ impl FloodResult {
     /// Panes that ended with an error.
     pub fn failures(&self) -> Vec<&PaneResult> {
         self.panes.iter().filter(|p| p.error.is_some()).collect()
+    }
+}
+
+/// Which transport a pane's output travels over.
+///
+/// The design's transport table (section 8.9) says agents should run headless
+/// over plain pipes where they document it, and only interactive console apps
+/// need ConPTY. Measuring both is the only way to tell whether a throughput
+/// ceiling belongs to the console host or to us.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// A real pseudo-terminal. What an interactive console app requires.
+    Pty,
+    /// A plain pipe on stdout. No console host in the path.
+    Pipe,
+}
+
+impl Transport {
+    /// Stable name for reports.
+    pub fn label(self) -> &'static str {
+        match self {
+            Transport::Pty => "pty (ConPTY)",
+            Transport::Pipe => "pipe (headless)",
+        }
+    }
+}
+
+/// Drain one pane over a plain pipe, counting what arrives.
+fn drain_pane_pipe(index: usize, exe: &str, bytes: u64) -> PaneResult {
+    use std::process::{Command, Stdio};
+    let started = Instant::now();
+
+    let mut child = match Command::new(exe)
+        .args(["--emit", "--bytes", &bytes.to_string()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return PaneResult {
+                index,
+                bytes_read: 0,
+                reads: 0,
+                elapsed: started.elapsed(),
+                error: Some(format!("spawn failed: {e}")),
+            }
+        }
+    };
+
+    let mut stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            let _ = child.kill();
+            return PaneResult {
+                index,
+                bytes_read: 0,
+                reads: 0,
+                elapsed: started.elapsed(),
+                error: Some("no stdout pipe".to_string()),
+            };
+        }
+    };
+
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut bytes_read = 0u64;
+    let mut reads = 0u64;
+    let mut error = None;
+    loop {
+        match std::io::Read::read(&mut stdout, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                bytes_read += n as u64;
+                reads += 1;
+            }
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => break,
+            Err(e) => {
+                error = Some(format!("read failed: {e}"));
+                break;
+            }
+        }
+    }
+    let _ = child.wait();
+
+    PaneResult {
+        index,
+        bytes_read,
+        reads,
+        elapsed: started.elapsed(),
+        error,
     }
 }
 
@@ -177,7 +269,14 @@ fn drain_pane(index: usize, exe: &str, bytes: u64, rows: u16, cols: u16) -> Pane
 /// Run `panes` flooding panes of `bytes_per_pane` each, concurrently.
 ///
 /// `exe` is the path to this binary, which each pane re-runs in `--emit` mode.
-pub fn run(exe: &str, panes: usize, bytes_per_pane: u64, rows: u16, cols: u16) -> FloodResult {
+pub fn run(
+    exe: &str,
+    panes: usize,
+    bytes_per_pane: u64,
+    rows: u16,
+    cols: u16,
+    transport: Transport,
+) -> FloodResult {
     let started = Instant::now();
     let (tx, rx) = mpsc::channel();
     let mut handles = Vec::with_capacity(panes);
@@ -186,7 +285,10 @@ pub fn run(exe: &str, panes: usize, bytes_per_pane: u64, rows: u16, cols: u16) -
         let exe = exe.to_string();
         let tx = tx.clone();
         handles.push(std::thread::spawn(move || {
-            let result = drain_pane(index, &exe, bytes_per_pane, rows, cols);
+            let result = match transport {
+                Transport::Pty => drain_pane(index, &exe, bytes_per_pane, rows, cols),
+                Transport::Pipe => drain_pane_pipe(index, &exe, bytes_per_pane),
+            };
             // A closed receiver just means the run was abandoned.
             let _ = tx.send(result);
         }));
@@ -212,6 +314,7 @@ pub fn run(exe: &str, panes: usize, bytes_per_pane: u64, rows: u16, cols: u16) -
         elapsed: started.elapsed(),
         requested_per_pane: bytes_per_pane,
         read_sizes: Summary::of(&read_sizes),
+        transport,
     }
 }
 
@@ -235,7 +338,15 @@ mod tests {
             elapsed: Duration::from_secs_f64(secs),
             requested_per_pane: requested,
             read_sizes: Summary::of(&[]),
+            transport: Transport::Pty,
         }
+    }
+
+    #[test]
+    fn transport_labels_are_distinct_and_named() {
+        assert_ne!(Transport::Pty.label(), Transport::Pipe.label());
+        assert!(Transport::Pty.label().contains("ConPTY"));
+        assert!(Transport::Pipe.label().contains("headless"));
     }
 
     #[test]
