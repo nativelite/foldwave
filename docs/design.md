@@ -479,6 +479,26 @@ take the ship down.
   - keep every pane's output drained at all times, or its input stalls
   - spawn suspended so a pane joins its job before it runs
 
+- **The app itself takes no console:** `#![windows_subsystem = "windows"]` on the
+  binary crate sets the PE subsystem to `WINDOWS` (2) instead of `CONSOLE` (3),
+  so the loader never allocates a console and no host window flashes up at
+  launch. foldwave owns its own window (§8.6), so this is the right setting for
+  the app. *(Verified 2026-09-15: subsystem byte 3 → 2; launched detached, a
+  console binary reports a console attached and a `windows`-subsystem binary
+  reports none.)*
+  - **It is not a silencer for stdout.** Handles are still *inherited*: run from
+    a shell or with redirection, `println!` works normally. What changes is that
+    nothing is *allocated* when there is no parent console, so output then goes
+    nowhere. Diagnostics must therefore not depend on stdout: use a log file, or
+    `AttachConsole(ATTACH_PARENT_PROCESS)`, or keep a console in development
+    with `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`.
+  - **It applies to the app only,** never to `fwbench` or `resmon`, whose whole
+    purpose is to print.
+  - **It changes nothing about child processes.** Console apps we host still
+    need ConPTY, and the ≈15.2 ms coalescing tick above is a property of the
+    console host's handling of *their* output, not of our subsystem. This
+    removes a popup; it does not touch the latency floor.
+
   Windows Terminal bundles its own **OpenConsole** (MIT) instead of relying on
   the system `conhost.exe`, to get newer ConPTY behavior (sources in
   `prior-art.md`). Whether we bundle it is decided by experiment E2 (§11).
