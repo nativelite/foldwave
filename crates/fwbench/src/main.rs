@@ -1,7 +1,7 @@
 //! `fwbench` — the foldwave M0 harness.
 
 use fwbench::flood::Transport;
-use fwbench::{echo, emit, flood, report, Run};
+use fwbench::{disk, echo, emit, flood, report, Run};
 use std::io::{self, Write};
 use std::time::Duration;
 
@@ -14,16 +14,23 @@ modes:
   flood         N panes flooding at once; measures throughput
   echo          key-echo latency through a shell, idle machine
   combined      echo latency measured WHILE the panes flood (the section 4 target)
+  disk          durable write rate of the log drive: buffered+fsync (the old
+                probe, as control), then write-through at qd1 and qdN
 
 options:
   --panes N     panes to flood (default 8)
-  --mib N       MiB each pane emits (default 32)
+  --mib N       MiB each pane emits (default 32); for disk, MiB per pattern
+                (default 2048)
   --samples N   key-echo samples (default 200)
   --gap-ms N    milliseconds between keystrokes (default 25; below ~16 the
                 Windows console's coalescing tick dominates the measurement)
   --shell NAME  shell to measure (default: cmd on Windows, sh elsewhere)
   --transport T pty (default, a real console) or pipe (headless, no console host)
   --no-attrib   skip resource attribution
+  --path DIR    disk: directory on the drive to measure (default: current dir;
+                the reference log drive is E:\\)
+  --io-kib N    disk: bytes per write for the write-through patterns (default 1024)
+  --qd N        disk: queue depth for the queued pattern (default 8)
   -h, --help    this message
 
 internal:
@@ -35,6 +42,7 @@ enum Mode {
     Flood,
     Echo,
     Combined,
+    Disk,
     Emit { bytes: u64 },
 }
 
@@ -48,17 +56,23 @@ struct Args {
     shell: Option<String>,
     attribution: bool,
     transport: Transport,
+    path: Option<String>,
+    io_kib: usize,
+    qd: usize,
 }
 
 fn parse(argv: &[String]) -> Result<Args, String> {
     let mut mode: Option<Mode> = None;
     let mut panes = 8usize;
-    let mut mib = 32u64;
+    let mut mib: Option<u64> = None;
     let mut samples = 200usize;
     let mut gap_ms = 25u64;
     let mut shell = None;
     let mut attribution = true;
     let mut transport = Transport::Pty;
+    let mut path = None;
+    let mut io_kib = 1024usize;
+    let mut qd = 8usize;
     let mut emit_bytes: Option<u64> = None;
 
     let mut i = 0;
@@ -86,6 +100,28 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                 mode = Some(Mode::Combined);
                 i += 1;
             }
+            "disk" => {
+                mode = Some(Mode::Disk);
+                i += 1;
+            }
+            "--path" => path = Some(value(&mut i, "--path")?),
+            "--io-kib" => {
+                let v = value(&mut i, "--io-kib")?;
+                io_kib = v.parse().map_err(|_| format!("bad --io-kib {v:?}"))?;
+                if io_kib == 0 || (io_kib * 1024) % disk::SECTOR != 0 {
+                    return Err(format!(
+                        "--io-kib must be a non-zero multiple of {}",
+                        disk::SECTOR / 1024
+                    ));
+                }
+            }
+            "--qd" => {
+                let v = value(&mut i, "--qd")?;
+                qd = v.parse().map_err(|_| format!("bad --qd {v:?}"))?;
+                if qd == 0 {
+                    return Err("--qd must be at least 1".into());
+                }
+            }
             "--emit" => {
                 mode = Some(Mode::Emit { bytes: 0 });
                 i += 1;
@@ -103,10 +139,11 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             }
             "--mib" => {
                 let v = value(&mut i, "--mib")?;
-                mib = v.parse().map_err(|_| format!("bad --mib {v:?}"))?;
-                if mib == 0 {
+                let n: u64 = v.parse().map_err(|_| format!("bad --mib {v:?}"))?;
+                if n == 0 {
                     return Err("--mib must be at least 1".into());
                 }
+                mib = Some(n);
             }
             "--samples" => {
                 let v = value(&mut i, "--samples")?;
@@ -143,6 +180,8 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         Some(m) => m,
         None => return Err(USAGE.to_string()),
     };
+    // A drive needs a long stream to show its sustained rate; panes do not.
+    let mib = mib.unwrap_or(if mode == Mode::Disk { 2048 } else { 32 });
 
     Ok(Args {
         mode,
@@ -153,6 +192,9 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         shell,
         attribution,
         transport,
+        path,
+        io_kib,
+        qd,
     })
 }
 
@@ -196,6 +238,29 @@ fn main() {
         return;
     }
 
+    if args.mode == Mode::Disk {
+        let dir = std::path::PathBuf::from(args.path.as_deref().unwrap_or("."));
+        let bytes = args.mib * 1024 * 1024;
+        let config = disk::Config {
+            dir: dir.clone(),
+            bytes,
+            patterns: disk::Pattern::default_matrix(args.io_kib * 1024, args.qd),
+        };
+        eprintln!(
+            "disk: {} MiB per pattern under {}...",
+            args.mib,
+            dir.display()
+        );
+        match disk::run(&config) {
+            Ok(results) => print!("{}", disk::render(&dir, bytes, &results)),
+            Err(e) => {
+                eprintln!("fwbench: disk measurement failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     let exe = match std::env::current_exe() {
         Ok(p) => p.to_string_lossy().into_owned(),
         Err(e) => {
@@ -217,7 +282,7 @@ fn main() {
     let started = std::time::Instant::now();
 
     let run = match args.mode {
-        Mode::Emit { .. } => unreachable!("handled above"),
+        Mode::Emit { .. } | Mode::Disk => unreachable!("handled above"),
         Mode::Flood => {
             eprintln!("flooding {} panes x {} MiB...", args.panes, args.mib);
             Run {
@@ -302,6 +367,24 @@ mod tests {
         assert_eq!(parse(&argv(&["flood"])).unwrap().mode, Mode::Flood);
         assert_eq!(parse(&argv(&["echo"])).unwrap().mode, Mode::Echo);
         assert_eq!(parse(&argv(&["combined"])).unwrap().mode, Mode::Combined);
+        assert_eq!(parse(&argv(&["disk"])).unwrap().mode, Mode::Disk);
+    }
+
+    #[test]
+    fn disk_options_parse_and_guard_alignment() {
+        let a = parse(&argv(&[
+            "disk", "--path", "E:\\", "--io-kib", "256", "--qd", "4",
+        ]))
+        .unwrap();
+        assert_eq!(a.path.as_deref(), Some("E:\\"));
+        assert_eq!(a.io_kib, 256);
+        assert_eq!(a.qd, 4);
+        let d = parse(&argv(&["disk"])).unwrap();
+        assert_eq!((d.io_kib, d.qd, d.path), (1024, 8, None));
+        assert_eq!(d.mib, 2048);
+        assert_eq!(parse(&argv(&["disk", "--mib", "64"])).unwrap().mib, 64);
+        assert!(parse(&argv(&["disk", "--io-kib", "3"])).is_err());
+        assert!(parse(&argv(&["disk", "--qd", "0"])).is_err());
     }
 
     #[test]

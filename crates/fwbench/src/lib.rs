@@ -6,6 +6,8 @@
 //!
 //! - **Throughput** — N pty panes flooding at once ([`flood`]).
 //! - **Input latency** — key echo timed on arrival ([`echo`]).
+//! - **Storage** — the log drive measured the way the log writer will use
+//!   it: unbuffered write-through, queued ([`disk`]).
 //! - **Resource attribution** — where the machine went during the run, across
 //!   CPU, RAM, disk and GPU, via `resmon` (experiment E3, section 8.7b).
 //!
@@ -16,6 +18,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod disk;
 pub mod echo;
 pub mod emit;
 pub mod flood;

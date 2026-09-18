@@ -107,7 +107,7 @@ each leg does in isolation, so a plan for using them together starts from facts.
 | --- | --- | --- |
 | **RAM** — `memcpy`, 1 core | 23,235 MiB/s | 85× |
 | **CPU** — `vterm` full emulation, 16 threads | 723 MiB/s | 2.6× |
-| **SSD (E:)** — sustained log append, 16 MiB flush cadence | 479 MiB/s | 1.75× |
+| **SSD (E:)** — buffered append, `fsync` every 16 MiB, one write in flight | 479 MiB/s — **the method's ceiling, not the drive's** (see below) | 1.75× |
 | **GPU** — RTX 3070 | not yet measured (experiment E1, [`compute.md`](compute.md)) | — |
 | *transport:* headless pipe, 16 panes | ≥ 1854 MiB/s | 6.8× (a floor, §8.9) |
 | *transport:* ConPTY, 16 panes | 139 MiB/s | **0.51× — misses** |
@@ -127,6 +127,19 @@ each leg does in isolation, so a plan for using them together starts from facts.
 - **Parsing scales sublinearly:** 111 MiB/s on one thread, 723 on sixteen — 6.5×
   for 16× the threads, per-thread falling from 111 to 45 MiB/s. Budget cores
   accordingly; do not assume linear fan-out.
+- **The SSD row is the cost of a flush loop, not the drive.** That probe
+  handed the page cache 256 KiB at a time and stopped every 16 MiB for an
+  `fsync`; at the measured 26.7 ms fsync p50 the writer sat blocked for **80 %
+  of the wall clock** (33.4 ms per 16 MiB cycle, 6.7 ms of it filling), and the
+  device idled in between. It is the durable rate of *that pattern*, at queue
+  depth 1, and was wrongly promoted to a ceiling. The drive's own figure comes
+  from the pattern the log writer will use — unbuffered write-through
+  (`FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH`, every write durable on
+  return, no page cache, no flush) with a queue — which `fwbench disk` now
+  measures three ways, the old probe kept as the control. **Until it runs, the
+  SSD ceiling is unknown and 479 MiB/s is a floor.** Everything below that
+  leans on 479 (the "binding pair", §8.0's ingest bound and its 1.75× margin)
+  inherits that caveat.
 - **Ignore buffered write figures.** Every drive tested reported ≈3.6 GB/s
   buffered, because that is the OS page cache, not the device. Only durable
   (`fsync`) figures are real.

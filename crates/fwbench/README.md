@@ -27,9 +27,25 @@ cargo run --release --bin fwbench -- combined --panes 8 --mib 32 --samples 120
 | `flood` | N panes flooding; throughput only |
 | `echo` | key-echo latency on an idle machine |
 | `combined` | echo latency measured **while** the panes flood — the §4 target |
+| `disk` | durable write rate of the log drive, three ways: the old buffered+fsync probe as control, then unbuffered write-through at queue depth 1 and N |
 
 Options: `--panes N`, `--mib N`, `--samples N`, `--gap-ms N`, `--shell NAME`,
-`--no-attrib`.
+`--no-attrib`; for `disk`, `--path DIR` (the reference log drive is `E:\`),
+`--io-kib N` (default 1024) and `--qd N` (default 8), with `--mib` defaulting
+to 2048 per pattern.
+
+```
+cargo run --release --bin fwbench -- disk --path E:```
+
+`disk` exists because the first E: figure in design §4.1 (479 MiB/s) measured
+a flush round-trip loop, not the drive: buffered appends through the page
+cache, an `fsync` every 16 MiB, one write in flight. Write-through
+(`FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH`) makes every write durable
+on return with no page cache and no flush, and a queue keeps the device busy.
+The three rows side by side say how much of the gap was the method. Each
+write is timed, so the report carries p50/p90/p99, not just a rate. Numbers
+inside a drive's SLC cache (2 GiB is) flatter it; a longer `--mib` shows the
+sustained rate past it.
 
 ## First numbers on the reference machine
 
