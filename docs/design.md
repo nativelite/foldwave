@@ -106,22 +106,26 @@ each leg does in isolation, so a plan for using them together starts from facts.
 | Leg | Ceiling | vs target |
 | --- | --- | --- |
 | **RAM** — `memcpy`, 1 core | 23,235 MiB/s | 85× |
-| **CPU** — `vterm` full emulation, 16 threads | 723 MiB/s (E4 re-run 2026-09-21: 612 on 16 threads, 503 on the 6 P-cores alone) | 2.6× |
-| **SSD (E:)** — unbuffered write-through, 1 MiB appends, one write in flight, sustained past the SLC cache (`fwbench disk`, 2026-09-21) | ≈1,750 MiB/s (write p99 ≈1.1 ms); 3,477 MiB/s while the SLC cache lasts | **6.4×** |
+| **CPU** — `vterm` full emulation, 16 threads (E4, quiet machine, 2026-09-22) | **924.8 MiB/s**; 623.8 on the 6 P-cores alone, 125.5 on one P-core | **3.4×** |
+| **SSD (E:)** — unbuffered write-through, 1 MiB appends, one write in flight (`fwbench disk`, 2026-09-21/22) | ≈1,800 MiB/s sustained past the SLC cache (p99 ≈1.1 ms); 4,295 MiB/s held across a 16 GiB burst inside it | **6.6×** |
 | **GPU** — RTX 3070 | not yet measured (experiment E1, [`compute.md`](compute.md)) | — |
 | *transport:* headless pipe, 16 panes | ≥ 1854 MiB/s | 6.8× (a floor, §8.9) |
 | *transport:* ConPTY, 16 panes | 139 MiB/s | **0.51× — misses** |
 
 **What this says about the architecture:**
 
-- **The §4 targets are reachable.** With agents headless, every leg clears
-  273 MiB/s: the SSD by 6.4× (sustained), the CPU by 2.6×. ConPTY misses
-  outright.
-- **CPU parsing is the binding leg.** The SSD (≈1,750 MiB/s sustained) and the
-  pipe transport (≥ 1,854) are both more than 2× faster than parsing, and RAM is
-  never a constraint. Engineering effort belongs in the parser, not in moving or
-  storing bytes. (Before 2026-09-21 this line said "CPU and SSD are the binding
-  pair", based on the discredited 479 MiB/s figure.)
+- **The §4 targets are reachable with room to spare.** With agents headless,
+  every leg clears 273 MiB/s: the SSD by 6.6× (sustained), the CPU by 3.4×.
+  ConPTY misses outright.
+- **CPU parsing is still the binding leg, but it is no longer close.** The SSD
+  (≈1,800 MiB/s sustained) and the pipe transport (≥ 1,854) are about 2× faster
+  than parsing at 924.8, and RAM is never a constraint. Parsing also has known
+  headroom left: ≈38 % of its time is per-token allocation (E4). Engineering
+  effort belongs in the parser, not in moving or storing bytes.
+  - Two earlier framings were wrong and are recorded so they are not repeated:
+    "CPU and SSD are the binding pair" (from the discredited 479 MiB/s SSD
+    figure, corrected 2026-09-21), and the first E4 run's lower CPU numbers,
+    taken while a browser used ~1.1 cores (corrected 2026-09-22).
 - **This quantifies §8.7b's index-construction offload.** 723 MiB/s is *parsing
   alone*, with all 16 threads busy. A background indexer would compete for
   exactly those cores. Moving it to a GPU measured at 0% utilization is now the
@@ -411,70 +415,72 @@ thread and at 16; §8.0 interpolates between them.
 Output: the real constants behind points 3 and 4, and therefore whether one core
 really does cover visible-pane parsing.
 
-**E4 result (measured 2026-09-21, quiet machine, release build,
-`fwbench parse` and `fwbench gpu`).** The workload is 64 MiB of the harness's
-agent-like output per pane, fed 64 KiB at a time, 5 timed reps after a warm-up.
-Core placement was set with `start /affinity`: `0x555` is one thread per
-P-core, `0xFFF` is P-cores plus their hyper-threads, `0xFFFF` is everything.
-Pinning one thread to each CPU showed that logical CPUs 0–11 are P-cores
-(≈85 MiB/s full emulation) and 12–15 are E-cores (≈51 MiB/s).
+**E4 result (re-measured 2026-09-22 on a quiet machine; supersedes the
+2026-09-21 run).** Release build, `fwbench parse` and `fwbench gpu`, 64 MiB of
+the harness's agent-like output per pane, fed 64 KiB at a time, 5 timed reps
+after a warm-up. Core placement was set with `start /affinity`: `0x555` is one
+thread per P-core, `0xFFF` P-cores plus their hyper-threads, `0xFFFF`
+everything.
+
+*Machine state.* The founder closed the browser and paused Google Drive first.
+The noisy-run guard (`crates/fwbench/src/noise.rs`) reported **0.16–0.27 cores** used outside fwbench
+during these runs, of which **0.09–0.14 was the Claude Code session driving
+them**; the rest was Samsung Magician, the Intel graphics service, Windows
+Terminal and Google Drive at 0.01–0.04 each. The first run of these same
+benchmarks, on 2026-09-21, was taken while a browser burned ~1.1 cores, and it
+measured **25–50 % low**. Those numbers are gone; these replace them.
 
 *The split, one thread on a P-core:*
 
 | Stage | Median MiB/s | Share of full emulation time |
 | --- | --- | --- |
-| `vterm` full emulation (tokenize + apply to screen) | 116.6 | 100 % |
-| `ansi::Parser` tokenize, one heap token per token | 187.6 | 62 % |
-| The state machine alone ([`fsm.rs`](../crates/fwbench/src/fsm.rs) table) | 517.7 | 23 % |
-| All 11 start states in lockstep (enumerative, no shortcut) | 359.5 | 32 % |
-| Structural scan, hidden-pane path (lines + OSC 133) | 1,750.9 | 7 % |
+| `vterm` full emulation (tokenize + apply to screen) | 123.4 | 100 % |
+| `ansi::Parser` tokenize, one heap token per token | 206.9 | 60 % |
+| The state machine alone ([`fsm.rs`](../crates/fwbench/src/fsm.rs) table) | 565.6 | 22 % |
+| All 11 start states in lockstep (enumerative, no shortcut) | 383.3 | 32 % |
+| Structural scan, hidden-pane path (lines + OSC 133) | 1,798.4 | 7 % |
 
-- **Applying tokens to the screen is ≈38 % of the time, and tokenizing is
-  ≈62 %.** Only 23 % of the time is the state machine itself. The other
-  ≈39 % is `ansi` allocating a `String`/`Vec` per token. That part can be
-  recovered on the CPU, with no GPU, by a tokenizer that emits spans instead
-  of owned tokens.
-- **The hidden-pane scan runs at 1.4–1.75 GiB/s per core** (1,416 MiB/s in the
-  unpinned run). That confirms the ≥1 GiB/s the §8.0 budget assumed.
+- **Applying tokens to the screen is ≈40 % of the time, tokenizing ≈60 %.**
+  Only 22 % is the state machine itself; the other ≈38 % is `ansi` allocating
+  a `String`/`Vec` per token. That part is recoverable on the CPU, with no
+  GPU, by a tokenizer that emits spans into a caller-owned buffer.
+- **The hidden-pane scan runs at 1.8 GiB/s per core,** comfortably above the
+  ≥1 GiB/s the §8.0 budget assumed.
+- **Core placement matters more than any tuning here:** the same single thread
+  measured 125.5 MiB/s on a P-core, 100.4 on CPU 0 (which also takes the
+  machine's interrupts) and 55.4 on an E-core.
 
 *Scaling, full emulation, one pane per thread, aggregate median MiB/s:*
 
 | Threads | P-cores only (`0x555`) | P + HT (`0xFFF`) | All 16 (`0xFFFF`) |
 | --- | --- | --- | --- |
-| 1 | 103.1 | 84.6 | 81.2 |
-| 2 | 170.8 | 143.0 | 153.8 |
-| 4 | 240.8 | 275.7 | 270.7 |
-| 6 | 502.6 | 410.1 | 344.5 |
-| 8 | — | 468.1 | 444.0 |
-| 12 | — | 453.2 | 557.9 |
-| 16 | — | — | 612.1 |
+| 1 | 125.5 | 125.6 | 127.2 |
+| 2 | 232.1 | 232.2 | 229.8 |
+| 4 | **436.3** | 411.4 | 412.4 |
+| 6 | **623.8** | 544.3 | 544.5 |
+| 8 | — | 628.8 | 666.6 |
+| 12 | — | 743.0 | 801.4 |
+| 16 | — | — | **924.8** |
 
-- **Put parser threads on P-cores.** Six threads, one per P-core, gave
-  502.6 MiB/s. All 16 logical CPUs gave only 612.1 MiB/s.
-  - Hyper-threads add little: 8 threads on `0xFFF` gave 468.1 MiB/s, and 12
-    gave 453.2.
-  - E-cores add about 51 MiB/s each.
-  - Unpinned, a single thread got 81 MiB/s against 103–117 MiB/s pinned to a
-    P-core. The scheduler put it on an E-core some of the time.
-- **Noise:** five reps per cell is thin. The P-only curve is not monotonic
-  per thread (4 threads at 60 MiB/s each, 6 at 84), and the §4.1 figures
-  from 2026-09-16 (111 MiB/s on 1 thread, 723 on 16) sit above today's. Treat
-  these rows as ±15 %. The P-core conclusion holds at every thread count.
-- **The machine was not quiet, and now every run says so.** The noisy-run guard
-  (`fwbench` `noise.rs`, added 2026-09-22) ends every run with the CPU used
-  outside fwbench's own tree.
-  - `resmon` over 15 s showed about 1.5 cores busy elsewhere, a browser about
-    1.1 of them.
-  - An 8 s `parse` run measured 1.15 cores: Chrome 0.35, Google Drive 0.29,
-    Edge WebView2 0.27.
-  - 188 system processes are unreadable without admin, so the true figure is
-    higher.
-  - Every run so far, E4 included, was taken under that load. Re-run before
-    treating any row as final.
+- **Parsing clears the §4 target on two P-cores** (232 MiB/s ≈ 0.85× target)
+  and beats it on four (436 MiB/s, 1.6×). The whole machine reaches
+  **924.8 MiB/s, 3.4× target** — above the 723 MiB/s §4.1 recorded on
+  2026-09-16 and 51 % above the noisy 2026-09-21 run.
+- **Six threads pinned to the six P-cores (623.8) beat eight threads spread
+  over P-cores and hyper-threads (628.8) at three quarters of the thread
+  count,** and beat six unpinned threads by 15 %. Pin parser threads to
+  P-cores, then spill.
+- **Hyper-threads and E-cores earn their keep only once the P-cores are full:**
+  12 threads add 128 MiB/s over 8, and 16 add 123 over 12, against ~110 MiB/s
+  for each of the first four P-core threads.
+- Scaling is smooth and monotonic in every column, unlike the noisy run.
+  Per-thread efficiency falls from 125.5 (1 thread) to 104.0 (6 P-cores) to
+  57.8 (all 16).
 
 *The GPU fit.* The workload was sampled at 10,000 chunk boundaries. From each
-of the 11 start states, the table below counts how many bytes it takes to
-reach the state the true (ground) trajectory is in, within a 64 KiB chunk.
+of the 11 start states, the table counts the bytes needed to reach the state
+the true (ground) trajectory is in, within a 64 KiB chunk. These figures are
+deterministic and unchanged from the 2026-09-21 run.
 
 | Start state | Converged | p50 / p99 / max bytes | Never |
 | --- | --- | --- | --- |
@@ -489,33 +495,38 @@ In the true stream, 96.56 % of byte offsets are in ground, 2.46 % in CSI and
 or DCS strings.
 
 - **Parallel tokenizing fits.** Every non-string start state rejoins ground
-  within 18 bytes. So a chunk parsed from an unknown state costs one pass plus
-  at most 18 bytes of extra work per state.
-- **The exception is string states**, and it has a cheap fix. A string absorbs
+  within 18 bytes. A chunk parsed from an unknown state therefore costs one
+  pass plus at most 18 bytes of extra work per state.
+- **The exception is string states**, and the fix is cheap. A string absorbs
   plain text until BEL or `ESC \`, so it never converges. The 141 escape
   misses are the same case: the byte after the boundary was `]`, `P`, `X`,
-  `^` or `_`, which opens a string. The fix is a second pass: carry a
-  "string open" flag through each chunk by scanning for terminators, which is
-  a structural scan at 1.4+ GiB/s. Then parse each chunk from ground. The
-  enumerative lockstep, which needs no convergence shortcut, still runs at
-  359.5 MiB/s, 69 % of the single trajectory.
+  `^` or `_`, which opens a string. Carry a "string open" flag through each
+  chunk with a terminator scan (1.8 GiB/s), then parse each chunk from ground.
+  The enumerative lockstep, which needs no convergence shortcut at all, still
+  runs at 383.3 MiB/s, 68 % of the single trajectory.
 - **Transfer is not the obstacle.** `fwbench gpu` (RTX 3070, PCIe 4.0 x16, CUDA
-  Driver API, 200 copies per cell, two runs agreeing within 4 %) measured:
-  - Pinned host memory: 18–20 GiB/s at 1 MiB, 21.6–23.5 GiB/s at 16 and
-    64 MiB, and 13 µs p50 for a single 64 KiB read.
-  - Pageable memory: 7.2–10.7 GiB/s.
-  - At the §4 target, 273 MiB/s in 1 MiB pinned batches keeps the link busy
-    ≈1.5 % of the time. A 1 MiB copy (54 µs) costs 0.6 % of parsing that MiB
-    on one P-core (≈8.6 ms). §8.7b's "transfer alone would exceed the parse
-    cost" is wrong for throughput.
+  Driver API, 2 s warm-up, 200 copies per cell):
+
+  | Copy | Pinned host memory | Pageable |
+  | --- | --- | --- |
+  | 64 KiB | 4.9 GiB/s, 12 µs p50 | 4.0 GiB/s |
+  | 1 MiB | 18.5 GiB/s H2D, 20.1 D2H, 53 µs p50 | 10.9 / 8.8 GiB/s |
+  | 16 MiB | 22.5 / 24.2 GiB/s | 11.7 / 9.9 GiB/s |
+  | 64 MiB | 22.6 / 24.3 GiB/s | 10.1 GiB/s |
+
+  At the §4 target, 273 MiB/s in 1 MiB pinned batches keeps the link busy
+  ≈1.4 % of the time, and a 1 MiB copy (53 µs) costs 0.6 % of parsing that MiB
+  on one P-core (≈8.1 ms). §8.7b's "transfer alone would exceed the parse
+  cost" is wrong for throughput by more than 100×.
 
 **What E4 says.** Tokenizing is data-parallel enough for a GPU and cheap to
-ship to it. Applying tokens to the screen (38 %) stays sequential per pane on
-the CPU. The GPU would tokenize and index everything: hidden panes, history
-replay and checkpoint rebuilds. The CPU would apply tokens only for visible
-panes. Two things remain unmeasured: a real GPU tokenizer kernel's end-to-end
-rate (the next spike), and checkpoint size and rebuild time (`vterm` has no
-checkpoint yet).
+ship to it, but the CPU is no longer short of headroom: 924.8 MiB/s is 3.4×
+the target, and a non-allocating tokenizer should lift the per-core figure
+further. So the GPU case now rests on *giving cores back to the agents*
+(§8.7b's actual goal), not on reaching the target. Applying tokens to the
+screen (≈40 %) stays sequential per pane on the CPU. Still unmeasured: a real
+GPU tokenizer kernel end to end (the next spike), and checkpoint size and
+rebuild time (`vterm` has no checkpoint yet).
 
 **Experiment E5: the composed pipeline (part of M0).** The first measurement of
 the legs *running together* instead of one at a time.
