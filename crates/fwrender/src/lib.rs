@@ -31,6 +31,8 @@
 mod atlas;
 mod cpu;
 mod frame;
+#[cfg(windows)]
+pub mod win;
 
 pub use atlas::{Atlas, GlyphKey, GlyphPart, Metrics, Rasterizer, TestRasterizer, BOLD, ITALIC};
 pub use cpu::{blend, CpuRenderer};
