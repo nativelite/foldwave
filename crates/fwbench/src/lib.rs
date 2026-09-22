@@ -13,6 +13,8 @@
 //!   [`fsm`], [`scan`]), and the host-to-GPU copy cost behind it ([`gpu`]).
 //! - **The composed pipeline** — log + parse + scan on N panes at once,
 //!   experiment E5 ([`compose`]).
+//! - **Crash and replay** — kill a writer mid-append, check the log against
+//!   the stream that made it, rebuild a screen from it ([`replay`]).
 //! - **Resource attribution** — where the machine went during the run, across
 //!   CPU, RAM, disk and GPU, via `resmon` (experiment E3, section 8.7b).
 //!
@@ -36,6 +38,7 @@ pub mod gpu;
 pub mod noise;
 pub mod parse;
 pub mod read;
+pub mod replay;
 pub mod report;
 pub mod scan;
 pub mod stats;

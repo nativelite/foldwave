@@ -1,7 +1,9 @@
 //! `fwbench` — the foldwave M0 harness.
 
 use fwbench::flood::Transport;
-use fwbench::{compose, disk, echo, emit, flood, gpu, noise, parse as e4, read, report, Run};
+use fwbench::{
+    compose, disk, echo, emit, flood, gpu, noise, parse as e4, read, replay, report, Run,
+};
 use std::io::{self, Write};
 use std::time::Duration;
 
@@ -22,6 +24,9 @@ modes:
                 panes are parsed, the rest structurally scanned; --log
                 per-pane|single|none picks the layout (section 8.4's open
                 question); --rate MiB/s paces instead of running flat out
+  replay        crash safety: spawn a log writer, kill it mid-append, check
+                the log against the stream that produced it, and time a screen
+                rebuild; --kill-ms N is how long it writes first (default 1500)
   gpu           host<->GPU copy cost via the CUDA driver (pinned and pageable,
                 64 KiB..64 MiB); --samples copies per cell (default 200)
   read          read rate of --path DIR, unbuffered and buffered, with the CPU
@@ -54,6 +59,7 @@ options:
 
 internal:
   --emit --bytes N   emit N bytes of agent-like output to stdout
+  --crash-writer     append to --path until killed (the replay mode's child)
 ";
 
 #[derive(Debug, PartialEq)]
@@ -66,6 +72,8 @@ enum Mode {
     Gpu,
     Read,
     Compose,
+    Replay,
+    CrashWriter,
     Emit { bytes: u64 },
 }
 
@@ -85,6 +93,7 @@ struct Args {
     threads: Vec<usize>,
     reps: usize,
     noise_limit: f64,
+    kill_ms: u64,
     visible: usize,
     log: compose::LogMode,
     rate_mib: f64,
@@ -107,6 +116,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut threads = vec![1, 2, 4, 6, 8, 12, 16];
     let mut reps = 5usize;
     let mut noise_limit = noise::DEFAULT_LIMIT_CORES;
+    let mut kill_ms = 1500u64;
     let mut visible = 4usize;
     let mut log = compose::LogMode::PerPane;
     let mut rate_mib = 0.0f64;
@@ -142,6 +152,18 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "disk" => {
                 mode = Some(Mode::Disk);
                 i += 1;
+            }
+            "replay" => {
+                mode = Some(Mode::Replay);
+                i += 1;
+            }
+            "--crash-writer" => {
+                mode = Some(Mode::CrashWriter);
+                i += 1;
+            }
+            "--kill-ms" => {
+                let v = value(&mut i, "--kill-ms")?;
+                kill_ms = v.parse().map_err(|_| format!("bad --kill-ms {v:?}"))?;
             }
             "compose" => {
                 mode = Some(Mode::Compose);
@@ -287,6 +309,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mib = mib.unwrap_or(match mode {
         Mode::Disk | Mode::Read => 2048,
         Mode::Compose => 256,
+        Mode::Replay | Mode::CrashWriter => 8192,
         Mode::Parse => 64,
         _ => 32,
     });
@@ -306,6 +329,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         threads,
         reps,
         noise_limit,
+        kill_ms,
         visible,
         log,
         rate_mib,
@@ -398,6 +422,44 @@ fn run(args: &Args) -> i32 {
             Ok(results) => print!("{}", disk::render(&dir, bytes, &results)),
             Err(e) => {
                 eprintln!("fwbench: disk measurement failed: {e}");
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    if args.mode == Mode::CrashWriter {
+        let path = std::path::PathBuf::from(args.path.as_deref().unwrap_or("fwbench-crash.log"));
+        // Killed mid-write by the parent; an error here is the parent's to see.
+        let _ = replay::crash_writer(&path, args.mib * 1024 * 1024, args.io_kib * 1024);
+        return 0;
+    }
+
+    if args.mode == Mode::Replay {
+        let exe = match std::env::current_exe() {
+            Ok(p) => p.to_string_lossy().into_owned(),
+            Err(e) => {
+                eprintln!("fwbench: cannot find own path: {e}");
+                return 1;
+            }
+        };
+        let dir = std::path::PathBuf::from(args.path.as_deref().unwrap_or("."));
+        let config = replay::Config {
+            dir: dir.clone(),
+            bytes: args.mib * 1024 * 1024,
+            io: args.io_kib * 1024,
+            run_for: Duration::from_millis(args.kill_ms),
+            rebuild_bytes: 3 * 1024 * 1024 + 300 * 1024, // the 3.3 MiB of 8.0
+        };
+        eprintln!(
+            "replay: writing under {} for {} ms, then killing the writer...",
+            dir.display(),
+            args.kill_ms
+        );
+        match replay::run(&exe, &config) {
+            Ok(r) => print!("{}", replay::render(&config, &r)),
+            Err(e) => {
+                eprintln!("fwbench: replay failed: {e}");
                 return 1;
             }
         }
@@ -516,7 +578,14 @@ fn run(args: &Args) -> i32 {
     let started = std::time::Instant::now();
 
     let run = match args.mode {
-        Mode::Emit { .. } | Mode::Disk | Mode::Parse | Mode::Gpu | Mode::Read | Mode::Compose => {
+        Mode::Emit { .. }
+        | Mode::Disk
+        | Mode::Parse
+        | Mode::Gpu
+        | Mode::Read
+        | Mode::Compose
+        | Mode::Replay
+        | Mode::CrashWriter => {
             unreachable!("handled above")
         }
         Mode::Flood => {
@@ -612,6 +681,18 @@ mod tests {
         let d = parse(&argv(&["parse"])).unwrap();
         assert_eq!(d.mode, Mode::Parse);
         assert_eq!(parse(&argv(&["gpu"])).unwrap().mode, Mode::Gpu);
+        let r = parse(&argv(&["replay"])).unwrap();
+        assert_eq!((r.mode, r.kill_ms, r.mib), (Mode::Replay, 1500, 8192));
+        assert_eq!(
+            parse(&argv(&["replay", "--kill-ms", "250"]))
+                .unwrap()
+                .kill_ms,
+            250
+        );
+        assert_eq!(
+            parse(&argv(&["--crash-writer"])).unwrap().mode,
+            Mode::CrashWriter
+        );
         let c = parse(&argv(&["compose"])).unwrap();
         assert_eq!(
             (c.mode, c.panes, c.visible, c.mib, c.log, c.rate_mib),

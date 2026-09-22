@@ -89,7 +89,7 @@ before it is claimed.
 | Idle | ~0% CPU, no busy polling, GPU idle when nothing changes |
 | History | 100 GB per session on disk; open, jump to any line, and search in < 1 s |
 | Memory | a fixed, machine-derived RAM budget per pane; RAM never grows with history |
-| Crash | after a crash or kill, every pane's history up to the last flush replays |
+| Crash | after a crash or kill, every pane's history up to the last flush replays — **measured** (E6, §8.0): 9 kills, every log an exact prefix, no torn tail |
 | Fault isolation | a crash in one part doesn't take the ship down: an agent, a pane, a parser, the indexer, the AI server or the GPU device each fail alone. The failed part restarts or rebuilds from its log within 2 s (target), and every other pane keeps running |
 
 Where atrium stands today (*measured*, Windows, release, output timestamped on a
@@ -632,6 +632,40 @@ separate them on throughput.
   payloads aligned (0.4 % at 1 MiB writes); that overhead is not what decides
   the comparison.
 
+**E6 result: crash and replay (measured 2026-09-22, `fwbench replay`).** §4
+promises that after a crash "every pane's history up to the last flush
+replays"; nothing had tested it. The harness spawns a writer that appends a
+*seeded* stream to a log on E: (unbuffered write-through, §8.4's pattern),
+kills it with `TerminateProcess` — no unwinding, no flush, no destructors —
+then checks the file byte for byte against the stream that produced it and
+rebuilds a screen from it.
+
+| Kills | Appends | Durable after the kill | Log an exact prefix? | Torn tail |
+| --- | --- | --- | --- | --- |
+| 9, from 20 ms to 1.5 s of writing | 256 KiB and 1 MiB | 44 MiB – 4.8 GiB | **yes, every time** | **none, every time** |
+
+- **Write-through delivers what it promises.** A killed writer leaves whole
+  appends or nothing: no partial record, no reordering, no corruption at the
+  tail. That is the property the log's crash story rests on, and it is now
+  measured rather than assumed.
+- **Replaying the log runs at 186–220 MiB/s**, the `vterm` emulation rate, as
+  expected: replay *is* parsing.
+- **A pane rebuild from 3.3 MiB of log takes 15.2–15.6 ms**, inside a 60 Hz
+  frame (16.7 ms) but with only ~9 % to spare. §8.0's checkpoint formula is
+  confirmed (3.3 MiB / 15.2 ms = 217 MiB/s, the measured parse rate), but the
+  interval it produces has no margin. **Proposal: checkpoint every ≈2 MiB**
+  (≈10 ms rebuild, 40 % margin) until the governor tunes it from measured
+  rebuild latency.
+- **What this does not test: power loss.** `TerminateProcess` kills the
+  process, not the drive. Write-through with no buffering asks the device to
+  persist each write before returning, but the 990 PRO is a consumer drive
+  with no power-loss protection, so a real power cut could still lose what sat
+  in its volatile cache. Testing that needs hardware we do not have.
+- **Still untested:** a *concurrent* crash — 16 panes writing when the kill
+  lands — and replay of a device-level log, which would have to demultiplex
+  pane-tagged records. Both matter only if §8.4's per-pane decision is
+  revisited.
+
 **What E5 settles.** §8.0 is no longer a proposal with arithmetic behind it:
 the legs compose, the pipeline runs 5–9× the target flat out, and at the target
 it leaves ~92 % of the machine idle. Two things it does not cover: key-echo
@@ -1072,7 +1106,7 @@ One concern each; names are placeholders.
 | Milestone | Deliverable | Proof |
 | --- | --- | --- |
 | **M0 Harness** | throughput and latency benchmark: N panes of recorded agent output, timestamped key echo, frame timing, RSS, disk rate. vtebench (MIT/Apache) supplies workloads, but it measures only PTY read speed, not latency or frames, so it can't be the harness. Includes experiments E1, GPU contention (`compute.md`), E2, built-in console host vs OpenConsole (§11), and **E3, CPU attribution** (§8.7b) | a baseline table for atrium today and for 1–2 existing terminals; the E1 contention table on the RTX 3070; the E3 attribution table that says which stage is worth offloading |
-| M0 status (2026-09-22) | **Mostly delivered.** `resmon` (four-resource attribution, E3) and `fwbench` (`flood`, `echo`, `combined`, `disk`, `read`, `parse` = E4, `compose` = E5, `gpu`) are in `crates/`, plus `fwcuda` (CUDA Driver API) and a noisy-run guard on every mode. Headline numbers on the quiet reference machine: transport **139 MiB/s over ConPTY** vs **1,854 over pipes**; log drive **≈1,800 MiB/s sustained** write-through, **2,745** cold read; full VT emulation **1,828 MiB/s** across 16 threads after the span tokenizer; the composed pipeline **1,312–2,429 MiB/s**, and **~92 % idle** at the 273 MiB/s target. Still to build: frame timing (needs M3), **E1** (GPU contention), **E2** (conhost vs OpenConsole), key-echo latency measured against the *composed* pipeline rather than a flood, and a crash/replay test of the log | [`crates/fwbench`](../crates/fwbench), [`crates/resmon`](../crates/resmon), [`crates/fwcuda`](../crates/fwcuda) |
+| M0 status (2026-09-22) | **Mostly delivered.** `resmon` (four-resource attribution, E3) and `fwbench` (`flood`, `echo`, `combined`, `disk`, `read`, `parse` = E4, `compose` = E5, `gpu`) are in `crates/`, plus `fwcuda` (CUDA Driver API) and a noisy-run guard on every mode. Headline numbers on the quiet reference machine: transport **139 MiB/s over ConPTY** vs **1,854 over pipes**; log drive **≈1,800 MiB/s sustained** write-through, **2,745** cold read; full VT emulation **1,828 MiB/s** across 16 threads after the span tokenizer; the composed pipeline **1,312–2,429 MiB/s**, and **~92 % idle** at the 273 MiB/s target. Still to build: frame timing (needs M3), **E1** (GPU contention), **E2** (conhost vs OpenConsole), and key-echo latency measured against the *composed* pipeline rather than a flood | [`crates/fwbench`](../crates/fwbench), [`crates/resmon`](../crates/resmon), [`crates/fwcuda`](../crates/fwcuda) |
 | **M1 Headless core** | `panelog` + fast parser + `vterm` checkpoints, driven by the harness with no UI | throughput and history targets met headless |
 | **M2 atrium adopts it** | unbounded history, search and crash replay inside atrium | atrium benchmarks don't regress; replay after a kill |
 | **M3 Renderer spike** | one platform (Windows, D3D11), glyph atlas, damaged-row redraw, CPU fallback | frame time and latency under flood vs. baseline |
