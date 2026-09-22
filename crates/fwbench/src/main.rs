@@ -2,7 +2,7 @@
 
 use fwbench::flood::Transport;
 use fwbench::{
-    compose, disk, echo, emit, flood, gpu, noise, parse as e4, read, replay, report, Run,
+    compose, disk, echo, emit, flood, gpu, history, noise, parse as e4, read, replay, report, Run,
 };
 use std::io::{self, Write};
 use std::time::Duration;
@@ -28,6 +28,9 @@ modes:
   replay        crash safety: spawn a log writer, kill it mid-append, check
                 the log against the stream that produced it, and time a screen
                 rebuild; --kill-ms N is how long it writes first (default 1500)
+  history       the section 4 history target through panelog: write --mib of
+                pane output to a log under --path, then time opening it and
+                --samples random jumps to lines
   gpu           host<->GPU copy cost via the CUDA driver (pinned and pageable,
                 64 KiB..64 MiB); --samples copies per cell (default 200)
   read          read rate of --path DIR, unbuffered and buffered, with the CPU
@@ -82,6 +85,7 @@ enum Mode {
     Compose,
     Replay,
     CrashWriter,
+    History,
     Emit { bytes: u64 },
 }
 
@@ -167,6 +171,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             }
             "disk" => {
                 mode = Some(Mode::Disk);
+                i += 1;
+            }
+            "history" => {
+                mode = Some(Mode::History);
                 i += 1;
             }
             "replay" => {
@@ -341,6 +349,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         Mode::Disk | Mode::Read => 2048,
         Mode::Compose => 256,
         Mode::Replay | Mode::CrashWriter => 8192,
+        Mode::History => 16384,
         Mode::Parse => 64,
         _ => 32,
     });
@@ -517,6 +526,27 @@ fn run(args: &Args) -> i32 {
         return 0;
     }
 
+    if args.mode == Mode::History {
+        let plan = history::Plan {
+            dir: std::path::PathBuf::from(args.path.as_deref().unwrap_or(".")),
+            bytes: args.mib * 1024 * 1024,
+            jumps: args.samples,
+        };
+        eprintln!(
+            "history: writing {} MiB under {}...",
+            args.mib,
+            plan.dir.display()
+        );
+        match history::run(&plan) {
+            Ok(h) => print!("{}", history::render(&plan, &h)),
+            Err(e) => {
+                eprintln!("fwbench: history failed: {e}");
+                return 1;
+            }
+        }
+        return 0;
+    }
+
     if args.mode == Mode::CrashWriter {
         let path = std::path::PathBuf::from(args.path.as_deref().unwrap_or("fwbench-crash.log"));
         // Killed mid-write by the parent; an error here is the parent's to see.
@@ -678,7 +708,8 @@ fn run(args: &Args) -> i32 {
         | Mode::Read
         | Mode::Compose
         | Mode::Replay
-        | Mode::CrashWriter => {
+        | Mode::CrashWriter
+        | Mode::History => {
             unreachable!("handled above")
         }
         Mode::Flood => {

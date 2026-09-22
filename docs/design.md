@@ -790,6 +790,35 @@ fixes these details; the numbers are what M1 builds and then measures.
   first slice is append, flush, crash-safe recovery, jump-to-line and range
   reads, with the §4 history target measured headless on E:.
 
+**`panelog`, first M1 slice (built and measured 2026-09-22).**
+[`nativelite/panelog-rs`](https://github.com/nativelite/panelog-rs) (private,
+MIT, std only, no `unsafe`): records of a 64-byte header (CRC-32C of header and
+payload) plus payload, padded to 4 KiB and written unbuffered write-through,
+never rewritten; 64 MiB segments; per-segment record maps and a **sparse line
+index** (one entry per 64 lines) as rebuildable caches. Recovery keeps exactly
+the records that validate, cuts a torn tail and rebuilds maps and index;
+`Reader::verify` re-checks every payload for corruption at rest.
+
+- **Why sparse:** an offset and timestamp for every line is ~40 GB of index for
+  100 GB of agent output (~40–50 bytes a line); one entry per 64 lines is
+  ~625 MB. A jump is one index read plus a scan of fewer than 64 lines.
+- **§4 history target, measured on E: (`fwbench history`, quiet machine):**
+
+  | Log size | Open | Jump to a random line p50 / p99 / max | Write | On-disk overhead |
+  | --- | --- | --- | --- | --- |
+  | 16 GiB, 338 M lines, 1,000 jumps | 40.0 ms | 0.085 / 0.172 / 0.832 ms | 777 MiB/s | 0.51 % |
+  | **100 GB (93.1 GiB), 1.97 G lines, 2,000 jumps** | **277.6 ms** | **0.112 / 0.238 / 1.377 ms** | 675 MiB/s | 0.51 % |
+
+  Open and jump-to-any-line are met with more than three orders of magnitude to
+  spare. Search, the third part of the target, is a later slice.
+- **Write rate is CPU-bound on one thread** (CRC-32C, newline scan, copy into
+  the staging record) at 675–777 MiB/s, below the drive's ≈1,800 MiB/s. That is
+  2.5× the per-machine ingest target already, and one pane never needs it;
+  hardware CRC and a SWAR newline scan are the obvious levers if it ever
+  matters.
+- Still to come in M1: checkpoints (`vterm` save/restore), marks, search,
+  compression of cold segments.
+
 - Writes are batched and flushed on a cadence and at checkpoints; the governor
   watches write latency.
 - Cold segments may be compressed (std has no compressor: a small LZ-family

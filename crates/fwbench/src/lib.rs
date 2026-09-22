@@ -35,6 +35,7 @@ pub mod emit;
 pub mod flood;
 pub mod fsm;
 pub mod gpu;
+pub mod history;
 pub mod noise;
 pub mod parse;
 pub mod read;
