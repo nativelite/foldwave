@@ -358,6 +358,11 @@ pub struct VkRenderer {
     command_pool: VkCommandPool,
     cmd: VkCommandBuffer,
     fence: VkFence,
+    /// Work was submitted with `fence` and not yet waited for. Only a
+    /// successful submit sets it: a submit that fails after the fence was
+    /// reset leaves the fence unsignalled forever, and waiting on it then
+    /// would hang.
+    fence_pending: std::cell::Cell<bool>,
 
     atlas_image: VkImage,
     atlas_memory: VkDeviceMemory,
@@ -814,6 +819,7 @@ impl VkRenderer {
             command_pool: NULL_HANDLE,
             cmd: null_mut(),
             fence: NULL_HANDLE,
+            fence_pending: std::cell::Cell::new(false),
             atlas_image: NULL_HANDLE,
             atlas_memory: NULL_HANDLE,
             atlas_view: NULL_HANDLE,
@@ -1330,9 +1336,13 @@ impl VkRenderer {
         };
         let old = w.swapchain;
         w.swapchain = NULL_HANDLE;
-        w.stale = false;
+        // `stale` stays set until every per-image resource exists: a failure
+        // part way leaves a swapchain the next acquire must rebuild, never a
+        // half-built one it would index past.
+        w.stale = true;
         if extent.width == 0 || extent.height == 0 {
             unsafe { (w.fns.destroy_swapchain)(self.device, old, null()) };
+            w.stale = false;
             return Ok(());
         }
         let mut count = caps.minImageCount + 1;
@@ -1386,6 +1396,7 @@ impl VkRenderer {
             let s = self.semaphore()?;
             w.render_done.push(s);
         }
+        w.stale = false;
         Ok(())
     }
 
@@ -1653,8 +1664,30 @@ impl VkRenderer {
                 pSignalSemaphores: null(),
             },
         };
-        // SAFETY: the fence is signalled and unused (waited above); `submit`
-        // and what it points to live across the call.
+        self.submit(&submit)
+    }
+
+    // ------------------------------------------------------------- helpers
+
+    /// Wait for the last successful submit, if any is outstanding.
+    fn wait_fence(&self) -> Result<(), Error> {
+        if !self.fence_pending.get() {
+            return Ok(());
+        }
+        // SAFETY: a live fence of this device, with work submitted to signal
+        // it (so the wait ends, or the device is lost and it returns).
+        check("vkWaitForFences", unsafe {
+            (self.dev.wait_for_fences)(self.device, 1, &self.fence, 1, u64::MAX)
+        })?;
+        self.fence_pending.set(false);
+        Ok(())
+    }
+
+    /// Reset the fence and submit `info` with it. The fence counts as pending
+    /// only once the submit succeeded.
+    fn submit(&self, info: &VkSubmitInfo) -> Result<(), Error> {
+        // SAFETY: the fence is not in use (waited, or never submitted);
+        // `info` and what it points to live across the call.
         unsafe {
             check(
                 "vkResetFences",
@@ -1662,18 +1695,11 @@ impl VkRenderer {
             )?;
             check(
                 "vkQueueSubmit",
-                (self.dev.queue_submit)(self.queue, 1, &submit, self.fence),
-            )
+                (self.dev.queue_submit)(self.queue, 1, info, self.fence),
+            )?;
         }
-    }
-
-    // ------------------------------------------------------------- helpers
-
-    fn wait_fence(&self) -> Result<(), Error> {
-        // SAFETY: a live fence of this device.
-        check("vkWaitForFences", unsafe {
-            (self.dev.wait_for_fences)(self.device, 1, &self.fence, 1, u64::MAX)
-        })
+        self.fence_pending.set(true);
+        Ok(())
     }
 
     /// Begin recording the (idle) command buffer; this implicitly resets it.
@@ -1685,10 +1711,19 @@ impl VkRenderer {
             pInheritanceInfo: null(),
         };
         // SAFETY: the buffer is not pending (callers waited on the fence) and
-        // its pool allows individual resets.
-        check("vkBeginCommandBuffer", unsafe {
-            (self.dev.begin_command_buffer)(self.cmd, &info)
-        })
+        // its pool allows individual resets. The explicit reset returns it to
+        // the initial state even if an earlier failed vkEndCommandBuffer left
+        // it recording or invalid, where begin would be invalid usage.
+        unsafe {
+            check(
+                "vkResetCommandBuffer",
+                (self.dev.reset_command_buffer)(self.cmd, 0),
+            )?;
+            check(
+                "vkBeginCommandBuffer",
+                (self.dev.begin_command_buffer)(self.cmd, &info),
+            )
+        }
     }
 
     /// End, submit with the fence, and wait for it.
@@ -1704,22 +1739,11 @@ impl VkRenderer {
             signalSemaphoreCount: 0,
             pSignalSemaphores: null(),
         };
-        // SAFETY: a recording command buffer; the fence is signalled and
-        // unused; `submit` lives across the call.
-        unsafe {
-            check(
-                "vkEndCommandBuffer",
-                (self.dev.end_command_buffer)(self.cmd),
-            )?;
-            check(
-                "vkResetFences",
-                (self.dev.reset_fences)(self.device, 1, &self.fence),
-            )?;
-            check(
-                "vkQueueSubmit",
-                (self.dev.queue_submit)(self.queue, 1, &submit, self.fence),
-            )?;
-        }
+        // SAFETY: a recording command buffer.
+        check("vkEndCommandBuffer", unsafe {
+            (self.dev.end_command_buffer)(self.cmd)
+        })?;
+        self.submit(&submit)?;
         self.wait_fence()
     }
 

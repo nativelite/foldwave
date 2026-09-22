@@ -1141,6 +1141,7 @@ fns!(DeviceFns {
     begin_command_buffer: "vkBeginCommandBuffer" =
         fn(VkCommandBuffer, *const VkCommandBufferBeginInfo) -> VkResult;
     end_command_buffer: "vkEndCommandBuffer" = fn(VkCommandBuffer) -> VkResult;
+    reset_command_buffer: "vkResetCommandBuffer" = fn(VkCommandBuffer, VkFlags) -> VkResult;
     cmd_pipeline_barrier: "vkCmdPipelineBarrier" =
         fn(VkCommandBuffer, VkFlags, VkFlags, VkFlags, u32, *const VkMemoryBarrier, u32, *const c_void, u32, *const VkImageMemoryBarrier);
     cmd_copy_buffer_to_image: "vkCmdCopyBufferToImage" =
