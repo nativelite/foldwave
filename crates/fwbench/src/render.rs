@@ -1,14 +1,15 @@
 //! M3: frame time and output-to-screen latency under a flood.
 //!
 //! An emulator thread feeds agent-like output into a `vterm` pane, paced at a
-//! rate (or flat out), and keeps the bottom row out of the scroll region as a
-//! status line. Every `marker_every` it stamps a numbered marker on that line
-//! and records when those bytes reached the emulator. The render thread (the
-//! caller's, since a window belongs to the thread that made it) turns the
-//! screen into a [`Frame`], draws it through a [`Target`] and, when the frame
-//! it has just presented shows a new marker, records the latency from arrival
-//! to present. A phase with no output then checks that nothing is drawn and
-//! prices idle CPU.
+//! rate (or flat out). Every `marker_every` it stamps the arrival time of the
+//! chunk it is about to feed, under the pane lock, so the stamp and the bytes
+//! land in the screen together. The render thread (the caller's, since a
+//! window belongs to the thread that made it) turns the screen into a
+//! [`Frame`] — noting under the same lock how many stamps that screen includes
+//! — draws it through a [`Target`], and for every stamp newly included records
+//! the latency from arrival to present. Nothing is written to the screen to
+//! measure it, so the workload is exactly what an agent would send. A phase
+//! with no output then checks that nothing is drawn and prices idle CPU.
 //!
 //! The latency is to *present returned*, not to photons: the display adds its
 //! own scan-out on top, the same for every terminal.
@@ -82,10 +83,9 @@ pub struct Rendered {
     pub render: Vec<Duration>,
     /// Target present.
     pub present: Vec<Duration>,
-    /// Marker arrival to present returned.
+    /// Stamp arrival to present returned, one sample per stamp.
     pub latency: Vec<Duration>,
-    /// Markers stamped, and how many were never shown on their own (a later
-    /// one reached the screen first).
+    /// Stamps taken.
     pub markers: u64,
     /// Frames drawn during the idle phase (should be 0).
     pub idle_frames: usize,
@@ -102,27 +102,18 @@ pub struct Rendered {
 /// A pane shared between the emulator thread and the renderer.
 struct Pane {
     term: Mutex<Term>,
-    /// Arrival time (ns since `epoch`) of marker `n`, indexed by `n`.
+    /// Arrival time (ns since `epoch`) of stamp `n`, indexed by `n`. Pushed
+    /// under the `term` lock together with the bytes it stamps.
     arrivals: Mutex<Vec<u64>>,
+    /// The renderer is waiting for `term`; the emulator steps aside, since
+    /// the lock is not fair and a flat-out feeder would starve the frame.
+    want: AtomicBool,
     /// Bytes fed.
     fed: AtomicU64,
     /// Set by the emulator after a feed, cleared by the renderer: one wake per
     /// batch instead of one per chunk.
     pending: AtomicBool,
     stop: AtomicBool,
-}
-
-/// The marker line: `MARK nnnnnnnn` at the start of the bottom row.
-fn marker_bytes(rows: usize, n: u64) -> Vec<u8> {
-    format!("\x1b7\x1b[{rows};1H\x1b[0mMARK {n:08}\x1b8").into_bytes()
-}
-
-/// The marker number the bottom row shows, if any.
-fn read_marker(term: &Term) -> Option<u64> {
-    let s = term.screen();
-    let row = s.rows() - 1;
-    let text: String = (0..13).map(|c| s.cell(row, c).ch).collect();
-    text.strip_prefix("MARK ")?.parse().ok()
 }
 
 /// Agent-like output with `\r\n` line ends, as a pty's output processing
@@ -156,12 +147,10 @@ pub fn run(
     let palette = Palette::default();
     let mut frame = Frame::new();
 
-    let mut term = Term::new(rows, cols);
-    // Reserve the bottom row for the marker line.
-    term.feed(format!("\x1b[1;{}r\x1b[H", rows - 1).as_bytes());
     let pane = Arc::new(Pane {
-        term: Mutex::new(term),
+        term: Mutex::new(Term::new(rows, cols)),
         arrivals: Mutex::new(Vec::new()),
+        want: AtomicBool::new(false),
         fed: AtomicU64::new(0),
         pending: AtomicBool::new(false),
         stop: AtomicBool::new(false),
@@ -177,27 +166,30 @@ pub fn run(
         std::thread::spawn(move || {
             const CHUNK: usize = 16 * 1024;
             let start = Instant::now();
-            let (mut at, mut sent, mut n) = (0usize, 0u64, 0u64);
+            let (mut at, mut sent) = (0usize, 0u64);
             let mut next_marker = start + every;
             while !pane.stop.load(Ordering::Relaxed) && start.elapsed() < flood {
-                let now = Instant::now();
-                if now >= next_marker {
-                    let bytes = marker_bytes(rows, n);
-                    let mut t = pane.term.lock().unwrap();
-                    pane.arrivals.lock().unwrap().push(ns(Instant::now()));
-                    t.feed(&bytes);
-                    drop(t);
-                    n += 1;
-                    next_marker += every;
-                } else if rate > 0.0 {
+                if rate > 0.0 {
                     let due = (start.elapsed().as_secs_f64() * rate * 1048576.0) as u64;
                     if sent >= due {
                         std::thread::sleep(Duration::from_micros(200));
                         continue;
                     }
                 }
+                while pane.want.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
                 let take = CHUNK.min(data.len() - at);
-                pane.term.lock().unwrap().feed(&data[at..at + take]);
+                let mut t = pane.term.lock().unwrap();
+                let now = Instant::now();
+                if now >= next_marker {
+                    pane.arrivals.lock().unwrap().push(ns(now));
+                    while next_marker <= now {
+                        next_marker += every;
+                    }
+                }
+                t.feed(&data[at..at + take]);
+                drop(t);
                 sent += take as u64;
                 pane.fed.store(sent, Ordering::Relaxed);
                 at = (at + take) % data.len();
@@ -228,7 +220,7 @@ pub fn run(
         glyphs: 0,
         atlas_misses: 0,
     };
-    let mut shown: Option<u64> = None;
+    let mut shown = 0usize;
     let started = Instant::now();
     let mut closed = false;
     let mut step = |target: &mut dyn Target,
@@ -238,12 +230,14 @@ pub fn run(
                     idle: bool| {
         pane.pending.store(false, Ordering::Release);
         let t = Instant::now();
+        pane.want.store(true, Ordering::Release);
         let mut term = pane.term.lock().unwrap();
+        pane.want.store(false, Ordering::Release);
         if !term.take_dirty() {
             return Ok(false);
         }
         frame.update(term.screen(), true, &palette, atlas, raster);
-        let marker = read_marker(&term);
+        let included = pane.arrivals.lock().unwrap().len();
         drop(term);
         let update = t.elapsed();
         if frame.damaged_rows() == 0 {
@@ -260,12 +254,13 @@ pub fn run(
         out.update.push(update);
         out.render.push(d.render);
         out.present.push(d.present);
-        if let Some(k) = marker.filter(|&k| Some(k) != shown) {
-            shown = Some(k);
-            if let Some(&arrived) = pane.arrivals.lock().unwrap().get(k as usize) {
+        if included > shown {
+            let arrivals = pane.arrivals.lock().unwrap();
+            for &arrived in &arrivals[shown..included] {
                 out.latency
                     .push(Duration::from_nanos(ns(done).saturating_sub(arrived)));
             }
+            shown = included;
         }
         Ok::<bool, io::Error>(true)
     };
@@ -369,6 +364,85 @@ impl Target for Headless {
     }
 }
 
+/// The CPU renderer in a window, blitted with GDI.
+#[cfg(windows)]
+pub struct WindowCpu {
+    window: fwrender::win::Window,
+    cpu: fwrender::CpuRenderer,
+    presenter: fwrender::win::CpuPresenter,
+    events: Vec<fwrender::win::Event>,
+}
+
+#[cfg(windows)]
+impl WindowCpu {
+    /// A window with a client area of `size` pixels.
+    pub fn new(size: (u32, u32)) -> io::Result<WindowCpu> {
+        let window = fwrender::win::Window::new("fwbench render - cpu", size.0, size.1)?;
+        let (w, h) = window.client_size();
+        Ok(WindowCpu {
+            window,
+            cpu: fwrender::CpuRenderer::new(w, h),
+            presenter: fwrender::win::CpuPresenter::new(),
+            events: Vec::new(),
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Target for WindowCpu {
+    fn name(&self) -> String {
+        "cpu (GDI blit)".into()
+    }
+
+    fn size(&self) -> (u32, u32) {
+        (self.cpu.width(), self.cpu.height())
+    }
+
+    fn draw(&mut self, frame: &Frame, atlas: &mut Atlas) -> io::Result<Draw> {
+        let t = Instant::now();
+        atlas.take_dirty();
+        let (mut lo, mut hi) = (u32::MAX, 0u32);
+        let ch = atlas.metrics().cell_h;
+        for (r, _) in frame.damage().iter().enumerate().filter(|(_, &d)| d) {
+            lo = lo.min(r as u32 * ch);
+            hi = hi.max((r as u32 + 1) * ch);
+        }
+        self.cpu.draw(frame, atlas);
+        let render = t.elapsed();
+        let t = Instant::now();
+        if lo < hi {
+            self.presenter.present(&self.window, &self.cpu, lo..hi)?;
+        }
+        Ok(Draw {
+            render,
+            present: t.elapsed(),
+        })
+    }
+
+    fn wait(&mut self, timeout: Duration) -> bool {
+        self.events.clear();
+        self.window.wait(Some(timeout), &mut self.events);
+        !self
+            .events
+            .iter()
+            .any(|e| matches!(e, fwrender::win::Event::CloseRequested))
+    }
+
+    fn waker(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let w = self.window.waker();
+        Arc::new(move || w.wake())
+    }
+}
+
+/// The Vulkan backend in a window (not merged yet).
+#[cfg(windows)]
+pub fn open_vulkan(_size: (u32, u32), _present: &str) -> io::Result<Box<dyn Target>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the Vulkan backend is not merged yet",
+    ))
+}
+
 /// The report.
 pub fn render(config: &Config, r: &Rendered) -> String {
     let secs = r.elapsed.as_secs_f64().max(1e-9);
@@ -415,13 +489,8 @@ pub fn render(config: &Config, r: &Rendered) -> String {
         line(&Summary::of(&r.present))
     );
     o += &format!(
-        "| output to present, p50 / p90 / p99 | {} |\n",
+        "| output arrival to present, p50 / p90 / p99 | {} |\n",
         line(&Summary::of(&r.latency))
-    );
-    o += &format!(
-        "| markers shown / stamped | {} / {} |\n",
-        r.latency.len(),
-        r.markers
     );
     o += &format!(
         "| glyphs rasterized (atlas misses) | {} ({}) |\n",
@@ -447,18 +516,6 @@ mod tests {
     use fwrender::{Metrics, TestRasterizer};
 
     #[test]
-    fn markers_round_trip_through_the_emulator() {
-        let mut t = Term::new(5, 20);
-        t.feed(b"\x1b[1;4r\x1b[H");
-        for i in 0..10 {
-            t.feed(format!("line {i}\r\n").as_bytes());
-        }
-        t.feed(&marker_bytes(5, 42));
-        t.feed(b"more\r\n");
-        assert_eq!(read_marker(&t), Some(42));
-    }
-
-    #[test]
     fn a_short_headless_run_draws_measures_and_goes_quiet() {
         let config = Config {
             flood: Duration::from_millis(600),
@@ -478,8 +535,13 @@ mod tests {
         assert_eq!((r.cols, r.rows), (80, 25));
         assert!(r.frames > 5, "{} frames", r.frames);
         assert!(r.bytes > 1024 * 1024, "{} bytes", r.bytes);
-        assert!(!r.latency.is_empty() && r.markers >= 10);
+        assert!(r.markers >= 10, "{} stamps", r.markers);
+        assert_eq!(
+            r.latency.len() as u64,
+            r.markers,
+            "every stamp reaches a frame"
+        );
         assert_eq!(r.idle_frames, 0, "nothing changes, nothing is drawn");
-        assert!(render(&config, &r).contains("output to present"));
+        assert!(render(&config, &r).contains("output arrival to present"));
     }
 }

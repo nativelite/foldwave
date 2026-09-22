@@ -32,6 +32,12 @@ modes:
                 pane output to a log under --path, then time opening it and
                 --samples random jumps to lines; --checkpoint-mib N also stores a
                 terminal checkpoint every N MiB and times pane rebuilds
+  render        M3: a window shows one pane flooding at --rate MiB/s (0 = flat
+                out) for --seconds (default 10), drawn by --backend cpu|vulkan;
+                times frame update, render, present and output-to-present
+                latency, then idles 3 s and counts frames and CPU. --present
+                fifo|mailbox|immediate (vulkan), --font NAME (default
+                Consolas), --px N (default 16), --size WxH (default 1600x900)
   gpu           host<->GPU copy cost via the CUDA driver (pinned and pageable,
                 64 KiB..64 MiB); --samples copies per cell (default 200)
   read          read rate of --path DIR, unbuffered and buffered, with the CPU
@@ -87,6 +93,7 @@ enum Mode {
     Replay,
     CrashWriter,
     History,
+    Render,
     Emit { bytes: u64 },
 }
 
@@ -117,6 +124,31 @@ struct Args {
     rate_mib: f64,
     flush_mib: u64,
     flush_path: Option<String>,
+    render: RenderArgs,
+}
+
+/// `render` mode's options.
+#[derive(Debug, Clone, PartialEq)]
+struct RenderArgs {
+    backend: String,
+    seconds: u64,
+    present: String,
+    font: String,
+    px: i32,
+    size: (u32, u32),
+}
+
+impl Default for RenderArgs {
+    fn default() -> Self {
+        RenderArgs {
+            backend: "cpu".into(),
+            seconds: 10,
+            present: "fifo".into(),
+            font: "Consolas".into(),
+            px: 16,
+            size: (1600, 900),
+        }
+    }
 }
 
 fn parse(argv: &[String]) -> Result<Args, String> {
@@ -146,6 +178,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut flush_mib = 0u64;
     let mut flush_path: Option<String> = None;
     let mut emit_bytes: Option<u64> = None;
+    let mut render = RenderArgs::default();
 
     let mut i = 0;
     let value = |i: &mut usize, flag: &str| -> Result<String, String> {
@@ -183,6 +216,46 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "replay" => {
                 mode = Some(Mode::Replay);
                 i += 1;
+            }
+            "render" => {
+                mode = Some(Mode::Render);
+                i += 1;
+            }
+            "--backend" => {
+                let v = value(&mut i, "--backend")?;
+                if v != "cpu" && v != "vulkan" {
+                    return Err(format!("bad --backend {v:?}, want cpu or vulkan"));
+                }
+                render.backend = v;
+            }
+            "--seconds" => {
+                let v = value(&mut i, "--seconds")?;
+                render.seconds = v.parse().map_err(|_| format!("bad --seconds {v:?}"))?;
+            }
+            "--present" => {
+                let v = value(&mut i, "--present")?;
+                if !matches!(v.as_str(), "fifo" | "mailbox" | "immediate") {
+                    return Err(format!(
+                        "bad --present {v:?}, want fifo, mailbox or immediate"
+                    ));
+                }
+                render.present = v;
+            }
+            "--font" => render.font = value(&mut i, "--font")?,
+            "--px" => {
+                let v = value(&mut i, "--px")?;
+                render.px = match v.parse() {
+                    Ok(n) if n > 0 => n,
+                    _ => return Err(format!("bad --px {v:?}")),
+                };
+            }
+            "--size" => {
+                let v = value(&mut i, "--size")?;
+                let wh = v
+                    .split_once('x')
+                    .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+                    .filter(|&(w, h): &(u32, u32)| w >= 64 && h >= 64);
+                render.size = wh.ok_or_else(|| format!("bad --size {v:?}, want WxH"))?;
             }
             "--crash-writer" => {
                 mode = Some(Mode::CrashWriter);
@@ -389,6 +462,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         rate_mib,
         flush_mib,
         flush_path,
+        render,
     })
 }
 
@@ -534,6 +608,10 @@ fn run(args: &Args) -> i32 {
             }
         }
         return 0;
+    }
+
+    if args.mode == Mode::Render {
+        return run_render(args);
     }
 
     if args.mode == Mode::History {
@@ -720,7 +798,8 @@ fn run(args: &Args) -> i32 {
         | Mode::Compose
         | Mode::Replay
         | Mode::CrashWriter
-        | Mode::History => {
+        | Mode::History
+        | Mode::Render => {
             unreachable!("handled above")
         }
         Mode::Flood => {
@@ -1087,4 +1166,52 @@ mod tests {
         g.fill(&mut buf, 8 * 1024);
         assert!(buf.len() >= 8 * 1024);
     }
+}
+
+/// `render` mode: a real window, one backend.
+#[cfg(windows)]
+fn run_render(args: &Args) -> i32 {
+    use fwbench::render;
+    let r = &args.render;
+    let mut raster = match fwrender::win::GdiRasterizer::new(&r.font, r.px) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("fwbench: font {:?} at {} px: {e}", r.font, r.px);
+            return 1;
+        }
+    };
+    let config = render::Config {
+        flood: Duration::from_secs(r.seconds),
+        idle: Duration::from_secs(3),
+        rate_mib: args.rate_mib,
+        marker_every: Duration::from_millis(20),
+    };
+    let target: io::Result<Box<dyn render::Target>> = match r.backend.as_str() {
+        "cpu" => render::WindowCpu::new(r.size).map(|t| Box::new(t) as _),
+        _ => render::open_vulkan(r.size, &r.present),
+    };
+    let mut target = match target {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("fwbench: {} backend: {e}", r.backend);
+            return 1;
+        }
+    };
+    eprintln!("render: {} for {} s...", target.name(), r.seconds);
+    match render::run(&config, target.as_mut(), &mut raster) {
+        Ok(out) => {
+            print!("{}", render::render(&config, &out));
+            0
+        }
+        Err(e) => {
+            eprintln!("fwbench: render failed: {e}");
+            1
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn run_render(_: &Args) -> i32 {
+    eprintln!("fwbench: render mode is Windows-only in the M3 spike");
+    1
 }
