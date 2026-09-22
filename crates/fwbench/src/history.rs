@@ -22,6 +22,10 @@ pub struct Plan {
     pub bytes: u64,
     /// Random line jumps to time.
     pub jumps: usize,
+    /// Store a terminal checkpoint every this many bytes (at the next point
+    /// the emulator allows one) and time pane rebuilds; 0 skips both, and the
+    /// emulator is not run during the write.
+    pub checkpoint_every: u64,
 }
 
 /// What it measured.
@@ -41,6 +45,12 @@ pub struct History {
     pub files: usize,
     /// Bytes on disk, headers and padding included.
     pub disk_bytes: u64,
+    /// Checkpoints stored.
+    pub checkpoints: usize,
+    /// Per-rebuild latency: nearest checkpoint, restore, replay to the line.
+    pub rebuild: Option<Summary>,
+    /// Largest replay a rebuild needed, in bytes.
+    pub max_replay: u64,
 }
 
 /// Write the log, open it, jump around it, remove it.
@@ -62,6 +72,8 @@ fn measure(plan: &Plan, dir: &std::path::Path) -> io::Result<History> {
     let started = Instant::now();
     {
         let mut w = Writer::create(dir, Config::default())?;
+        let mut term = vterm::Term::new(24, 80);
+        let mut since = 0u64;
         let mut written = 0u64;
         let mut at = 0usize;
         const CHUNK: usize = 64 * 1024;
@@ -70,7 +82,18 @@ fn measure(plan: &Plan, dir: &std::path::Path) -> io::Result<History> {
                 at = 0;
             }
             let take = CHUNK.min((plan.bytes - written) as usize);
-            w.append(&source[at..at + take], epoch.elapsed().as_nanos() as u64)?;
+            let chunk = &source[at..at + take];
+            w.append(chunk, epoch.elapsed().as_nanos() as u64)?;
+            if plan.checkpoint_every > 0 {
+                term.feed(chunk);
+                since += take as u64;
+                if since >= plan.checkpoint_every {
+                    if let Some(ck) = term.checkpoint() {
+                        w.checkpoint(&ck)?;
+                        since = 0;
+                    }
+                }
+            }
             at += take;
             written += take as u64;
         }
@@ -92,6 +115,38 @@ fn measure(plan: &Plan, dir: &std::path::Path) -> io::Result<History> {
         samples.push(t.elapsed());
     }
 
+    let (mut rebuild, mut max_replay) = (None, 0u64);
+    if plan.checkpoint_every > 0 {
+        let mut samples = Vec::with_capacity(plan.jumps);
+        let mut buf = vec![0u8; 64 * 1024];
+        for _ in 0..plan.jumps {
+            let n = rng.below(lines);
+            let t = Instant::now();
+            let target = r.line_start(n)?;
+            let (mut pos, mut term) = match r.checkpoint_before(target)? {
+                Some((at, blob)) => (
+                    at,
+                    vterm::Term::restore(&blob)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+                ),
+                None => (0, vterm::Term::new(24, 80)),
+            };
+            max_replay = max_replay.max(target - pos);
+            while pos < target {
+                let want = buf.len().min((target - pos) as usize);
+                let got = r.read_at(pos, &mut buf[..want])?;
+                if got == 0 {
+                    break;
+                }
+                term.feed(&buf[..got]);
+                pos += got as u64;
+            }
+            std::hint::black_box(term.screen().cursor().row);
+            samples.push(t.elapsed());
+        }
+        rebuild = Some(Summary::of(&samples));
+    }
+
     let (mut files, mut disk_bytes) = (0usize, 0u64);
     for e in std::fs::read_dir(dir)? {
         let e = e?;
@@ -106,6 +161,9 @@ fn measure(plan: &Plan, dir: &std::path::Path) -> io::Result<History> {
         jumps: Summary::of(&samples),
         files,
         disk_bytes,
+        checkpoints: r.checkpoint_count(),
+        rebuild,
+        max_replay,
     })
 }
 
@@ -136,7 +194,22 @@ pub fn render(plan: &Plan, h: &History) -> String {
         ms(h.jumps.p90),
         ms(h.jumps.p99),
         ms(h.jumps.max),
-    )
+    ) + &match &h.rebuild {
+        Some(s) => format!(
+            "| checkpoints stored (every {:.1} MiB) | {} |\n\
+             | rebuild a 24x80 pane at a random line, p50 / p90 / p99 (n = {}) | {:.2} / {:.2} / {:.2} ms |\n\
+             | slowest rebuild; largest replay | {:.2} ms; {:.2} MiB |\n",
+            plan.checkpoint_every as f64 / (1024.0 * 1024.0),
+            h.checkpoints,
+            s.count,
+            ms(s.p50),
+            ms(s.p90),
+            ms(s.p99),
+            ms(s.max),
+            h.max_replay as f64 / (1024.0 * 1024.0),
+        ),
+        None => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -152,11 +225,19 @@ mod tests {
             dir: parent.clone(),
             bytes: 3 * 1024 * 1024,
             jumps: 50,
+            checkpoint_every: 512 * 1024,
         };
         let h = run(&plan).expect("history");
         assert_eq!(h.bytes, plan.bytes);
         assert!(h.lines > 1000);
         assert_eq!(h.jumps.count, 50);
+        assert!(h.checkpoints >= 4, "{} checkpoints", h.checkpoints);
+        assert_eq!(h.rebuild.as_ref().map(|s| s.count), Some(50));
+        assert!(
+            h.max_replay <= 512 * 1024 + 64 * 1024 + 4096,
+            "{}",
+            h.max_replay
+        );
         assert!(render(&plan, &h).contains("jump to a random line"));
         assert_eq!(
             std::fs::read_dir(&parent).unwrap().count(),

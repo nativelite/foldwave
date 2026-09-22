@@ -816,8 +816,26 @@ the records that validate, cuts a torn tail and rebuilds maps and index;
   2.5× the per-machine ingest target already, and one pane never needs it;
   hardware CRC and a SWAR newline scan are the obvious levers if it ever
   matters.
-- Still to come in M1: checkpoints (`vterm` save/restore), marks, search,
-  compression of cold segments.
+- **Checkpoints (built and measured 2026-09-22).** `vterm` gained
+  `Term::checkpoint` / `Term::restore` (the whole emulator state; taken only
+  between sequences, so the tokenizer never needs saving; 24x80 ≈ 20 KB, save
+  23 µs, restore 63 µs), and `panelog` stores them beside the log
+  (`Writer::checkpoint`, `Reader::checkpoint_before`). A pane is rebuilt by
+  restoring the nearest checkpoint and replaying the log after it.
+  `fwbench history --checkpoint-mib N`, 8 GiB of agent output on E:, 1,000
+  rebuilds at random lines of a 24x80 pane:
+
+  | Checkpoint every | Rebuild p50 / p90 / p99 | Worst | Disk overhead |
+  | --- | --- | --- | --- |
+  | 2 MiB | 5.59 / 9.90 / 13.98 ms | 20.54 ms | 1.08 % |
+  | **1 MiB** | **3.09 / 5.04 / 6.94 ms** | **9.11 ms** | 1.65 % |
+
+  **Proposal: checkpoint every 1 MiB of pane output.** Every one of 1,000
+  rebuilds then fit inside one 60 Hz frame (16.7 ms); at 2 MiB the tail
+  overshoots. The difference costs 0.6 % more disk. This supersedes §8.0's
+  arithmetic figure (3.3 MiB) and E6's ~2 MiB proposal: measured end to end,
+  the tail needs the smaller interval.
+- Still to come in M1: marks, search, compression of cold segments.
 
 - Writes are batched and flushed on a cadence and at checkpoints; the governor
   watches write latency.

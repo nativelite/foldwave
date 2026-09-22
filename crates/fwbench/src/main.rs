@@ -30,7 +30,8 @@ modes:
                 rebuild; --kill-ms N is how long it writes first (default 1500)
   history       the section 4 history target through panelog: write --mib of
                 pane output to a log under --path, then time opening it and
-                --samples random jumps to lines
+                --samples random jumps to lines; --checkpoint-mib N also stores a
+                terminal checkpoint every N MiB and times pane rebuilds
   gpu           host<->GPU copy cost via the CUDA driver (pinned and pageable,
                 64 KiB..64 MiB); --samples copies per cell (default 200)
   read          read rate of --path DIR, unbuffered and buffered, with the CPU
@@ -109,6 +110,7 @@ struct Args {
     emit_cached: bool,
     emit_raw: bool,
     echo: bool,
+    checkpoint_mib: u64,
     kill_ms: u64,
     visible: usize,
     log: compose::LogMode,
@@ -136,6 +138,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut emit_cached = false;
     let mut emit_raw = false;
     let mut echo = false;
+    let mut checkpoint_mib = 0u64;
     let mut kill_ms = 1500u64;
     let mut visible = 4usize;
     let mut log = compose::LogMode::PerPane;
@@ -199,6 +202,12 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--echo" => {
                 echo = true;
                 i += 1;
+            }
+            "--checkpoint-mib" => {
+                let v = value(&mut i, "--checkpoint-mib")?;
+                checkpoint_mib = v
+                    .parse()
+                    .map_err(|_| format!("bad --checkpoint-mib {v:?}"))?;
             }
             "--kill-ms" => {
                 let v = value(&mut i, "--kill-ms")?;
@@ -373,6 +382,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         emit_cached,
         emit_raw,
         echo,
+        checkpoint_mib,
         kill_ms,
         visible,
         log,
@@ -531,6 +541,7 @@ fn run(args: &Args) -> i32 {
             dir: std::path::PathBuf::from(args.path.as_deref().unwrap_or(".")),
             bytes: args.mib * 1024 * 1024,
             jumps: args.samples,
+            checkpoint_every: args.checkpoint_mib * 1024 * 1024,
         };
         eprintln!(
             "history: writing {} MiB under {}...",
