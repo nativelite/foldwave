@@ -1023,7 +1023,9 @@ measure it.
   ran at 182 MiB/s with the full screen scrolling and at 21 MiB/s with
   `DECSTBM` set to all but the last row: the scroll moves every cell of the
   region instead of rotating the ring. TUIs with a status line use scroll
-  regions, so this is `vterm` work, recorded here and not fixed in the spike.
+  regions. **Fixed 2026-09-22** (ansi-rs 926580e): `Screen` now reaches rows
+  through a row map, so any region scrolls by rotating row indices; the same
+  probe runs 176–177 MiB/s with the region and 173–177 without.
 - **Result for decision 4:** Vulkan on Windows did not fall short, so the spike
   gives no reason for D3D11. Confirming the backend order is the founder's
   call (§11).
@@ -1342,7 +1344,7 @@ One concern each; names are placeholders.
 | M1 status (2026-09-22) | **Delivered, headless.** `panelog` (append, crash-safe recovery, sparse line index, checkpoints, trigram search, marks), `vterm` checkpoint/restore and `ansi::MarkScanner`, driven by `fwbench history`. §4 history target met at 100 GB: open 0.3–0.4 s, jump to any line 0.1–0.3 ms, search ≤ 0.5 s; pane rebuild p99 6.9 ms with 1 MiB checkpoints; last failed command found in 0.18 ms. Open: compression of cold segments (a proposal), and running checkpointing off the writer thread | [`panelog-rs`](https://github.com/nativelite/panelog-rs), [`crates/fwbench`](../crates/fwbench) |
 | **M2 atrium adopts it** | unbounded history, search and crash replay inside atrium | atrium benchmarks don't regress; replay after a kill |
 | **M3 Renderer spike** | one platform (Windows; Vulkan per §8.6, D3D11 only if it falls short), glyph atlas, damaged-row redraw, CPU fallback | frame time and latency under flood vs. baseline |
-| M3 status (2026-09-22) | **Spike delivered on Windows with Vulkan, not D3D11** (§8.6 puts Vulkan first; this row said D3D11). `fwrender`: frame with row damage, glyph atlas, CPU reference renderer, a Vulkan backend that matches it pixel for pixel, and a Win32 window. `fwbench render` at 164 fps: output to present p99 ≤ 7.2 ms on Vulkan against 10.7–18.3 ms on CPU; Vulkan's frame cost is flat at ~0.2 ms up to 2560x1400; idle draws 0 frames. Open: a comparison with other terminals (needs an external timing method), our own glyph rasterizer (GDI for now), the `vterm` scroll-region cost, and confirming decision 4 | [`crates/fwrender`](../crates/fwrender), §8.6 |
+| M3 status (2026-09-22) | **Spike delivered on Windows with Vulkan, not D3D11** (§8.6 puts Vulkan first; this row said D3D11). `fwrender`: frame with row damage, glyph atlas, CPU reference renderer, a Vulkan backend that matches it pixel for pixel, and a Win32 window. `fwbench render` at 164 fps: output to present p99 ≤ 7.2 ms on Vulkan against 10.7–18.3 ms on CPU; Vulkan's frame cost is flat at ~0.2 ms up to 2560x1400; idle draws 0 frames. Open: a comparison with other terminals (needs an external timing method), our own glyph rasterizer (GDI for now), and confirming decision 4 (the `vterm` scroll-region cost found here is fixed) | [`crates/fwrender`](../crates/fwrender), §8.6 |
 | **M4 App alpha** | window, panes, blocks, cross-pane search, governor | all §4 targets measured on the reference machine |
 
 M1–M2 pay off in atrium before any GPU work, which de-risks the expensive part.
