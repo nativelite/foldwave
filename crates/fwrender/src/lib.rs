@@ -31,6 +31,9 @@
 mod atlas;
 mod cpu;
 mod frame;
+pub mod spirv;
+#[cfg(windows)]
+pub mod vk;
 #[cfg(windows)]
 pub mod win;
 
