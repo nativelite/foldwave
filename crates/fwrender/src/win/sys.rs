@@ -196,6 +196,12 @@ pub const QS_ALLINPUT: u32 = 0x1CFF;
 pub const MWMO_INPUTAVAILABLE: u32 = 0x0004;
 pub const INFINITE: u32 = 0xFFFF_FFFF;
 pub const WAIT_FAILED: u32 = 0xFFFF_FFFF;
+/// `CreateWaitableTimerExW` flag, Windows 10 1803+ (learn.microsoft.com,
+/// CreateWaitableTimerExW, dwFlags).
+pub const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: u32 = 0x0000_0002;
+/// `TIMER_MODIFY_STATE` (0x0002) | `SYNCHRONIZE` (0x0010_0000): enough to
+/// set the timer and wait on it.
+pub const TIMER_MODIFY_AND_SYNCHRONIZE: u32 = 0x0010_0002;
 
 /// `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2` is `((DPI_AWARENESS_CONTEXT)-4)`.
 pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
@@ -349,6 +355,22 @@ extern "system" {
 #[link(name = "kernel32")]
 extern "system" {
     pub fn GetModuleHandleW(name: *const u16) -> Hinstance;
+    pub fn CreateWaitableTimerExW(
+        attributes: *const c_void,
+        name: *const u16,
+        flags: u32,
+        access: u32,
+    ) -> Handle;
+    /// `due` is a LARGE_INTEGER: negative is relative, in 100 ns units.
+    pub fn SetWaitableTimer(
+        timer: Handle,
+        due: *const i64,
+        period_ms: i32,
+        completion: *const c_void,
+        arg: *const c_void,
+        resume: i32,
+    ) -> i32;
+    pub fn CloseHandle(handle: Handle) -> i32;
 }
 
 /// `s` as NUL-terminated UTF-16.

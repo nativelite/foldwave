@@ -37,7 +37,8 @@ modes:
                 times frame update, render, present and output-to-present
                 latency, then idles 3 s and counts frames and CPU. --present
                 fifo|mailbox|immediate (vulkan), --font NAME (default
-                Consolas), --px N (default 16), --size WxH (default 1600x900)
+                Consolas), --px N (default 16), --size WxH (default 1600x900),
+                --max-fps N caps the frame rate (default 0: draw on change)
   gpu           host<->GPU copy cost via the CUDA driver (pinned and pageable,
                 64 KiB..64 MiB); --samples copies per cell (default 200)
   read          read rate of --path DIR, unbuffered and buffered, with the CPU
@@ -136,6 +137,7 @@ struct RenderArgs {
     font: String,
     px: i32,
     size: (u32, u32),
+    max_fps: u32,
 }
 
 impl Default for RenderArgs {
@@ -147,6 +149,7 @@ impl Default for RenderArgs {
             font: "Consolas".into(),
             px: 16,
             size: (1600, 900),
+            max_fps: 0,
         }
     }
 }
@@ -242,6 +245,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                 render.present = v;
             }
             "--font" => render.font = value(&mut i, "--font")?,
+            "--max-fps" => {
+                let v = value(&mut i, "--max-fps")?;
+                render.max_fps = v.parse().map_err(|_| format!("bad --max-fps {v:?}"))?;
+            }
             "--px" => {
                 let v = value(&mut i, "--px")?;
                 render.px = match v.parse() {
@@ -1185,6 +1192,7 @@ fn run_render(args: &Args) -> i32 {
         idle: Duration::from_secs(3),
         rate_mib: args.rate_mib,
         marker_every: Duration::from_millis(20),
+        max_fps: r.max_fps,
     };
     let target: io::Result<Box<dyn render::Target>> = match r.backend.as_str() {
         "cpu" => render::WindowCpu::new(r.size).map(|t| Box::new(t) as _),

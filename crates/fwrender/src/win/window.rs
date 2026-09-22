@@ -72,6 +72,11 @@ pub struct Window {
     /// The hwnd as seen by wakers; zeroed (under the lock) before the window
     /// is destroyed, so a waker never posts to a dead or reused handle.
     wake_target: Arc<Mutex<usize>>,
+    /// A high-resolution waitable timer for [`Window::wait`]'s deadline, so a
+    /// frame can be paced to well under the ~15.6 ms default timer tick that
+    /// a plain wait timeout rounds to. Null when the system has none (before
+    /// Windows 10 1803); `wait` then falls back to the millisecond timeout.
+    timer: Handle,
 }
 
 impl std::fmt::Debug for Window {
@@ -196,6 +201,15 @@ impl Window {
             hinstance,
             shared,
             wake_target: Arc::new(Mutex::new(hwnd as usize)),
+            // SAFETY: no attributes, no name; a null result is handled.
+            timer: unsafe {
+                CreateWaitableTimerExW(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                    TIMER_MODIFY_AND_SYNCHRONIZE,
+                )
+            },
         };
 
         // Size the frame for the requested client area at the DPI of the
@@ -276,23 +290,37 @@ impl Window {
             if self.drain(events) {
                 return;
             }
-            let millis = match (timeout, deadline) {
-                (None, _) | (Some(_), None) => INFINITE,
-                (Some(_), Some(d)) => {
-                    let left = d.saturating_duration_since(Instant::now());
-                    if left.is_zero() {
-                        return;
-                    }
+            let mut millis = INFINITE;
+            let mut handles = 0;
+            if let Some(d) = deadline {
+                let left = d.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return;
+                }
+                // Negative: relative, in 100 ns units, rounded up.
+                let due = -(((left.as_nanos() + 99) / 100).min(i64::MAX as u128) as i64);
+                // SAFETY: `self.timer` is our live timer handle (checked
+                // non-null); `due` outlives the call; no completion routine.
+                let armed = !self.timer.is_null()
+                    && unsafe {
+                        SetWaitableTimer(self.timer, &due, 0, std::ptr::null(), std::ptr::null(), 0)
+                    } != 0;
+                if armed {
+                    handles = 1;
+                } else {
                     // Round up so a sub-millisecond remainder still sleeps.
                     let ms = (left.as_nanos() + 999_999) / 1_000_000;
-                    ms.min(u128::from(INFINITE - 1)) as u32
+                    millis = ms.min(u128::from(INFINITE - 1)) as u32;
                 }
-            };
-            // SAFETY: no handles (count 0, null array); waits for any message.
+            } else if timeout.is_some() {
+                // A timeout too large to represent: wait without one.
+                millis = INFINITE;
+            }
+            // SAFETY: `handles` is 0 (null array) or 1 (our armed timer).
             let r = unsafe {
                 MsgWaitForMultipleObjectsEx(
-                    0,
-                    std::ptr::null(),
+                    handles,
+                    &self.timer,
                     millis,
                     QS_ALLINPUT,
                     MWMO_INPUTAVAILABLE,
@@ -339,6 +367,10 @@ impl Drop for Window {
         // SAFETY: `hwnd` is live and owned by this thread. WM_NCDESTROY clears
         // GWLP_USERDATA before `shared` is freed after this block.
         unsafe { DestroyWindow(self.hwnd) };
+        if !self.timer.is_null() {
+            // SAFETY: our timer handle, closed once.
+            unsafe { CloseHandle(self.timer) };
+        }
     }
 }
 

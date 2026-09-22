@@ -45,6 +45,11 @@ pub trait Target {
     fn wait(&mut self, timeout: Duration) -> bool;
     /// A function any thread may call to end a [`Target::wait`] early.
     fn waker(&self) -> Arc<dyn Fn() + Send + Sync>;
+    /// Set up anything that needs the atlas (a GPU device, a swapchain)
+    /// before the clock starts.
+    fn prepare(&mut self, _atlas: &mut Atlas) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// What to run.
@@ -58,6 +63,8 @@ pub struct Config {
     pub rate_mib: f64,
     /// Time between markers.
     pub marker_every: Duration,
+    /// Frame-rate cap; 0 draws whenever something changed.
+    pub max_fps: u32,
 }
 
 /// What a run measured.
@@ -146,6 +153,7 @@ pub fn run(
     let mut atlas = Atlas::new(m, 2048, 2048);
     let palette = Palette::default();
     let mut frame = Frame::new();
+    target.prepare(&mut atlas)?;
 
     let pane = Arc::new(Pane {
         term: Mutex::new(Term::new(rows, cols)),
@@ -157,6 +165,15 @@ pub fn run(
     });
     let epoch = Instant::now();
     let ns = move |t: Instant| t.duration_since(epoch).as_nanos() as u64;
+
+    // Draw the blank screen once, uncounted, so the first measured frame
+    // does not pay for pipeline and swapchain warm-up.
+    {
+        let term = pane.term.lock().unwrap();
+        frame.update(term.screen(), true, &palette, &mut atlas, raster);
+    }
+    target.draw(&frame, &mut atlas)?;
+    frame.clear_damage();
 
     let data = Arc::new(workload(32 * 1024 * 1024));
     let wake = target.waker();
@@ -265,9 +282,23 @@ pub fn run(
         Ok::<bool, io::Error>(true)
     };
 
+    let min_interval = if config.max_fps > 0 {
+        Duration::from_secs_f64(1.0 / config.max_fps as f64)
+    } else {
+        Duration::ZERO
+    };
+    let mut last_draw: Option<Instant> = None;
     while started.elapsed() < config.flood + Duration::from_millis(100) {
-        step(&mut *target, &mut frame, &mut atlas, &mut out, false)?;
-        if !target.wait(Duration::from_millis(50)) {
+        let since = last_draw.map_or(min_interval, |t| t.elapsed());
+        let timeout = if since < min_interval {
+            min_interval - since
+        } else {
+            if step(&mut *target, &mut frame, &mut atlas, &mut out, false)? {
+                last_draw = Some(Instant::now());
+            }
+            Duration::from_millis(50)
+        };
+        if !target.wait(timeout) {
             closed = true;
             break;
         }
@@ -434,27 +465,141 @@ impl Target for WindowCpu {
     }
 }
 
-/// The Vulkan backend in a window (not merged yet).
+/// The Vulkan backend in a window. The renderer is made on the first draw,
+/// because it needs the atlas, which [`run`] owns.
 #[cfg(windows)]
-pub fn open_vulkan(_size: (u32, u32), _present: &str) -> io::Result<Box<dyn Target>> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "the Vulkan backend is not merged yet",
-    ))
+pub struct WindowVulkan {
+    state: VkState,
+    mode: fwrender::vk::PresentMode,
+    events: Vec<fwrender::win::Event>,
+}
+
+#[cfg(windows)]
+enum VkState {
+    Window(fwrender::win::Window),
+    Ready(fwrender::vk::VkWindow),
+    Failed,
+}
+
+#[cfg(windows)]
+impl WindowVulkan {
+    fn window(&mut self) -> Option<&mut fwrender::win::Window> {
+        match &mut self.state {
+            VkState::Window(w) => Some(w),
+            VkState::Ready(v) => Some(v.window_mut()),
+            VkState::Failed => None,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Target for WindowVulkan {
+    fn name(&self) -> String {
+        match &self.state {
+            VkState::Ready(_) => format!("vulkan ({:?})", self.mode),
+            _ => format!("vulkan ({:?}, not prepared)", self.mode),
+        }
+    }
+
+    fn size(&self) -> (u32, u32) {
+        match &self.state {
+            VkState::Window(w) => w.client_size(),
+            VkState::Ready(v) => v.window().client_size(),
+            VkState::Failed => (0, 0),
+        }
+    }
+
+    fn prepare(&mut self, atlas: &mut Atlas) -> io::Result<()> {
+        if let VkState::Window(_) = self.state {
+            let VkState::Window(w) = std::mem::replace(&mut self.state, VkState::Failed) else {
+                unreachable!()
+            };
+            let mut v = fwrender::vk::VkWindow::new(w, atlas, self.mode).map_err(vk_error)?;
+            eprintln!("render: vulkan device {}", v.renderer().device_name());
+            self.state = VkState::Ready(v);
+        }
+        Ok(())
+    }
+
+    fn draw(&mut self, frame: &Frame, atlas: &mut Atlas) -> io::Result<Draw> {
+        let t = Instant::now();
+        let VkState::Ready(v) = &mut self.state else {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "vulkan is not prepared",
+            ));
+        };
+        let stats = v.renderer().draw(frame, atlas).map_err(vk_error)?;
+        let total = t.elapsed();
+        Ok(Draw {
+            render: total.saturating_sub(stats.present),
+            present: stats.present,
+        })
+    }
+
+    fn wait(&mut self, timeout: Duration) -> bool {
+        self.events.clear();
+        let mut events = std::mem::take(&mut self.events);
+        if let Some(w) = self.window() {
+            w.wait(Some(timeout), &mut events);
+        }
+        let closed = events
+            .iter()
+            .any(|e| matches!(e, fwrender::win::Event::CloseRequested));
+        self.events = events;
+        !closed
+    }
+
+    fn waker(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let w = match &self.state {
+            VkState::Window(w) => w.waker(),
+            VkState::Ready(v) => v.window().waker(),
+            VkState::Failed => return Arc::new(|| {}),
+        };
+        Arc::new(move || w.wake())
+    }
+}
+
+#[cfg(windows)]
+fn vk_error(e: fwrender::vk::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, e.to_string())
+}
+
+/// Open the Vulkan backend in a window of `size` pixels, presenting with
+/// `present` (`fifo`, `mailbox` or `immediate`).
+#[cfg(windows)]
+pub fn open_vulkan(size: (u32, u32), present: &str) -> io::Result<Box<dyn Target>> {
+    use fwrender::vk::PresentMode;
+    let mode = match present {
+        "mailbox" => PresentMode::Mailbox,
+        "immediate" => PresentMode::Immediate,
+        _ => PresentMode::Fifo,
+    };
+    let window = fwrender::win::Window::new("fwbench render - vulkan", size.0, size.1)?;
+    Ok(Box::new(WindowVulkan {
+        state: VkState::Window(window),
+        mode,
+        events: Vec::new(),
+    }))
 }
 
 /// The report.
 pub fn render(config: &Config, r: &Rendered) -> String {
     let secs = r.elapsed.as_secs_f64().max(1e-9);
+    let cap = if config.max_fps > 0 {
+        format!(", capped at {} fps", config.max_fps)
+    } else {
+        String::new()
+    };
     let rate = if config.rate_mib > 0.0 {
         format!("{:.1} MiB/s", config.rate_mib)
     } else {
         "flat out".into()
     };
     let mut o = format!(
-        "render: {} - {}x{} cells in {}x{} px, output {}, {:.1} s\n\n\
+        "render: {} - {}x{} cells in {}x{} px, output {}{}, {:.1} s\n\n\
          | measure | result |\n| --- | --- |\n",
-        r.backend, r.cols, r.rows, r.size.0, r.size.1, rate, secs
+        r.backend, r.cols, r.rows, r.size.0, r.size.1, rate, cap, secs
     );
     let line = |s: &Summary| {
         format!(
@@ -522,6 +667,7 @@ mod tests {
             idle: Duration::from_millis(300),
             rate_mib: 8.0,
             marker_every: Duration::from_millis(20),
+            max_fps: 0,
         };
         let mut target = Headless::new(80 * 8, 25 * 16);
         let mut raster = TestRasterizer {

@@ -2147,3 +2147,44 @@ fn pick_device(
     best.map(|(_, pd, family, name)| (pd, family, name))
         .ok_or(Error::NoSuitableDevice)
 }
+
+/// A window and the Vulkan renderer drawing into it, owned together so the
+/// renderer can never outlive the window its surface was made for. The safe
+/// way to put [`VkRenderer`] on screen.
+pub struct VkWindow {
+    // Declared first so it drops first: the surface belongs to `window`.
+    renderer: VkRenderer,
+    window: crate::win::Window,
+}
+
+impl VkWindow {
+    /// Make a renderer for `window` at its current client size.
+    pub fn new(
+        window: crate::win::Window,
+        atlas: &Atlas,
+        mode: PresentMode,
+    ) -> Result<VkWindow, Error> {
+        let (w, h) = window.client_size();
+        // SAFETY: the handles are `window`'s, and `window` is moved into the
+        // result next to the renderer, which drops first (field order).
+        let renderer = unsafe {
+            VkRenderer::for_window(window.hinstance(), window.hwnd(), w, h, atlas, mode)
+        }?;
+        Ok(VkWindow { renderer, window })
+    }
+
+    /// The window.
+    pub fn window(&self) -> &crate::win::Window {
+        &self.window
+    }
+
+    /// The window, for pumping its events.
+    pub fn window_mut(&mut self) -> &mut crate::win::Window {
+        &mut self.window
+    }
+
+    /// The renderer.
+    pub fn renderer(&mut self) -> &mut VkRenderer {
+        &mut self.renderer
+    }
+}
