@@ -42,6 +42,7 @@ pub mod replay;
 pub mod report;
 pub mod scan;
 pub mod stats;
+pub mod terminal;
 
 pub use echo::EchoResult;
 pub use flood::{FloodResult, PaneResult};

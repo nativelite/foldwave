@@ -14,6 +14,7 @@
 //! the keys accumulate on an abandoned command line and the process is killed.
 
 use crate::stats::Summary;
+use crate::terminal::Watcher;
 use std::io;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -74,17 +75,25 @@ pub fn default_shell() -> &'static str {
 pub fn run(shell: &str, samples: usize, gap: Duration) -> io::Result<EchoResult> {
     let mut pty = pty::Pty::spawn(shell, &[], 24, 80)?;
     let mut reader = pty.reader()?;
-    let (tx, rx) = mpsc::channel::<Instant>();
+    let (tx, rx) = mpsc::channel::<Msg>();
 
-    // The reader thread times arrival the moment the blocking read returns.
+    // The reader thread times arrival the moment the blocking read returns,
+    // and hands back any terminal query the console host asked, which the main
+    // thread answers: it owns the write side.
     let reader_thread = std::thread::spawn(move || {
         let mut buf = vec![0u8; 16 * 1024];
+        let mut watcher = Watcher::new();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
-                Ok(_) => {
+                Ok(n) => {
                     let arrived = Instant::now();
-                    if tx.send(arrived).is_err() {
+                    for reply in watcher.replies(&buf[..n]) {
+                        if tx.send(Msg::Reply(reply)).is_err() {
+                            return;
+                        }
+                    }
+                    if tx.send(Msg::Arrived(arrived)).is_err() {
                         break; // the run finished
                     }
                 }
@@ -93,22 +102,25 @@ pub fn run(shell: &str, samples: usize, gap: Duration) -> io::Result<EchoResult>
         }
     });
 
-    settle(&rx);
+    settle(&rx, &mut pty);
 
     let mut latencies = Vec::with_capacity(samples);
     let mut lost = 0usize;
     for _ in 0..samples {
-        // Discard anything still in flight so the next arrival is ours.
-        while rx.try_recv().is_ok() {}
+        // Discard anything still in flight so the next arrival is ours, but
+        // still answer any query among it.
+        while let Ok(msg) = rx.try_recv() {
+            answer(&msg, &mut pty);
+        }
 
         let sent = Instant::now();
         if pty.write(b"x").is_err() {
             lost += 1;
             break;
         }
-        match rx.recv_timeout(ECHO_TIMEOUT) {
-            Ok(arrived) => latencies.push(arrived.saturating_duration_since(sent)),
-            Err(_) => lost += 1,
+        match wait_for_arrival(&rx, &mut pty, sent + ECHO_TIMEOUT) {
+            Some(arrived) => latencies.push(arrived.saturating_duration_since(sent)),
+            None => lost += 1,
         }
         std::thread::sleep(gap);
     }
@@ -132,14 +144,46 @@ pub fn run(shell: &str, samples: usize, gap: Duration) -> io::Result<EchoResult>
     })
 }
 
+/// What the reader thread tells the main thread.
+enum Msg {
+    /// Output arrived at this instant.
+    Arrived(Instant),
+    /// The console host asked a terminal query; write this answer back.
+    Reply(&'static [u8]),
+}
+
+/// Answer a query; arrivals need nothing.
+fn answer(msg: &Msg, pty: &mut pty::Pty) {
+    if let Msg::Reply(bytes) = msg {
+        let _ = pty.write(bytes);
+    }
+}
+
+/// The next output arrival before `deadline`, answering queries meanwhile.
+fn wait_for_arrival(
+    rx: &mpsc::Receiver<Msg>,
+    pty: &mut pty::Pty,
+    deadline: Instant,
+) -> Option<Instant> {
+    loop {
+        let left = deadline.checked_duration_since(Instant::now())?;
+        match rx.recv_timeout(left) {
+            Ok(Msg::Arrived(at)) => return Some(at),
+            Ok(reply) => answer(&reply, pty),
+            Err(_) => return None,
+        }
+    }
+}
+
 /// Wait until the shell stops producing output, so its banner and prompt are
-/// not mistaken for an echo. Gives up after [`SETTLE_LIMIT`].
-fn settle(rx: &mpsc::Receiver<Instant>) {
+/// not mistaken for an echo, answering any query the console host asks on the
+/// way. Gives up after [`SETTLE_LIMIT`].
+fn settle(rx: &mpsc::Receiver<Msg>, pty: &mut pty::Pty) {
     let deadline = Instant::now() + SETTLE_LIMIT;
     while Instant::now() < deadline {
         match rx.recv_timeout(SETTLE_QUIET) {
-            Ok(_) => continue, // still talking
-            Err(_) => return,  // quiet for SETTLE_QUIET: settled
+            Ok(msg) => answer(&msg, pty), // still talking
+            Err(_) => return,             // quiet for SETTLE_QUIET: settled
         }
     }
 }

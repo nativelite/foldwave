@@ -54,6 +54,9 @@ options:
                 \"none\" skips scaling). Set core placement from outside, e.g.
                 cmd /c start /b /wait /affinity 0x555 fwbench parse ...
   --reps N      parse: timed repetitions per cell (default 5)
+  --conpty DLL  host every pty with this ConPTY implementation instead of the
+                system conhost.exe, e.g. Windows Terminal's conpty.dll, which
+                starts the OpenConsole.exe beside it (experiment E2)
   --noise-limit C  cores other processes may use during a run before it is
                 marked NOISY (default 0.05, i.e. 5% of one core)
   -h, --help    this message
@@ -94,6 +97,7 @@ struct Args {
     threads: Vec<usize>,
     reps: usize,
     noise_limit: f64,
+    conpty: Option<String>,
     echo: bool,
     kill_ms: u64,
     visible: usize,
@@ -118,6 +122,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut threads = vec![1, 2, 4, 6, 8, 12, 16];
     let mut reps = 5usize;
     let mut noise_limit = noise::DEFAULT_LIMIT_CORES;
+    let mut conpty: Option<String> = None;
     let mut echo = false;
     let mut kill_ms = 1500u64;
     let mut visible = 4usize;
@@ -164,6 +169,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                 mode = Some(Mode::CrashWriter);
                 i += 1;
             }
+            "--conpty" => conpty = Some(value(&mut i, "--conpty")?),
             "--echo" => {
                 echo = true;
                 i += 1;
@@ -336,6 +342,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         threads,
         reps,
         noise_limit,
+        conpty,
         echo,
         kill_ms,
         visible,
@@ -384,6 +391,15 @@ fn main() {
             }
         }
         return;
+    }
+
+    #[cfg(windows)]
+    if let Some(dll) = &args.conpty {
+        if let Err(e) = pty::use_conpty_library(std::path::Path::new(dll)) {
+            eprintln!("fwbench: cannot load ConPTY library {dll}: {e}");
+            std::process::exit(1);
+        }
+        println!("console host: {dll} (not the system conhost.exe)");
     }
 
     // Every measuring mode is bracketed by the noisy-run guard.
@@ -790,6 +806,12 @@ mod tests {
             Mode::CrashWriter
         );
         assert!(parse(&argv(&["compose", "--echo"])).unwrap().echo);
+        assert_eq!(
+            parse(&argv(&["flood", "--conpty", "x.dll"]))
+                .unwrap()
+                .conpty,
+            Some("x.dll".to_string())
+        );
         assert!(!parse(&argv(&["compose"])).unwrap().echo);
         let c = parse(&argv(&["compose"])).unwrap();
         assert_eq!(

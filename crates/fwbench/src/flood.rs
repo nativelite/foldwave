@@ -223,18 +223,25 @@ fn drain_pane(index: usize, exe: &str, bytes: u64, rows: u16, cols: u16) -> Pane
     // The reader must keep draining while the child runs, or the pipe fills and
     // the child stalls. It runs on its own thread for exactly that reason
     // (design section 8.1).
+    let (replies_tx, replies_rx) = std::sync::mpsc::channel::<&'static [u8]>();
     let counter = std::thread::spawn(move || {
         let mut reader = reader;
         let mut buf = vec![0u8; 64 * 1024];
         let mut bytes_read = 0u64;
         let mut reads = 0u64;
         let mut error = None;
+        let mut watcher = crate::terminal::Watcher::new();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
                     bytes_read += n as u64;
                     reads += 1;
+                    // A console host that asks a terminal query (OpenConsole
+                    // opens with one) stalls until it is answered.
+                    for reply in watcher.replies(&buf[..n]) {
+                        let _ = replies_tx.send(reply);
+                    }
                 }
                 Err(e) if e.kind() == io::ErrorKind::BrokenPipe => break,
                 Err(e) => {
@@ -246,10 +253,27 @@ fn drain_pane(index: usize, exe: &str, bytes: u64, rows: u16, cols: u16) -> Pane
         (bytes_read, reads, error)
     });
 
-    // Wait for the child to finish emitting, then close the pseudoconsole so
-    // the reader reaches end-of-stream. Dropping the `Pty` before the join is
-    // required on Windows; the other order deadlocks (see `echo.rs`).
-    let _ = pty.wait();
+    // Wait for the child to finish emitting, answering terminal queries while
+    // it runs, then close the pseudoconsole so the reader reaches
+    // end-of-stream. Dropping the `Pty` before the join is required on Windows;
+    // the other order deadlocks (see `echo.rs`).
+    loop {
+        match replies_rx.recv_timeout(std::time::Duration::from_millis(5)) {
+            Ok(reply) => {
+                let _ = pty.write(reply);
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            // The reader is gone; keep polling for exit without spinning.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                std::thread::sleep(std::time::Duration::from_millis(5))
+            }
+        }
+        match pty.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) => {}
+        }
+    }
     drop(pty);
 
     let (bytes_read, reads, error) = match counter.join() {

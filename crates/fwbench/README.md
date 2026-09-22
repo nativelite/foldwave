@@ -38,7 +38,12 @@ cargo run --release --bin fwbench -- combined --panes 8 --mib 32 --samples 120
 Options: `--panes N`, `--mib N`, `--samples N`, `--gap-ms N`, `--shell NAME`,
 `--no-attrib`; for `disk`, `--path DIR` (the reference log drive is `E:\`),
 `--io-kib N` (default 1024) and `--qd N` (default 8), with `--mib` defaulting
-to 2048 per pattern. Every mode ends with a **noise** line: CPU used by processes
+to 2048 per pattern. `--conpty DLL` hosts every pty with another ConPTY implementation instead of
+the system `conhost.exe` — Windows Terminal's `conpty.dll` starts the
+`OpenConsole.exe` beside it (experiment E2). The harness answers the
+Device Attributes and cursor-position queries a console host may send, as
+any terminal must: OpenConsole draws nothing until its opening query is
+answered. Every mode ends with a **noise** line: CPU used by processes
 outside fwbench's own tree during the run, the heaviest programs by name, and
 NOISY when it exceeds `--noise-limit` cores (default 0.05, i.e. 5% of one core).
 For `parse`, `--mib` (default 64, per pane), `--reps N`

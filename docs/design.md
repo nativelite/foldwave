@@ -110,7 +110,8 @@ each leg does in isolation, so a plan for using them together starts from facts.
 | **SSD (E:)** — unbuffered write-through, 1 MiB appends, one write in flight (`fwbench disk`, 2026-09-21/22) | ≈1,800 MiB/s sustained past the SLC cache (p99 ≈1.1 ms); 4,295 MiB/s held across a 16 GiB burst inside it | **6.6×** |
 | **GPU** — RTX 3070 | not yet measured (experiment E1, [`compute.md`](compute.md)) | — |
 | *transport:* headless pipe, 16 panes | ≥ 1854 MiB/s | 6.8× (a floor, §8.9) |
-| *transport:* ConPTY, 16 panes | 139 MiB/s | **0.51× — misses** |
+| *transport:* ConPTY via the built-in `conhost.exe`, 16 panes | 139–145 MiB/s | **0.51× — misses** |
+| *transport:* ConPTY via OpenConsole 1.24 (E2, 2026-09-22), 16 panes | **433–444 MiB/s** | **1.6×** |
 
 **What this says about the architecture:**
 
@@ -1029,7 +1030,9 @@ take the ship down.
       undercut this, because the wait happens before we ever see the bytes.
     - It shows up in the tail even at a comfortable cadence: at a 25 ms gap,
       p50 was 0.06 ms but p99 was 11.74 ms (*measured, under an 8-pane flood*).
-      **The §4 p99 < 5 ms target is therefore not reachable through ConPTY**,
+      **The §4 p99 < 5 ms target is therefore not reachable through the
+      built-in `conhost.exe`** — E2 (§11) found OpenConsole has no such tick and
+      meets it (p99 0.31–0.43 ms under an 8-pane flood),
       only on the headless and pty transports.
     - Which strengthens the headless-over-pipes preference in the transport
       table below: it is not only the fastest path, it is the only one without
@@ -1138,7 +1141,7 @@ One concern each; names are placeholders.
 | Milestone | Deliverable | Proof |
 | --- | --- | --- |
 | **M0 Harness** | throughput and latency benchmark: N panes of recorded agent output, timestamped key echo, frame timing, RSS, disk rate. vtebench (MIT/Apache) supplies workloads, but it measures only PTY read speed, not latency or frames, so it can't be the harness. Includes experiments E1, GPU contention (`compute.md`), E2, built-in console host vs OpenConsole (§11), and **E3, CPU attribution** (§8.7b) | a baseline table for atrium today and for 1–2 existing terminals; the E1 contention table on the RTX 3070; the E3 attribution table that says which stage is worth offloading |
-| M0 status (2026-09-22) | **Mostly delivered.** `resmon` (four-resource attribution, E3) and `fwbench` (`flood`, `echo`, `combined`, `disk`, `read`, `parse` = E4, `compose` = E5, `gpu`) are in `crates/`, plus `fwcuda` (CUDA Driver API) and a noisy-run guard on every mode. Headline numbers on the quiet reference machine: transport **139 MiB/s over ConPTY** vs **1,854 over pipes**; log drive **≈1,800 MiB/s sustained** write-through, **2,745** cold read; full VT emulation **1,828 MiB/s** across 16 threads after the span tokenizer; the composed pipeline **1,312–2,429 MiB/s**, and **~92 % idle** at the 273 MiB/s target. Still to build: frame timing (needs M3), **E1** (GPU contention) and **E2** (conhost vs OpenConsole). Measured since the last status: the crash/replay test (E6) and key echo against the composed pipeline | [`crates/fwbench`](../crates/fwbench), [`crates/resmon`](../crates/resmon), [`crates/fwcuda`](../crates/fwcuda) |
+| M0 status (2026-09-22) | **Mostly delivered.** `resmon` (four-resource attribution, E3) and `fwbench` (`flood`, `echo`, `combined`, `disk`, `read`, `parse` = E4, `compose` = E5, `gpu`) are in `crates/`, plus `fwcuda` (CUDA Driver API) and a noisy-run guard on every mode. Headline numbers on the quiet reference machine: transport **139 MiB/s over ConPTY** vs **1,854 over pipes**; log drive **≈1,800 MiB/s sustained** write-through, **2,745** cold read; full VT emulation **1,828 MiB/s** across 16 threads after the span tokenizer; the composed pipeline **1,312–2,429 MiB/s**, and **~92 % idle** at the 273 MiB/s target. Still to build: frame timing (needs M3) and **E1** (GPU contention). **E2 done 2026-09-22**: OpenConsole beats the built-in host on every measure; how to ship it is a founder decision. Measured since the last status: the crash/replay test (E6) and key echo against the composed pipeline | [`crates/fwbench`](../crates/fwbench), [`crates/resmon`](../crates/resmon), [`crates/fwcuda`](../crates/fwcuda) |
 | **M1 Headless core** | `panelog` + fast parser + `vterm` checkpoints, driven by the harness with no UI | throughput and history targets met headless |
 | **M2 atrium adopts it** | unbounded history, search and crash replay inside atrium | atrium benchmarks don't regress; replay after a kill |
 | **M3 Renderer spike** | one platform (Windows, D3D11), glyph atlas, damaged-row redraw, CPU fallback | frame time and latency under flood vs. baseline |
@@ -1157,7 +1160,7 @@ Founder answers of 2026-09-15.
 | 3 | Reusing open source | **Inspiration over original code.** Copying is a rare exception | Now in [standards/zero-dependency.md](https://github.com/nativelite/ops/blob/main/standards/zero-dependency.md). Inspiration needs no notice; any copied code keeps its MIT/Apache notice (a legal requirement) |
 | 4 | GPU binding | **Our own bindings, not wgpu** | Backend order recommended in §8.6: Vulkan, CPU fallback, Metal later, D3D11 only if the spike needs it. To confirm after the M3 spike |
 | 5 | Platforms | **Windows first**, groundwork for others | Vulkan and a pane-transport interface keep Linux close; macOS gets Metal later |
-| 6 | Console host | **Decide by measurement (experiment E2).** Founder wants the most performant option | Built-in host vs bundled OpenConsole, below. Either way agents run headless over pipes where they document it, and Linux/macOS use ptys |
+| 6 | Console host | **Decide by measurement (experiment E2).** Founder wants the most performant option. **Measured 2026-09-22: OpenConsole is clearly better** (3× throughput, p99 under a flood 0.31–0.43 ms vs 6.2–9.9 ms, 6× less host CPU per byte); *how* to ship it is open, see the E2 result | Built-in host vs bundled OpenConsole, below. Either way agents run headless over pipes where they document it, and Linux/macOS use ptys |
 | 7 | GPU compute | **Use the GPU wherever it helps**, balanced across SSD, RAM, GPU and CPU | Every GPU path gets a CPU path and a benchmark; §8.7a lists the candidates; local AI stays out of process |
 | 8 | Targets | **Confirmed**, plus **fault isolation**: a crash recovers without taking the ship down | §4 targets; §8.8a design |
 | 9 | Leveraging the whole machine | **Aim offload at work that is GPU-shaped, not at the utilization number.** The governor's first input is CPU pressure | Founder observation 2026-09-15: CPU 80–99% while the GPU idles. §8.7b places every stage and names what will never move; index construction (§8.7a) is the new GPU candidate; E3 measures it |
@@ -1171,6 +1174,60 @@ Founder answers of 2026-09-15.
 | Cost of testing OpenConsole | the standard pseudo-console call always starts the built-in host, so it needs our own launch code, inspired by Windows Terminal's `winconpty` (MIT) |
 | Sharpened by M0 (2026-09-15) | the built-in host coalesces output on a ≈15.2 ms tick (§8.9, measured). The first question for OpenConsole is whether it shows the same period, since that tick, not our code, sets the p99 floor for every ConPTY pane |
 | Decision rule | bundle it (optional, falling back to the built-in host) only if it is clearly better on throughput or p99 latency; otherwise don't |
+
+**E2 result (measured 2026-09-22, quiet machine).** Windows' built-in
+`conhost.exe` (10.0.26100.1) against OpenConsole from the
+`Microsoft.Windows.Console.ConPTY` 1.24.260710001 package (MIT, the same
+version line as the installed Windows Terminal 1.24), loaded at runtime with
+`nativelite-pty`'s new `use_conpty_library` and `fwbench --conpty`. Identical
+harness, workload and machine; only the console host differs.
+
+*The first attempt was wrong, and why matters for foldwave.* OpenConsole opens
+every session with a Primary Device Attributes query (`ESC [ c`) and **draws
+nothing until a terminal answers it**; the built-in host never asks. The
+harness did not answer, so the first run measured that stall: OpenConsole
+looked *half* as fast, and each echo run had one ~680 ms key and one lost key.
+`fwbench` now answers DA1 and cursor-position queries as any terminal must
+(`crates/fwbench/src/terminal.rs`). **foldwave's emulator has to answer them
+too**, or every OpenConsole pane starts with a stall.
+
+| Measure | `conhost.exe` | OpenConsole | |
+| --- | --- | --- | --- |
+| Flood, 1 pane (32 MiB, 2 rounds) | 16.4–17.1 MiB/s | 58.3–58.8 MiB/s | **3.4×** |
+| Flood, 4 panes | 64.2–66.2 | 171.3–188.9 | **2.8×** |
+| Flood, 8 panes | 89.8–98.8 | 272.0–277.3 | **2.9×** |
+| Flood, 16 panes | 144.0–145.3 | 433.0–443.8 | **3.0×** |
+| Key echo, keys back to back (0 ms gap, n = 60) | p50 15.46 ms | p50 **0.01 ms** | no tick |
+| Key echo, 25 ms gap (n = 60) | p50 0.13, p99 0.57 ms | p50 0.13, p99 0.72 ms | even |
+| Key echo **during** an 8-pane flood (n = 200, 2 runs) | p99 **9.89 / 6.23 ms — over** | p99 **0.31 / 0.43 ms** | meets §4 |
+| Flood throughput in that same run | 97.4–98.2 MiB/s | 288.6–289.1 MiB/s | 2.9× |
+| Host CPU per MiB of output (16 × 128 MiB) | 86.8–87.0 ms | 13.3–14.4 ms | **6× less** |
+| Peak working set per host | 8.3–8.7 MiB | 10.9 MiB | +2.4 MiB |
+
+- **The ≈15.2 ms coalescing tick is conhost's, not ConPTY's.** OpenConsole
+  echoes keys sent back to back in 0.01 ms at the median; conhost's p50 still
+  follows 15.2 ms minus the gap. That settles the open question in §8.9: the
+  tick is the built-in host's own render timer, not the Windows timer
+  resolution and not `cmd`.
+- **OpenConsole meets the §4 input target through ConPTY; conhost cannot.**
+- **The built-in host is CPU-bound, and it is expensive.** At 16 panes the
+  conhosts burned ≈13 of 16 logical cores to move 145 MiB/s. OpenConsole moved
+  465–473 MiB/s on about 7. Even OpenConsole spends real CPU per byte —
+  another reason agents that can run headless should (§8.1).
+- **By E2's own decision rule, OpenConsole is clearly better** — on
+  throughput, on p99 latency and on CPU — so the rule says bundle it, optional,
+  falling back to the built-in host.
+- **How to get it onto users' machines is a founder decision**, because every
+  route touches the zero-dependency rule differently:
+  1. *Bundle* the NuGet package's `conpty.dll` + `OpenConsole.exe` (MIT,
+     ~1.2 MB): simplest, but ships Microsoft binaries in a nativelite app.
+  2. *Use an installed Windows Terminal's* `OpenConsole.exe` when present,
+     with our own launcher (a port of `winconpty`, MIT, needing `ntdll`
+     calls): nothing redistributed, but only helps users who have Windows
+     Terminal, and the launcher leans on undocumented console-driver details.
+  3. *Build OpenConsole from source* (MIT) as part of the release: no opaque
+     binaries, but a large C++ build in a Rust project.
+  E2 answers *whether*; this is *how*, and it is not decided here.
 
 **Naming: foldwave (founder, 2026-09-15).**
 - **Meaning:** in Macross, a fold wave is a faster-than-light signal sent through
