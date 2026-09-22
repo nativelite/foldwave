@@ -14,6 +14,7 @@ resmon = { package = "nativelite-resmon", version = "0.1.0", path = "../resmon" 
 ansi = { package = "nativelite-ansi", version = "0.4.0", path = "../../../ansi-rs" }
 panelog = { package = "nativelite-panelog", version = "0.1.0", path = "../../../panelog-rs" }
 fwcuda = { package = "nativelite-fwcuda", version = "0.1.0", path = "../fwcuda" }
+fwrender = { package = "nativelite-fwrender", version = "0.1.0", path = "../fwrender" }
 vterm = { package = "nativelite-vterm", version = "0.5.3", path = "../../../vterm-rs" }
 
 [lib]

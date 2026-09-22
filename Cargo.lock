@@ -12,6 +12,7 @@ version = "0.1.0"
 dependencies = [
  "nativelite-ansi",
  "nativelite-fwcuda",
+ "nativelite-fwrender",
  "nativelite-panelog",
  "nativelite-pty",
  "nativelite-resmon",

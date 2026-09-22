@@ -39,6 +39,7 @@ pub mod history;
 pub mod noise;
 pub mod parse;
 pub mod read;
+pub mod render;
 pub mod replay;
 pub mod report;
 pub mod scan;
