@@ -75,6 +75,24 @@ fn tree(procs: &[RawProc], root: u32) -> HashSet<u32> {
     out
 }
 
+/// Cumulative CPU seconds of `self_pid` and its descendants in one snapshot,
+/// or `None` when the process itself is not in it. Two calls differenced give
+/// what this process burned over a phase — which is how a read benchmark
+/// prices transparent decompression.
+pub fn own_cpu_secs(snap: &Snapshot, self_pid: u32) -> Option<f64> {
+    if !snap.procs.iter().any(|p| p.pid == self_pid) {
+        return None;
+    }
+    let ours = tree(&snap.procs, self_pid);
+    let ns: u64 = snap
+        .procs
+        .iter()
+        .filter(|p| ours.contains(&p.pid))
+        .map(|p| p.cpu_ns())
+        .sum();
+    Some(ns as f64 / 1e9)
+}
+
 /// Attribute the CPU between `prev` and `cur` to everything except `self_pid`
 /// and its descendants.
 pub fn measure(
@@ -198,6 +216,17 @@ mod tests {
             },
             gpu: None,
         }
+    }
+
+    #[test]
+    fn own_cpu_sums_the_whole_tree() {
+        let s = snap(vec![
+            p(10, 1, "fwbench.exe", 100, 1_500),
+            p(11, 10, "child.exe", 110, 500),
+            p(20, 1, "other.exe", 50, 9_000),
+        ]);
+        assert_eq!(own_cpu_secs(&s, 10), Some(2.0));
+        assert_eq!(own_cpu_secs(&s, 999), None);
     }
 
     #[test]

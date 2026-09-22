@@ -158,13 +158,33 @@ each leg does in isolation, so a plan for using them together starts from facts.
   - **Plan on the sustained figure, not the cache figure.** 1,750 MiB/s is
     6.4× the target. The SLC figures hold only for bursts of a few tens of GiB.
   - **The trap: NTFS compression.** `E:\` has the NTFS *compressed* attribute
-    set, and new directories inherit it. On a compressed directory the same
-    harness measured 47 MiB/s (qd1), 89 MiB/s (qd8) and 100–143 MiB/s
-    (control). An independent .NET write-through probe agreed (51 MiB/s), and
-    sequential reads stayed at 845 MiB/s. Compression costs **≈35×**. The log
-    directory must be created uncompressed (`compact /u`), and the writer should
-    refuse to run, or warn, on a compressed directory. Whether the 2026-09-16
-    probe hit the same attribute was **not verified**.
+    set, and new directories inherit it, twice catching this harness out. On a
+    compressed directory the same code measured 47–61 MiB/s (qd1), 89–108
+    (qd8) and 100–143 (control); an independent .NET write-through probe
+    agreed at 51 MiB/s. Compression costs **≈35× on durable writes**. Whether
+    the 2026-09-16 probe hit the same attribute was **not verified**.
+  - **Compression costs reads too** (`fwbench read`, 2026-09-22, 4 GiB probe,
+    48 GiB written first to evict the page cache, so the reads are cold):
+
+    | Pass | Compressed | Uncompressed |
+    | --- | --- | --- |
+    | cold, unbuffered | **535.4 MiB/s** (p50 2.41 ms) | **2,406.2 MiB/s** (p50 0.37 ms) |
+    | warm, buffered | 8,522.9 (served from RAM) | 2,287.8 |
+    | CPU seconds per GiB | 0.08 | 0.07 |
+
+    So a compressed log reads back **4.5× slower** and with a **6.5× worse
+    per-read latency** — history replay, search and checkpoint rebuilds all pay
+    it. The CPU cost is small; the throughput cost is not. Warm figures are
+    RAM, not the drive, and are reported only as a ceiling.
+  - **What compression buys on this drive, measured with `compact /s`:**
+    SteamLibrary 414.9 → 400.6 GB (3 %), XboxGames 286.1 → 283.3 (1 %),
+    WindowsApps 284.4 → 281.6 (1 %), `E:\ai` 85.1 → 70.6 (17 %). Game and
+    store content is already compressed, so squeezing it again returns almost
+    nothing. **Verdict: the log directory must be uncompressed, and the
+    drive-wide attribute is a bad trade** — ~30 GB saved on a 914 GB drive
+    against 35× writes and 4.5× reads. The log writer should still refuse, or
+    warn, on a compressed directory; `fwbench read` reads the attribute the
+    same way (`FILE_ATTRIBUTE_COMPRESSED`).
   - **§8.0 is now stale.** It is built on ingest being SSD-bound at 479 MiB/s,
     and that is no longer true. The SSD has more headroom than any leg except
     RAM, and CPU parsing (723 MiB/s) is the binding leg. To be revised with the

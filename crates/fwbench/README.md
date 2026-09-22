@@ -33,6 +33,7 @@ cargo run --release --bin fwbench -- combined --panes 8 --mib 32 --samples 120
 | `disk` | durable write rate of the log drive, three ways: the old buffered+fsync probe as control, then unbuffered write-through at queue depth 1 and N |
 | `parse` | experiment E4: `vterm` full emulation vs `ansi` tokenizing vs the bare state machine, thread scaling, the structural scan, and how fast every start state converges (the GPU fit) |
 | `gpu` | host→GPU and GPU→host copy cost, pinned and pageable, 64 KiB to 64 MiB, after a 2 s warm-up |
+| `read` | read rate of a directory, unbuffered and buffered, with CPU per GiB; reports whether the directory is NTFS-compressed. `--flush-mib N` writes N MiB of throwaway data first so the probe is read cold, `--flush-path DIR` puts that file somewhere uncompressed |
 
 Options: `--panes N`, `--mib N`, `--samples N`, `--gap-ms N`, `--shell NAME`,
 `--no-attrib`; for `disk`, `--path DIR` (the reference log drive is `E:\`),

@@ -1,7 +1,7 @@
 //! `fwbench` — the foldwave M0 harness.
 
 use fwbench::flood::Transport;
-use fwbench::{disk, echo, emit, flood, gpu, noise, parse as e4, report, Run};
+use fwbench::{disk, echo, emit, flood, gpu, noise, parse as e4, read, report, Run};
 use std::io::{self, Write};
 use std::time::Duration;
 
@@ -20,6 +20,11 @@ modes:
                 scaling, structural scan, start-state convergence
   gpu           host<->GPU copy cost via the CUDA driver (pinned and pageable,
                 64 KiB..64 MiB); --samples copies per cell (default 200)
+  read          read rate of --path DIR, unbuffered and buffered, with the CPU
+                cost per GiB; says whether the directory is NTFS-compressed.
+                --flush-mib N (default 0) writes N MiB of throwaway data first
+                so the probe is read cold; --flush-path DIR puts that file
+                somewhere uncompressed
 
 options:
   --panes N     panes to flood (default 8)
@@ -55,6 +60,7 @@ enum Mode {
     Disk,
     Parse,
     Gpu,
+    Read,
     Emit { bytes: u64 },
 }
 
@@ -74,6 +80,8 @@ struct Args {
     threads: Vec<usize>,
     reps: usize,
     noise_limit: f64,
+    flush_mib: u64,
+    flush_path: Option<String>,
 }
 
 fn parse(argv: &[String]) -> Result<Args, String> {
@@ -91,6 +99,8 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut threads = vec![1, 2, 4, 6, 8, 12, 16];
     let mut reps = 5usize;
     let mut noise_limit = noise::DEFAULT_LIMIT_CORES;
+    let mut flush_mib = 0u64;
+    let mut flush_path: Option<String> = None;
     let mut emit_bytes: Option<u64> = None;
 
     let mut i = 0;
@@ -120,6 +130,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             }
             "disk" => {
                 mode = Some(Mode::Disk);
+                i += 1;
+            }
+            "read" => {
+                mode = Some(Mode::Read);
                 i += 1;
             }
             "gpu" => {
@@ -158,6 +172,11 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                 }
             }
             "--path" => path = Some(value(&mut i, "--path")?),
+            "--flush-mib" => {
+                let v = value(&mut i, "--flush-mib")?;
+                flush_mib = v.parse().map_err(|_| format!("bad --flush-mib {v:?}"))?;
+            }
+            "--flush-path" => flush_path = Some(value(&mut i, "--flush-path")?),
             "--io-kib" => {
                 let v = value(&mut i, "--io-kib")?;
                 io_kib = v.parse().map_err(|_| format!("bad --io-kib {v:?}"))?;
@@ -235,7 +254,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     };
     // A drive needs a long stream to show its sustained rate; panes do not.
     let mib = mib.unwrap_or(match mode {
-        Mode::Disk => 2048,
+        Mode::Disk | Mode::Read => 2048,
         Mode::Parse => 64,
         _ => 32,
     });
@@ -255,6 +274,8 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         threads,
         reps,
         noise_limit,
+        flush_mib,
+        flush_path,
     })
 }
 
@@ -348,6 +369,30 @@ fn run(args: &Args) -> i32 {
         return 0;
     }
 
+    if args.mode == Mode::Read {
+        let dir = std::path::PathBuf::from(args.path.as_deref().unwrap_or("."));
+        let config = read::Config {
+            dir: dir.clone(),
+            bytes: args.mib * 1024 * 1024,
+            io: args.io_kib * 1024,
+            flush_bytes: args.flush_mib * 1024 * 1024,
+            flush_dir: args.flush_path.as_deref().map(std::path::PathBuf::from),
+        };
+        eprintln!(
+            "read: writing a {} MiB probe under {}...",
+            args.mib,
+            dir.display()
+        );
+        match read::run(&config) {
+            Ok(report) => print!("{}", read::render(&report)),
+            Err(e) => {
+                eprintln!("fwbench: read measurement failed: {e}");
+                return 1;
+            }
+        }
+        return 0;
+    }
+
     if args.mode == Mode::Gpu {
         eprintln!(
             "gpu: warming up 2 s, then {} copies per cell...",
@@ -407,7 +452,9 @@ fn run(args: &Args) -> i32 {
     let started = std::time::Instant::now();
 
     let run = match args.mode {
-        Mode::Emit { .. } | Mode::Disk | Mode::Parse | Mode::Gpu => unreachable!("handled above"),
+        Mode::Emit { .. } | Mode::Disk | Mode::Parse | Mode::Gpu | Mode::Read => {
+            unreachable!("handled above")
+        }
         Mode::Flood => {
             eprintln!("flooding {} panes x {} MiB...", args.panes, args.mib);
             Run {
@@ -501,6 +548,8 @@ mod tests {
         let d = parse(&argv(&["parse"])).unwrap();
         assert_eq!(d.mode, Mode::Parse);
         assert_eq!(parse(&argv(&["gpu"])).unwrap().mode, Mode::Gpu);
+        let r = parse(&argv(&["read"])).unwrap();
+        assert_eq!((r.mode, r.mib, r.io_kib), (Mode::Read, 2048, 1024));
         assert_eq!(d.noise_limit, noise::DEFAULT_LIMIT_CORES);
         let n = parse(&argv(&["disk", "--noise-limit", "0.5"])).unwrap();
         assert_eq!(n.noise_limit, 0.5);

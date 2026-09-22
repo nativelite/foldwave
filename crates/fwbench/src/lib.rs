@@ -7,7 +7,8 @@
 //! - **Throughput** — N pty panes flooding at once ([`flood`]).
 //! - **Input latency** — key echo timed on arrival ([`echo`]).
 //! - **Storage** — the log drive measured the way the log writer will use
-//!   it: unbuffered write-through, queued ([`disk`]).
+//!   it: unbuffered write-through, queued ([`disk`]); and read back, with and
+//!   without NTFS compression ([`read`]).
 //! - **Parsing** — the parse budget and the GPU fit, experiment E4 ([`parse`],
 //!   [`fsm`], [`scan`]), and the host-to-GPU copy cost behind it ([`gpu`]).
 //! - **Resource attribution** — where the machine went during the run, across
@@ -31,6 +32,7 @@ pub mod fsm;
 pub mod gpu;
 pub mod noise;
 pub mod parse;
+pub mod read;
 pub mod report;
 pub mod scan;
 pub mod stats;

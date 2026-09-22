@@ -358,6 +358,11 @@ impl Aligned {
     pub fn aligned(&self) -> &[u8] {
         &self.storage[self.start..self.start + self.len]
     }
+
+    /// The aligned view, mutable, for reads into it.
+    pub fn aligned_mut(&mut self) -> &mut [u8] {
+        &mut self.storage[self.start..self.start + self.len]
+    }
 }
 
 /// Allocate `len` bytes of agent-like filler at a [`SECTOR`]-aligned address.
