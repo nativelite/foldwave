@@ -459,8 +459,18 @@ Pinning one thread to each CPU showed that logical CPUs 0–11 are P-cores
 - **Noise:** five reps per cell is thin. The P-only curve is not monotonic
   per thread (4 threads at 60 MiB/s each, 6 at 84), and the §4.1 figures
   from 2026-09-16 (111 MiB/s on 1 thread, 723 on 16) sit above today's. Treat
-  these rows as ±15 % until the noisy-run guard exists. The P-core
-  conclusion holds at every thread count.
+  these rows as ±15 %. The P-core conclusion holds at every thread count.
+- **The machine was not quiet, and now every run says so.** The noisy-run guard
+  (`fwbench` `noise.rs`, added 2026-09-22) ends every run with the CPU used
+  outside fwbench's own tree.
+  - `resmon` over 15 s showed about 1.5 cores busy elsewhere, a browser about
+    1.1 of them.
+  - An 8 s `parse` run measured 1.15 cores: Chrome 0.35, Google Drive 0.29,
+    Edge WebView2 0.27.
+  - 188 system processes are unreadable without admin, so the true figure is
+    higher.
+  - Every run so far, E4 included, was taken under that load. Re-run before
+    treating any row as final.
 
 *The GPU fit.* The workload was sampled at 10,000 chunk boundaries. From each
 of the 11 start states, the table below counts how many bytes it takes to

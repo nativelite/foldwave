@@ -13,6 +13,9 @@
 //! - **Resource attribution** — where the machine went during the run, across
 //!   CPU, RAM, disk and GPU, via `resmon` (experiment E3, section 8.7b).
 //!
+//! Every run ends with the noisy-run guard ([`noise`]): CPU used by other
+//! processes during the run, and whether it exceeded the limit.
+//!
 //! Frame timing is deliberately absent: it needs a renderer, which is M3.
 //!
 //! Zero third-party dependencies; nativelite org crates and std only.
@@ -26,6 +29,7 @@ pub mod emit;
 pub mod flood;
 pub mod fsm;
 pub mod gpu;
+pub mod noise;
 pub mod parse;
 pub mod report;
 pub mod scan;

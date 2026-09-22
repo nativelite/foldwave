@@ -1,7 +1,7 @@
 //! `fwbench` — the foldwave M0 harness.
 
 use fwbench::flood::Transport;
-use fwbench::{disk, echo, emit, flood, gpu, parse as e4, report, Run};
+use fwbench::{disk, echo, emit, flood, gpu, noise, parse as e4, report, Run};
 use std::io::{self, Write};
 use std::time::Duration;
 
@@ -39,6 +39,8 @@ options:
                 \"none\" skips scaling). Set core placement from outside, e.g.
                 cmd /c start /b /wait /affinity 0x555 fwbench parse ...
   --reps N      parse: timed repetitions per cell (default 5)
+  --noise-limit C  cores other processes may use during a run before it is
+                marked NOISY (default 0.05, i.e. 5% of one core)
   -h, --help    this message
 
 internal:
@@ -71,6 +73,7 @@ struct Args {
     qd: usize,
     threads: Vec<usize>,
     reps: usize,
+    noise_limit: f64,
 }
 
 fn parse(argv: &[String]) -> Result<Args, String> {
@@ -87,6 +90,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut qd = 8usize;
     let mut threads = vec![1, 2, 4, 6, 8, 12, 16];
     let mut reps = 5usize;
+    let mut noise_limit = noise::DEFAULT_LIMIT_CORES;
     let mut emit_bytes: Option<u64> = None;
 
     let mut i = 0;
@@ -144,6 +148,13 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                 reps = v.parse().map_err(|_| format!("bad --reps {v:?}"))?;
                 if reps == 0 {
                     return Err("--reps must be at least 1".into());
+                }
+            }
+            "--noise-limit" => {
+                let v = value(&mut i, "--noise-limit")?;
+                noise_limit = v.parse().map_err(|_| format!("bad --noise-limit {v:?}"))?;
+                if !(noise_limit >= 0.0 && noise_limit.is_finite()) {
+                    return Err("--noise-limit must be a non-negative number of cores".into());
                 }
             }
             "--path" => path = Some(value(&mut i, "--path")?),
@@ -243,6 +254,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         qd,
         threads,
         reps,
+        noise_limit,
     })
 }
 
@@ -286,6 +298,33 @@ fn main() {
         return;
     }
 
+    // Every measuring mode is bracketed by the noisy-run guard.
+    let before = resmon::sys::snapshot();
+    let started = std::time::Instant::now();
+    let code = run(&args);
+    match (before, resmon::sys::snapshot()) {
+        (Ok(prev), Ok(cur)) => {
+            let n = noise::measure(
+                &prev,
+                &cur,
+                std::process::id(),
+                started.elapsed().as_secs_f64(),
+                args.noise_limit,
+            );
+            print!("{}", noise::render(&n));
+        }
+        (Err(e), _) | (_, Err(e)) => println!(
+            "
+noise: not measured ({e})"
+        ),
+    }
+    if code != 0 {
+        std::process::exit(code);
+    }
+}
+
+/// Run one measuring mode; returns the process exit code.
+fn run(args: &Args) -> i32 {
     if args.mode == Mode::Disk {
         let dir = std::path::PathBuf::from(args.path.as_deref().unwrap_or("."));
         let bytes = args.mib * 1024 * 1024;
@@ -303,10 +342,10 @@ fn main() {
             Ok(results) => print!("{}", disk::render(&dir, bytes, &results)),
             Err(e) => {
                 eprintln!("fwbench: disk measurement failed: {e}");
-                std::process::exit(1);
+                return 1;
             }
         }
-        return;
+        return 0;
     }
 
     if args.mode == Mode::Gpu {
@@ -318,10 +357,10 @@ fn main() {
             Ok((label, cells)) => print!("{}", gpu::render(&label, &cells)),
             Err(e) => {
                 eprintln!("fwbench: gpu measurement failed: {e}");
-                std::process::exit(1);
+                return 1;
             }
         }
-        return;
+        return 0;
     }
 
     if args.mode == Mode::Parse {
@@ -344,14 +383,14 @@ fn main() {
         eprintln!("parse: convergence over {} boundaries...", cfg.offsets);
         let conv = e4::convergence(&data, cfg.offsets, e4::FEED);
         print!("{}", e4::render(&cfg, &split, &scaling, &conv));
-        return;
+        return 0;
     }
 
     let exe = match std::env::current_exe() {
         Ok(p) => p.to_string_lossy().into_owned(),
         Err(e) => {
             eprintln!("fwbench: cannot find own path: {e}");
-            std::process::exit(1);
+            return 1;
         }
     };
     let shell = args
@@ -423,6 +462,7 @@ fn main() {
 
     print!("{}", report::render(&run));
     println!("verdict: {}", report::verdict(&run));
+    0
 }
 
 fn measure_echo(shell: &str, samples: usize, gap: Duration) -> Option<echo::EchoResult> {
@@ -461,6 +501,11 @@ mod tests {
         let d = parse(&argv(&["parse"])).unwrap();
         assert_eq!(d.mode, Mode::Parse);
         assert_eq!(parse(&argv(&["gpu"])).unwrap().mode, Mode::Gpu);
+        assert_eq!(d.noise_limit, noise::DEFAULT_LIMIT_CORES);
+        let n = parse(&argv(&["disk", "--noise-limit", "0.5"])).unwrap();
+        assert_eq!(n.noise_limit, 0.5);
+        assert!(parse(&argv(&["disk", "--noise-limit", "-1"])).is_err());
+        assert!(parse(&argv(&["disk", "--noise-limit", "NaN"])).is_err());
         assert_eq!(d.mib, 64);
         assert_eq!(d.threads, vec![1, 2, 4, 6, 8, 12, 16]);
         assert_eq!(d.reps, 5);
