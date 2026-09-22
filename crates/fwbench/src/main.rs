@@ -23,7 +23,8 @@ modes:
   compose       E5: N panes logging, parsing and scanning at once; --visible V
                 panes are parsed, the rest structurally scanned; --log
                 per-pane|single|none picks the layout (section 8.4's open
-                question); --rate MiB/s paces instead of running flat out
+                question); --rate MiB/s paces instead of running flat out;
+                --echo measures key echo idle, then again under the load
   replay        crash safety: spawn a log writer, kill it mid-append, check
                 the log against the stream that produced it, and time a screen
                 rebuild; --kill-ms N is how long it writes first (default 1500)
@@ -93,6 +94,7 @@ struct Args {
     threads: Vec<usize>,
     reps: usize,
     noise_limit: f64,
+    echo: bool,
     kill_ms: u64,
     visible: usize,
     log: compose::LogMode,
@@ -116,6 +118,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut threads = vec![1, 2, 4, 6, 8, 12, 16];
     let mut reps = 5usize;
     let mut noise_limit = noise::DEFAULT_LIMIT_CORES;
+    let mut echo = false;
     let mut kill_ms = 1500u64;
     let mut visible = 4usize;
     let mut log = compose::LogMode::PerPane;
@@ -159,6 +162,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             }
             "--crash-writer" => {
                 mode = Some(Mode::CrashWriter);
+                i += 1;
+            }
+            "--echo" => {
+                echo = true;
                 i += 1;
             }
             "--kill-ms" => {
@@ -329,6 +336,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         threads,
         reps,
         noise_limit,
+        echo,
         kill_ms,
         visible,
         log,
@@ -476,6 +484,7 @@ fn run(args: &Args) -> i32 {
             dir: dir.clone(),
             io: args.io_kib * 1024,
             rate_mib: args.rate_mib,
+            stop: None,
         };
         eprintln!(
             "compose: {} panes x {} MiB, {} visible, log {} under {}...",
@@ -485,14 +494,17 @@ fn run(args: &Args) -> i32 {
             config.log.name(),
             dir.display()
         );
-        match compose::run(&config) {
-            Ok(result) => print!("{}", compose::render(&config, &result)),
-            Err(e) => {
-                eprintln!("fwbench: compose failed: {e}");
-                return 1;
+        if !args.echo {
+            match compose::run(&config) {
+                Ok(result) => print!("{}", compose::render(&config, &result)),
+                Err(e) => {
+                    eprintln!("fwbench: compose failed: {e}");
+                    return 1;
+                }
             }
+            return 0;
         }
-        return 0;
+        return compose_with_echo(args, config);
     }
 
     if args.mode == Mode::Read {
@@ -645,6 +657,90 @@ fn run(args: &Args) -> i32 {
     0
 }
 
+/// Key echo measured idle, then again while the composed pipeline runs: the
+/// section 4 input target is stated *over the shell's own latency*, so the
+/// idle run is the baseline the loaded one is judged against.
+fn compose_with_echo(args: &Args, mut config: compose::Config) -> i32 {
+    let shell = args
+        .shell
+        .clone()
+        .unwrap_or_else(|| echo::default_shell().to_string());
+
+    eprintln!(
+        "echo: baseline, {} keys through `{shell}`, idle...",
+        args.samples
+    );
+    let Some(idle) = measure_echo(&shell, args.samples, args.gap) else {
+        return 1;
+    };
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    config.stop = Some(stop.clone());
+    eprintln!("echo: same keys while the pipeline runs...");
+    let (composed, loaded) = std::thread::scope(|s| {
+        let load = s.spawn(|| compose::run(&config));
+        // Let every pane reach steady state before the first key.
+        std::thread::sleep(Duration::from_millis(500));
+        let loaded = measure_echo(&shell, args.samples, args.gap);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        (load.join().expect("compose thread"), loaded)
+    });
+
+    let composed = match composed {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("fwbench: compose failed: {e}");
+            return 1;
+        }
+    };
+    let Some(loaded) = loaded else {
+        return 1;
+    };
+    if composed.wall < loaded.samples.iter().sum::<Duration>() {
+        eprintln!("fwbench: warning: the load ended before the echo run did");
+    }
+
+    print!("{}", compose::render(&config, &composed));
+    print!("{}", render_echo_pair(&idle, &loaded));
+    0
+}
+
+/// Idle and loaded echo side by side, judged against the section 4 target:
+/// p50 < 1 ms and p99 < 5 ms *over* the shell's own latency.
+fn render_echo_pair(idle: &echo::EchoResult, loaded: &echo::EchoResult) -> String {
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    let over50 = ms(loaded.summary.p50) - ms(idle.summary.p50);
+    let over99 = ms(loaded.summary.p99) - ms(idle.summary.p99);
+    let verdict = |over: f64, limit: f64| {
+        if over < limit {
+            "meets"
+        } else {
+            "MISSES"
+        }
+    };
+    format!(
+        "\nkey echo through `{}`, {:.0} ms between keys\n\n\
+         | | p50 | p90 | p99 | lost |\n| --- | --- | --- | --- | --- |\n\
+         | idle | {:.2} ms | {:.2} ms | {:.2} ms | {} |\n\
+         | under the pipeline | {:.2} ms | {:.2} ms | {:.2} ms | {} |\n\
+         | added by the load | {:+.2} ms ({} p50 < 1 ms) | | {:+.2} ms ({} p99 < 5 ms) | |\n",
+        loaded.shell,
+        ms(loaded.gap),
+        ms(idle.summary.p50),
+        ms(idle.summary.p90),
+        ms(idle.summary.p99),
+        idle.lost,
+        ms(loaded.summary.p50),
+        ms(loaded.summary.p90),
+        ms(loaded.summary.p99),
+        loaded.lost,
+        over50,
+        verdict(over50, 1.0),
+        over99,
+        verdict(over99, 5.0),
+    )
+}
+
 fn measure_echo(shell: &str, samples: usize, gap: Duration) -> Option<echo::EchoResult> {
     match echo::run(shell, samples, gap) {
         Ok(r) => Some(r),
@@ -693,6 +789,8 @@ mod tests {
             parse(&argv(&["--crash-writer"])).unwrap().mode,
             Mode::CrashWriter
         );
+        assert!(parse(&argv(&["compose", "--echo"])).unwrap().echo);
+        assert!(!parse(&argv(&["compose"])).unwrap().echo);
         let c = parse(&argv(&["compose"])).unwrap();
         assert_eq!(
             (c.mode, c.panes, c.visible, c.mib, c.log, c.rate_mib),

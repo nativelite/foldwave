@@ -25,7 +25,8 @@ use crate::{parse, scan};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Where each pane's bytes are logged.
@@ -80,6 +81,9 @@ pub struct Config {
     pub io: usize,
     /// Aggregate MiB/s to pace at, or 0 to run flat out.
     pub rate_mib: f64,
+    /// Set to end the run early, before `bytes_per_pane`. Used to hold the
+    /// load for exactly as long as something else is being measured under it.
+    pub stop: Option<Arc<AtomicBool>>,
 }
 
 /// One pane's result.
@@ -295,7 +299,8 @@ fn pane_worker(
 
     let started = Instant::now();
     let mut at = 0usize;
-    while stat.bytes < config.bytes_per_pane {
+    let stopped = || matches!(&config.stop, Some(s) if s.load(Ordering::Relaxed));
+    while stat.bytes < config.bytes_per_pane && !stopped() {
         let want = io.min((config.bytes_per_pane - stat.bytes) as usize);
         // Replay the source cyclically; a chunk never straddles the end.
         if at + want > src.len() {
@@ -307,7 +312,8 @@ fn pane_worker(
         if config.log != LogMode::None {
             let payload = &mut staging.aligned_mut()[..want];
             payload.copy_from_slice(chunk);
-            let padded = want.next_multiple_of(SECTOR).min(io);
+            // Round up to a whole sector (`next_multiple_of` is newer than the MSRV).
+            let padded = ((want + SECTOR - 1) / SECTOR * SECTOR).min(io);
             let out = &staging.aligned()[..padded];
             let took = match (&mut own_file, single) {
                 (Some(file), _) => {
@@ -434,7 +440,30 @@ mod tests {
             dir,
             io: 512 * 1024,
             rate_mib: 0.0,
+            stop: None,
         }
+    }
+
+    #[test]
+    fn a_stop_flag_ends_the_run_early() {
+        let mut cfg = small(tmp("stop"), LogMode::None);
+        cfg.bytes_per_pane = u64::MAX / 2; // would never finish on its own
+        cfg.io = 64 * 1024;
+        cfg.rate_mib = 64.0;
+        let stop = Arc::new(AtomicBool::new(false));
+        cfg.stop = Some(stop.clone());
+        let flag = stop.clone();
+        // Generous: a debug build spends a while generating the sources before
+        // the timed region starts, and the flag must land after that.
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let run = run(&cfg).expect("compose");
+        stopper.join().unwrap();
+        assert!(run.wall < Duration::from_secs(10), "took {:?}", run.wall);
+        assert!(run.bytes > 0);
+        let _ = fs::remove_dir_all(&cfg.dir);
     }
 
     #[test]

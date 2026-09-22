@@ -84,7 +84,7 @@ before it is claimed.
 
 | Area | Target |
 | --- | --- |
-| Input latency | key echo p50 < 1 ms, p99 < 5 ms over the shell's own latency, **while** other panes flood |
+| Input latency | key echo p50 < 1 ms, p99 < 5 ms over the shell's own latency, **while** other panes flood — **measured against the full composed pipeline** (§8.0): p50 0.08 ms, p99 0.68 ms at target, +0.03 ms p99 even at 12.5× target |
 | Throughput | 16 panes each emitting 1 GB/min without falling behind, visible panes ≥ 60 fps |
 | Idle | ~0% CPU, no busy polling, GPU idle when nothing changes |
 | History | 100 GB per session on disk; open, jump to any line, and search in < 1 s |
@@ -632,6 +632,38 @@ separate them on throughput.
   payloads aligned (0.4 % at 1 MiB writes); that overhead is not what decides
   the comparison.
 
+**Latency under the composed load (measured 2026-09-22, `fwbench compose
+--echo`).** E5's last row. Key echo through `cmd` (ConPTY, 25 ms between
+keys) was measured idle, then again while the full pipeline ran in the same
+process: 16 panes logging to E:, 4 parsed, 12 scanned.
+
+| Load | Keys | Idle p50 / p99 | Under load p50 / p99 | Added p50 / p99 |
+| --- | --- | --- | --- | --- |
+| paced at the 273 MiB/s target | 1,000 | 0.13 / 4.37 ms | **0.08 / 0.68 ms** | −0.05 / −3.68 ms |
+| flat out, 3,405 MiB/s (12.5× target) | 600 | 0.15 / 0.88 ms | **0.10 / 0.90 ms** | −0.06 / +0.03 ms |
+| paced at target, four 200-key runs | 200 each | p99 0.71–4.40 ms | p99 0.60–0.97 ms | p99 −3.75 to +0.26 ms |
+| flat out, two 200-key runs | 200 each | p99 0.69–1.61 ms | p99 1.09–6.20 ms | p99 +0.40 / +4.59 ms |
+
+- **The composed pipeline does not touch input latency.** At the target rate
+  a key echoes in 0.08 ms at the median and 0.68 ms at p99 — against §4's
+  limits of 1 ms and 5 ms *over* the shell's own latency — and even running
+  flat out at 12.5× the target the added p99 is 0.03 ms. Every run, all ten,
+  met both limits. Not one key was lost.
+- **p99 needs more than 200 samples.** At 200 keys p99 is the second-worst
+  keystroke, and the idle baseline alone swung 0.69–4.40 ms between runs. One
+  200-key flat-out run showed +4.59 ms; the 600-key run under heavier load
+  showed +0.03 ms. The 600- and 1,000-key rows are the result; the 200-key
+  rows show the spread.
+- **The idle tail is often worse than the loaded one** (4.37 ms idle vs 0.68
+  loaded at 1,000 keys). The likely cause is CPU power states — an idle core
+  sleeps deeper and wakes slower, a loaded one stays awake — but that is
+  **unverified**. If it holds, foldwave's worst input latency is on a quiet
+  machine, not a busy one.
+- **What this is not:** foldwave's own input path, which does not exist yet.
+  It is a real shell behind ConPTY, echoing while the pipeline competes for
+  the same machine and the same process. Pane-switch time is E6's rebuild
+  figure (15.2–15.6 ms from 3.3 MiB).
+
 **E6 result: crash and replay (measured 2026-09-22, `fwbench replay`).** §4
 promises that after a crash "every pane's history up to the last flush
 replays"; nothing had tested it. The harness spawns a writer that appends a
@@ -1106,7 +1138,7 @@ One concern each; names are placeholders.
 | Milestone | Deliverable | Proof |
 | --- | --- | --- |
 | **M0 Harness** | throughput and latency benchmark: N panes of recorded agent output, timestamped key echo, frame timing, RSS, disk rate. vtebench (MIT/Apache) supplies workloads, but it measures only PTY read speed, not latency or frames, so it can't be the harness. Includes experiments E1, GPU contention (`compute.md`), E2, built-in console host vs OpenConsole (§11), and **E3, CPU attribution** (§8.7b) | a baseline table for atrium today and for 1–2 existing terminals; the E1 contention table on the RTX 3070; the E3 attribution table that says which stage is worth offloading |
-| M0 status (2026-09-22) | **Mostly delivered.** `resmon` (four-resource attribution, E3) and `fwbench` (`flood`, `echo`, `combined`, `disk`, `read`, `parse` = E4, `compose` = E5, `gpu`) are in `crates/`, plus `fwcuda` (CUDA Driver API) and a noisy-run guard on every mode. Headline numbers on the quiet reference machine: transport **139 MiB/s over ConPTY** vs **1,854 over pipes**; log drive **≈1,800 MiB/s sustained** write-through, **2,745** cold read; full VT emulation **1,828 MiB/s** across 16 threads after the span tokenizer; the composed pipeline **1,312–2,429 MiB/s**, and **~92 % idle** at the 273 MiB/s target. Still to build: frame timing (needs M3), **E1** (GPU contention), **E2** (conhost vs OpenConsole), and key-echo latency measured against the *composed* pipeline rather than a flood | [`crates/fwbench`](../crates/fwbench), [`crates/resmon`](../crates/resmon), [`crates/fwcuda`](../crates/fwcuda) |
+| M0 status (2026-09-22) | **Mostly delivered.** `resmon` (four-resource attribution, E3) and `fwbench` (`flood`, `echo`, `combined`, `disk`, `read`, `parse` = E4, `compose` = E5, `gpu`) are in `crates/`, plus `fwcuda` (CUDA Driver API) and a noisy-run guard on every mode. Headline numbers on the quiet reference machine: transport **139 MiB/s over ConPTY** vs **1,854 over pipes**; log drive **≈1,800 MiB/s sustained** write-through, **2,745** cold read; full VT emulation **1,828 MiB/s** across 16 threads after the span tokenizer; the composed pipeline **1,312–2,429 MiB/s**, and **~92 % idle** at the 273 MiB/s target. Still to build: frame timing (needs M3), **E1** (GPU contention) and **E2** (conhost vs OpenConsole). Measured since the last status: the crash/replay test (E6) and key echo against the composed pipeline | [`crates/fwbench`](../crates/fwbench), [`crates/resmon`](../crates/resmon), [`crates/fwcuda`](../crates/fwcuda) |
 | **M1 Headless core** | `panelog` + fast parser + `vterm` checkpoints, driven by the harness with no UI | throughput and history targets met headless |
 | **M2 atrium adopts it** | unbounded history, search and crash replay inside atrium | atrium benchmarks don't regress; replay after a kill |
 | **M3 Renderer spike** | one platform (Windows, D3D11), glyph atlas, damaged-row redraw, CPU fallback | frame time and latency under flood vs. baseline |
