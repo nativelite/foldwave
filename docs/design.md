@@ -856,7 +856,32 @@ the records that validate, cuts a torn tail and rebuilds maps and index;
   still more than 20× what one pane needs. Limits, stated in the API: matching
   is on raw bytes (a colour change mid-word hides that match), and needles
   under three bytes scan everything.
-- Still to come in M1: marks, compression of cold segments.
+- **Marks (built and measured 2026-09-22).** `ansi::MarkScanner` finds OSC
+  133 / 633 shell marks (prompt `A`, command `B`, output `C`, end `D` with its
+  exit code) in the raw stream with no parser or screen, across any chunk
+  split. `panelog` stores each as a 32-byte CRC'd entry in `marks.bin`, sorted
+  by offset (`Writer::mark`), and finds them by binary search with positioned
+  reads (`Reader::marks_in`, `Reader::last_mark_before`), so millions of marks
+  are never loaded. Like the other side files, a damaged tail is dropped on
+  open. `fwbench history`, 16 GiB on E:, a shell command cycle every 256 KiB
+  of output, one command in 50 failing:
+
+  | Query | Result |
+  | --- | --- |
+  | marks stored (65,536 commands) | 262,143 |
+  | find the last failed command | **0.176 ms**, the planted offset |
+  | list the marks in the last GiB | 16,384 marks in 25.5 ms |
+
+  Scanning on the writer thread costs ≈12 % of the write rate with
+  checkpoints off (386 → 339 MiB/s, 4 GiB A/B) and ≈5 % with 1 MiB
+  checkpoints on (131 → 125 MiB/s, where feeding `vterm` dominates). Without
+  checkpoints the writer stays above the 273 MiB/s per-machine target; with
+  them it does not on one thread, so checkpointing has to run off the writer
+  thread, as the §8.0 budget already gives every stage its own threads. The
+  16 GiB run was on a noisy machine (0.37 cores busy elsewhere). The lookups are far from any limit; the write-rate costs
+  are A/B on the same machine and state.
+- Still to come in M1: compression of cold segments. This is a proposal, not
+  something §4 needs, since the history target is met uncompressed.
 
 - Writes are batched and flushed on a cadence and at checkpoints; the governor
   watches write latency.
@@ -1242,6 +1267,7 @@ One concern each; names are placeholders.
 | **M0 Harness** | throughput and latency benchmark: N panes of recorded agent output, timestamped key echo, frame timing, RSS, disk rate. vtebench (MIT/Apache) supplies workloads, but it measures only PTY read speed, not latency or frames, so it can't be the harness. Includes experiments E1, GPU contention (`compute.md`), E2, built-in console host vs OpenConsole (§11), and **E3, CPU attribution** (§8.7b) | a baseline table for atrium today and for 1–2 existing terminals; the E1 contention table on the RTX 3070; the E3 attribution table that says which stage is worth offloading |
 | M0 status (2026-09-22) | **Mostly delivered.** `resmon` (four-resource attribution, E3) and `fwbench` (`flood`, `echo`, `combined`, `disk`, `read`, `parse` = E4, `compose` = E5, `gpu`) are in `crates/`, plus `fwcuda` (CUDA Driver API) and a noisy-run guard on every mode. Headline numbers on the quiet reference machine: transport **139 MiB/s over ConPTY** vs **1,854 over pipes**; log drive **≈1,800 MiB/s sustained** write-through, **2,745** cold read; full VT emulation **1,828 MiB/s** across 16 threads after the span tokenizer; the composed pipeline **1,312–2,429 MiB/s**, and **~92 % idle** at the 273 MiB/s target. Still to build: frame timing (needs M3) and **E1** (GPU contention). **E2 done 2026-09-22**: OpenConsole beats the built-in host on every measure; how to ship it is a founder decision. Measured since the last status: the crash/replay test (E6) and key echo against the composed pipeline | [`crates/fwbench`](../crates/fwbench), [`crates/resmon`](../crates/resmon), [`crates/fwcuda`](../crates/fwcuda) |
 | **M1 Headless core** | `panelog` + fast parser + `vterm` checkpoints, driven by the harness with no UI | throughput and history targets met headless |
+| M1 status (2026-09-22) | **Delivered, headless.** `panelog` (append, crash-safe recovery, sparse line index, checkpoints, trigram search, marks), `vterm` checkpoint/restore and `ansi::MarkScanner`, driven by `fwbench history`. §4 history target met at 100 GB: open 0.3–0.4 s, jump to any line 0.1–0.3 ms, search ≤ 0.5 s; pane rebuild p99 6.9 ms with 1 MiB checkpoints; last failed command found in 0.18 ms. Open: compression of cold segments (a proposal), and running checkpointing off the writer thread | [`panelog-rs`](https://github.com/nativelite/panelog-rs), [`crates/fwbench`](../crates/fwbench) |
 | **M2 atrium adopts it** | unbounded history, search and crash replay inside atrium | atrium benchmarks don't regress; replay after a kill |
 | **M3 Renderer spike** | one platform (Windows, D3D11), glyph atlas, damaged-row redraw, CPU fallback | frame time and latency under flood vs. baseline |
 | **M4 App alpha** | window, panes, blocks, cross-pane search, governor | all §4 targets measured on the reference machine |

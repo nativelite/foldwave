@@ -7,7 +7,8 @@
 use crate::emit::Rng;
 use crate::parse;
 use crate::stats::Summary;
-use panelog::{Config, Reader, SearchOptions, Writer};
+use ansi::{MarkKind, MarkScanner, ShellMark};
+use panelog::{Config, Mark, Reader, SearchOptions, Writer};
 use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -53,7 +54,24 @@ pub struct History {
     pub max_replay: u64,
     /// The search queries and what they found.
     pub searches: Vec<Query>,
+    /// Shell marks stored, and how many commands failed.
+    pub marks: u64,
+    /// Commands planted, and how many of them failed.
+    pub commands: u64,
+    /// Time to find the last failed command, and whether it was the right one.
+    pub last_failure: Duration,
+    /// Whether the last-failure lookup returned the planted offset.
+    pub last_failure_correct: bool,
+    /// Time to list the marks in the last GiB of the log, and how many.
+    pub recent_marks: Duration,
+    /// Marks in that window.
+    pub recent_count: usize,
 }
+
+/// A shell command cycle every this many bytes of output.
+const CYCLE_EVERY: u64 = 256 * 1024;
+/// Every this many commands, one fails.
+const FAIL_EVERY: u64 = 50;
 
 /// One timed search.
 #[derive(Debug, Clone)]
@@ -95,12 +113,16 @@ fn measure(plan: &Plan, dir: &std::path::Path) -> io::Result<History> {
     let source = parse::workload(0, 8 * 1024 * 1024);
     let epoch = Instant::now();
     let started = Instant::now();
+    let (planted_commands, planted_last_fail);
     {
         let mut w = Writer::create(dir, Config::default())?;
         let mut term = vterm::Term::new(24, 80);
         let mut since = 0u64;
         let mut written = 0u64;
         let mut at = 0usize;
+        let mut scanner = MarkScanner::new();
+        let mut found: Vec<ShellMark> = Vec::new();
+        let (mut since_cycle, mut commands, mut last_fail) = (0u64, 0u64, None::<u64>);
         let marker_every = (plan.bytes / MARKERS).max(1);
         let (mut next_marker, mut planted) = (marker_every / 2, 0u64);
         const CHUNK: usize = 64 * 1024;
@@ -110,7 +132,43 @@ fn measure(plan: &Plan, dir: &std::path::Path) -> io::Result<History> {
             }
             let take = CHUNK.min((plan.bytes - written) as usize);
             let chunk = &source[at..at + take];
-            w.append(chunk, epoch.elapsed().as_nanos() as u64)?;
+            let now = epoch.elapsed().as_nanos() as u64;
+            w.append(chunk, now)?;
+            scanner.feed(chunk, &mut found);
+            since_cycle += take as u64;
+            if since_cycle >= CYCLE_EVERY {
+                since_cycle = 0;
+                // Close the previous command (every FAIL_EVERY-th fails), then
+                // show a prompt and start the next, as a shell with semantic
+                // prompts does.
+                let code = if commands > 0 && commands % FAIL_EVERY == 0 {
+                    1
+                } else {
+                    0
+                };
+                if commands > 0 && code != 0 {
+                    last_fail = Some(w.len());
+                }
+                let end = if commands > 0 {
+                    format!("\x1b]133;D;{code}\x07")
+                } else {
+                    String::new()
+                };
+                let cycle = format!(
+                    "{end}\x1b]133;A\x07$ \x1b]133;B\x07cargo test -p crate-{commands}\r\n\x1b]133;C\x07"
+                );
+                w.append(cycle.as_bytes(), now)?;
+                scanner.feed(cycle.as_bytes(), &mut found);
+                commands += 1;
+            }
+            for m in found.drain(..) {
+                w.mark(Mark {
+                    offset: m.offset,
+                    kind: m.kind.letter(),
+                    value: m.exit_code.map_or(i64::MIN, i64::from),
+                    time_ns: now,
+                })?;
+            }
             if plan.checkpoint_every > 0 {
                 term.feed(chunk);
                 since += take as u64;
@@ -126,11 +184,16 @@ fn measure(plan: &Plan, dir: &std::path::Path) -> io::Result<History> {
             if planted < MARKERS && written >= next_marker {
                 let line = format!("fwbench-marker-{planted:02} planted here\n");
                 w.append(line.as_bytes(), epoch.elapsed().as_nanos() as u64)?;
+                // Keep the scanner's offsets in step with the log.
+                scanner.feed(line.as_bytes(), &mut found);
                 planted += 1;
                 next_marker += marker_every;
             }
         }
         w.flush()?;
+        drop(w);
+        planted_commands = commands;
+        planted_last_fail = last_fail;
     }
     let write = started.elapsed();
 
@@ -206,6 +269,17 @@ fn measure(plan: &Plan, dir: &std::path::Path) -> io::Result<History> {
         });
     }
 
+    let failed =
+        |m: &Mark| m.kind == MarkKind::CommandEnd.letter() && m.value != 0 && m.value != i64::MIN;
+    let t = Instant::now();
+    let last = r.last_mark_before(u64::MAX, failed)?;
+    let last_failure = t.elapsed();
+    let last_failure_correct = last.map(|m| m.offset) == planted_last_fail;
+    let window = r.len().saturating_sub(1 << 30)..r.len();
+    let t = Instant::now();
+    let recent_count = r.marks_in(window)?.len();
+    let recent_marks = t.elapsed();
+
     let (mut files, mut disk_bytes) = (0usize, 0u64);
     for e in std::fs::read_dir(dir)? {
         let e = e?;
@@ -224,6 +298,12 @@ fn measure(plan: &Plan, dir: &std::path::Path) -> io::Result<History> {
         rebuild,
         max_replay,
         searches,
+        marks: r.mark_count(),
+        commands: planted_commands,
+        last_failure,
+        last_failure_correct,
+        recent_marks,
+        recent_count,
     })
 }
 
@@ -281,6 +361,18 @@ pub fn render(plan: &Plan, h: &History) -> String {
                 ms(q.second)
             );
         }
+        o += &format!(
+            "| shell marks stored ({} commands, 1 in {} failing) | {} |\n\
+             | find the last failed command | {:.3} ms, {} |\n\
+             | list the marks in the last GiB | {} marks in {:.2} ms |\n",
+            h.commands,
+            FAIL_EVERY,
+            h.marks,
+            ms(h.last_failure),
+            if h.last_failure_correct { "correct" } else { "WRONG" },
+            h.recent_count,
+            ms(h.recent_marks),
+        );
         o
     }
 }
@@ -305,6 +397,14 @@ mod tests {
         let rare = &h.searches[0];
         assert_eq!(rare.matches, 1, "exactly one planted marker matches");
         assert_eq!(h.searches[1].matches, 0, "the absent needle");
+        assert!(h.commands >= 10, "{} commands", h.commands);
+        assert_eq!(
+            h.marks,
+            h.commands * 4 - 1,
+            "A, B, C per command, D for all but the last"
+        );
+        assert!(h.last_failure_correct, "none planted, none found");
+        assert!(h.recent_count > 0);
         assert!(h.lines > 1000);
         assert_eq!(h.jumps.count, 50);
         assert!(h.checkpoints >= 4, "{} checkpoints", h.checkpoints);
