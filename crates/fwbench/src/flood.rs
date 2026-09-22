@@ -118,12 +118,13 @@ impl Transport {
 }
 
 /// Drain one pane over a plain pipe, counting what arrives.
-fn drain_pane_pipe(index: usize, exe: &str, bytes: u64) -> PaneResult {
+fn drain_pane_pipe(index: usize, exe: &str, bytes: u64, emit: &[String]) -> PaneResult {
     use std::process::{Command, Stdio};
     let started = Instant::now();
 
     let mut child = match Command::new(exe)
         .args(["--emit", "--bytes", &bytes.to_string()])
+        .args(emit)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -188,10 +189,18 @@ fn drain_pane_pipe(index: usize, exe: &str, bytes: u64) -> PaneResult {
 /// Returns the byte count, the number of reads, and every read size, so the
 /// caller can see whether output arrives in a few large chunks or many small
 /// ones.
-fn drain_pane(index: usize, exe: &str, bytes: u64, rows: u16, cols: u16) -> PaneResult {
+fn drain_pane(
+    index: usize,
+    exe: &str,
+    bytes: u64,
+    rows: u16,
+    cols: u16,
+    emit: &[String],
+) -> PaneResult {
     let started = Instant::now();
     let bytes_arg = bytes.to_string();
-    let args = ["--emit", "--bytes", bytes_arg.as_str()];
+    let mut args = vec!["--emit", "--bytes", bytes_arg.as_str()];
+    args.extend(emit.iter().map(String::as_str));
 
     let mut pty = match pty::Pty::spawn(exe, &args, rows, cols) {
         Ok(p) => p,
@@ -292,7 +301,8 @@ fn drain_pane(index: usize, exe: &str, bytes: u64, rows: u16, cols: u16) -> Pane
 
 /// Run `panes` flooding panes of `bytes_per_pane` each, concurrently.
 ///
-/// `exe` is the path to this binary, which each pane re-runs in `--emit` mode.
+/// `exe` is the path to this binary, which each pane re-runs in `--emit` mode;
+/// `emit` is appended to that command line (e.g. `--cached`, `--raw`).
 pub fn run(
     exe: &str,
     panes: usize,
@@ -300,6 +310,7 @@ pub fn run(
     rows: u16,
     cols: u16,
     transport: Transport,
+    emit: &[String],
 ) -> FloodResult {
     let started = Instant::now();
     let (tx, rx) = mpsc::channel();
@@ -307,11 +318,12 @@ pub fn run(
 
     for index in 0..panes {
         let exe = exe.to_string();
+        let emit = emit.to_vec();
         let tx = tx.clone();
         handles.push(std::thread::spawn(move || {
             let result = match transport {
-                Transport::Pty => drain_pane(index, &exe, bytes_per_pane, rows, cols),
-                Transport::Pipe => drain_pane_pipe(index, &exe, bytes_per_pane),
+                Transport::Pty => drain_pane(index, &exe, bytes_per_pane, rows, cols, &emit),
+                Transport::Pipe => drain_pane_pipe(index, &exe, bytes_per_pane, &emit),
             };
             // A closed receiver just means the run was abandoned.
             let _ = tx.send(result);
