@@ -11,6 +11,8 @@
 //!   without NTFS compression ([`read`]).
 //! - **Parsing** — the parse budget and the GPU fit, experiment E4 ([`parse`],
 //!   [`fsm`], [`scan`]), and the host-to-GPU copy cost behind it ([`gpu`]).
+//! - **The composed pipeline** — log + parse + scan on N panes at once,
+//!   experiment E5 ([`compose`]).
 //! - **Resource attribution** — where the machine went during the run, across
 //!   CPU, RAM, disk and GPU, via `resmon` (experiment E3, section 8.7b).
 //!
@@ -24,6 +26,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod compose;
 pub mod disk;
 pub mod echo;
 pub mod emit;

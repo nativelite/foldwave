@@ -1,7 +1,7 @@
 //! `fwbench` — the foldwave M0 harness.
 
 use fwbench::flood::Transport;
-use fwbench::{disk, echo, emit, flood, gpu, noise, parse as e4, read, report, Run};
+use fwbench::{compose, disk, echo, emit, flood, gpu, noise, parse as e4, read, report, Run};
 use std::io::{self, Write};
 use std::time::Duration;
 
@@ -18,6 +18,10 @@ modes:
                 probe, as control), then write-through at qd1 and qdN
   parse         E4 parse budget + GPU fit: tokenize vs screen split, thread
                 scaling, structural scan, start-state convergence
+  compose       E5: N panes logging, parsing and scanning at once; --visible V
+                panes are parsed, the rest structurally scanned; --log
+                per-pane|single|none picks the layout (section 8.4's open
+                question); --rate MiB/s paces instead of running flat out
   gpu           host<->GPU copy cost via the CUDA driver (pinned and pageable,
                 64 KiB..64 MiB); --samples copies per cell (default 200)
   read          read rate of --path DIR, unbuffered and buffered, with the CPU
@@ -61,6 +65,7 @@ enum Mode {
     Parse,
     Gpu,
     Read,
+    Compose,
     Emit { bytes: u64 },
 }
 
@@ -80,6 +85,9 @@ struct Args {
     threads: Vec<usize>,
     reps: usize,
     noise_limit: f64,
+    visible: usize,
+    log: compose::LogMode,
+    rate_mib: f64,
     flush_mib: u64,
     flush_path: Option<String>,
 }
@@ -99,6 +107,9 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut threads = vec![1, 2, 4, 6, 8, 12, 16];
     let mut reps = 5usize;
     let mut noise_limit = noise::DEFAULT_LIMIT_CORES;
+    let mut visible = 4usize;
+    let mut log = compose::LogMode::PerPane;
+    let mut rate_mib = 0.0f64;
     let mut flush_mib = 0u64;
     let mut flush_path: Option<String> = None;
     let mut emit_bytes: Option<u64> = None;
@@ -131,6 +142,26 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "disk" => {
                 mode = Some(Mode::Disk);
                 i += 1;
+            }
+            "compose" => {
+                mode = Some(Mode::Compose);
+                i += 1;
+            }
+            "--visible" => {
+                let v = value(&mut i, "--visible")?;
+                visible = v.parse().map_err(|_| format!("bad --visible {v:?}"))?;
+            }
+            "--log" => {
+                let v = value(&mut i, "--log")?;
+                log = compose::LogMode::parse(&v)
+                    .ok_or_else(|| format!("bad --log {v:?}, want per-pane, single or none"))?;
+            }
+            "--rate" => {
+                let v = value(&mut i, "--rate")?;
+                rate_mib = v.parse().map_err(|_| format!("bad --rate {v:?}"))?;
+                if !(rate_mib >= 0.0 && rate_mib.is_finite()) {
+                    return Err("--rate must be a non-negative number of MiB/s".into());
+                }
             }
             "read" => {
                 mode = Some(Mode::Read);
@@ -255,6 +286,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     // A drive needs a long stream to show its sustained rate; panes do not.
     let mib = mib.unwrap_or(match mode {
         Mode::Disk | Mode::Read => 2048,
+        Mode::Compose => 256,
         Mode::Parse => 64,
         _ => 32,
     });
@@ -274,6 +306,9 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         threads,
         reps,
         noise_limit,
+        visible,
+        log,
+        rate_mib,
         flush_mib,
         flush_path,
     })
@@ -369,6 +404,35 @@ fn run(args: &Args) -> i32 {
         return 0;
     }
 
+    if args.mode == Mode::Compose {
+        let dir = std::path::PathBuf::from(args.path.as_deref().unwrap_or("."));
+        let config = compose::Config {
+            panes: args.panes,
+            visible: args.visible.min(args.panes),
+            bytes_per_pane: args.mib * 1024 * 1024,
+            log: args.log,
+            dir: dir.clone(),
+            io: args.io_kib * 1024,
+            rate_mib: args.rate_mib,
+        };
+        eprintln!(
+            "compose: {} panes x {} MiB, {} visible, log {} under {}...",
+            config.panes,
+            args.mib,
+            config.visible,
+            config.log.name(),
+            dir.display()
+        );
+        match compose::run(&config) {
+            Ok(result) => print!("{}", compose::render(&config, &result)),
+            Err(e) => {
+                eprintln!("fwbench: compose failed: {e}");
+                return 1;
+            }
+        }
+        return 0;
+    }
+
     if args.mode == Mode::Read {
         let dir = std::path::PathBuf::from(args.path.as_deref().unwrap_or("."));
         let config = read::Config {
@@ -452,7 +516,7 @@ fn run(args: &Args) -> i32 {
     let started = std::time::Instant::now();
 
     let run = match args.mode {
-        Mode::Emit { .. } | Mode::Disk | Mode::Parse | Mode::Gpu | Mode::Read => {
+        Mode::Emit { .. } | Mode::Disk | Mode::Parse | Mode::Gpu | Mode::Read | Mode::Compose => {
             unreachable!("handled above")
         }
         Mode::Flood => {
@@ -548,6 +612,27 @@ mod tests {
         let d = parse(&argv(&["parse"])).unwrap();
         assert_eq!(d.mode, Mode::Parse);
         assert_eq!(parse(&argv(&["gpu"])).unwrap().mode, Mode::Gpu);
+        let c = parse(&argv(&["compose"])).unwrap();
+        assert_eq!(
+            (c.mode, c.panes, c.visible, c.mib, c.log, c.rate_mib),
+            (Mode::Compose, 8, 4, 256, compose::LogMode::PerPane, 0.0)
+        );
+        let c = parse(&argv(&[
+            "compose",
+            "--log",
+            "single",
+            "--rate",
+            "273",
+            "--visible",
+            "2",
+        ]))
+        .unwrap();
+        assert_eq!(
+            (c.log, c.rate_mib, c.visible),
+            (compose::LogMode::Single, 273.0, 2)
+        );
+        assert!(parse(&argv(&["compose", "--log", "nope"])).is_err());
+        assert!(parse(&argv(&["compose", "--rate", "-1"])).is_err());
         let r = parse(&argv(&["read"])).unwrap();
         assert_eq!((r.mode, r.mib, r.io_kib), (Mode::Read, 2048, 1024));
         assert_eq!(d.noise_limit, noise::DEFAULT_LIMIT_CORES);

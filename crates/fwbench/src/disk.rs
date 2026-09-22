@@ -199,7 +199,7 @@ fn buffered_fsync(path: &Path, bytes: u64, io: usize, flush_every: u64) -> io::R
 
 /// Open for unbuffered write-through: the write returns when the bytes are on
 /// the device, and the page cache is never involved.
-fn open_writethrough(path: &Path, create: bool) -> io::Result<File> {
+pub(crate) fn open_writethrough(path: &Path, create: bool) -> io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.write(true);
     if create {
