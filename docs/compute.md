@@ -12,8 +12,9 @@ so. **Unverified** marks anything that couldn't be confirmed.
 | **Local AI over agent output** (summarize floods, cluster errors, semantic search) | ✅ Best fit | Real GPU work, and it can run in a **separate local process** (llama.cpp's `llama-server`, Ollama: both MIT, both HTTP), so the terminal links no CUDA and stays zero-dependency |
 | **Bulk search over huge history** (scan GBs when the index can't answer) | 🟡 Spike, measure first | Published GPU regex speedups are large, but exclude transfer time, and transfer is what decides small searches |
 | **Compressing cold log segments** | 🟡 Probably CPU | nvCOMP (GPU compression) is proprietary; measure whether CPU compression is enough first |
-| **Reading from SSD straight to GPU** (GPUDirect Storage) | ❌ Out | Linux-only, datacenter GPUs (Tesla/Quadro), extra kernel modules |
-| **VT parsing, input, rendering** | ❌ Out | Sequential and small (parsing), sub-millisecond already (input), and rendering belongs to D3D/Metal/Vulkan, not CUDA |
+| **Reading from SSD straight to GPU** (GPUDirect Storage, DirectStorage) | ❌ Out | GPUDirect Storage: Linux-only, datacenter GPUs. DirectStorage: not peer-to-peer (it stages through system RAM), read-only, and a proprietary redistributable. Our own `ReadFile` plus a GPU copy takes the same two hops with nothing to ship (below) |
+| **VT tokenizing** | 🟡 Candidate (2026-09-21, E4) | Measured to fit: non-string start states converge within 18 bytes, and a 1 MiB pinned copy costs 0.6 % of parsing it on a P-core ([design §8.0 E4 result](design.md)). A kernel must still beat the CPU end to end |
+| **Screen apply, input, rendering** | ❌ Out | Screen apply is sequential per pane, input is already sub-millisecond, and rendering belongs to D3D/Metal/Vulkan, not CUDA |
 
 **Design rule:** CUDA is NVIDIA-only. Treat it as **one optional compute
 backend** beside the CPU, detected at runtime, never required. Everything must
@@ -28,6 +29,15 @@ work on AMD, Intel and Apple GPUs and with no GPU.
 - **Idle snapshot (2026-09-15, measured):** `nvidia-smi` reported **0% GPU utilization, 1975 MiB of 8192 MiB used**, while the CPU carried two runaway `find` processes at 6.8 CPU-hours each ([design §8.7b](design.md)).
 - **Trust `nvidia-smi`, not Task Manager,** for utilization: Task Manager's GPU figure defaults to the 3D engine and under-reports compute.
 - **Shader toolchain (measured 2026-09-15, `C:\Windows\System32`):** `vulkan-1.dll` and `d3dcompiler_47.dll` are present; `dxcompiler.dll` is not. So D3D11 can compile HLSL at runtime from a system DLL, while a Vulkan backend needs SPIR-V compiled ahead of time and checked in — a build-time step, not a runtime dependency. Recorded for the M3 renderer decision ([design §8.6](design.md)); it does not change the Vulkan-first recommendation.
+
+- **Host↔GPU copies (measured 2026-09-21, `fwbench gpu`):**
+  - Link: RTX 3070 at PCIe 4.0 x16 (`nvidia-smi`).
+  - Setup: CUDA Driver API through `crates/fwcuda`, synchronous copies, 2 s warm-up, 200 copies per cell, two runs agreeing within 4 %.
+  - Pinned host memory: 18–20 GiB/s at 1 MiB, 21.6–23.5 GiB/s at 16–64 MiB, and 13 µs p50 for 64 KiB.
+  - Pageable memory: 7.2–10.7 GiB/s.
+  - Without a warm-up, a 20-copy smoke run swung between 10.9 and 18.5 GiB/s, so warm the GPU's clocks before measuring.
+- **Driver API signature change:** CUDA 13 docs give `cuCtxCreate` a new four-argument form, `(CUcontext*, CUctxCreateParams*, flags, CUdevice)` — https://docs.nvidia.com/cuda/cuda-driver-api/cuda_driver_api/group__CUDA__CTX.html
+  - The three-argument `cuCtxCreate_v2` is documented in the 12.6 archive (https://docs.nvidia.com/cuda/archive/12.6.0/cuda-driver-api/group__CUDA__CTX.html) and is still exported by driver 616.92, which reports CUDA 13040. `fwcuda` uses it.
 
 ## CUDA without the toolkit: the Driver API
 
@@ -64,6 +74,32 @@ work on AMD, Intel and Apple GPUs and with no GPU.
 - Needs the `nvidia-fs` kernel module and recent kernels for NVMe P2PDMA — release notes.
 - On Btrfs and ZFS it falls back to CPU reads (compatibility mode) — release notes.
 - **Verdict:** not for a desktop terminal.
+
+## DirectStorage (Windows' SSD-to-GPU loading API)
+
+*Researched 2026-09-21.*
+
+- **Not peer-to-peer.** With GPU decompression, "the first copy queue is used to copy the compressed stream from system memory to the GPU" — https://devblogs.microsoft.com/directx/directstorage-1-1-now-available/
+- **What BypassIO shortens is the path to RAM, not the path to the GPU.**
+  - Reads go I/O manager → NTFS → classpnp → StorNVMe, skipping the filter stacks — https://learn.microsoft.com/en-us/windows-hardware/drivers/ifs/bypassio
+  - It needs NVMe, NTFS and noncached reads.
+  - A minifilter that has not opted in (wof.sys, for example) forces the normal path.
+  - **NTFS compression cannot be enabled on a BypassIO-active file** — same page. This is one more reason to keep the log directory uncompressed.
+- **Read-only.** DirectStorage 1.3 has no write request, and BypassIO lists noncached writes as "coming in a future release" (same page; the 1.3 `dstorage.h` was inspected from the NuGet package).
+- **Not part of Windows.** `dstorage.dll` and `dstoragecore.dll` ship in NuGet `Microsoft.Direct3D.DirectStorage` under the proprietary Microsoft DirectStorage SDK license, and the app must redistribute them — https://www.nuget.org/packages/Microsoft.Direct3D.DirectStorage
+  - They are absent from System32 on the reference machine. It "ships with your game" — https://devblogs.microsoft.com/directx/directstorage-developer-preview-now-available/
+  - **This fails the zero-dependency rule.**
+- **GDeflate is open.** It is DEFLATE rearranged into 64 KiB tiles so 32 lanes can decode in parallel, with Apache-2.0 compressor, decompressor and shader code — https://github.com/microsoft/DirectStorage/tree/main/GDeflate
+  - It is the reference to study for our own GPU compression of cold log segments. Throughput claims are **unverified**: NVIDIA's figures are in images.
+- **Implication:** our own path is plain `ReadFile` into pinned memory, then a GPU copy through the Driver API or a Vulkan transfer queue. It is the same two hops DirectStorage takes, with nothing to redistribute. E: reads plus 22 GiB/s copies (above) put the ceiling at the drive.
+
+## Parallel tokenizing on a GPU (prior work)
+
+- **Data-parallel finite-state machines.** Enumerate every start state per chunk and combine chunks with a parallel prefix over transition functions. Reported up to 3× on one core and 21× on 8 cores for regex, Huffman and HTML tokenization — Mytkowicz, Musuvathi, Schulte, ASPLOS 2014, https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/asplos302-mytkowicz.pdf
+- **GPU structural indexing for JSON (GpJSON).** At least 2.9× faster end to end than the best parallel parsers on an A100 — PVLDB 18(9), 2025, https://vldb.org/pvldb/vol18/p3216-bonetta.pdf
+- **The VT500 parser has 14 states** — https://vt100.net/emu/dec_ansi_parser
+  - `nativelite-ansi` uses 6, which is 11 once pending-ESC and UTF-8 states are counted ([`fsm.rs`](../crates/fwbench/src/fsm.rs)).
+  - No published GPU VT parser was found (**unverified** absence).
 
 ## GPU text and regex search
 

@@ -3,12 +3,23 @@
 version = 3
 
 [[package]]
+name = "nativelite-ansi"
+version = "0.3.1"
+
+[[package]]
 name = "nativelite-fwbench"
 version = "0.1.0"
 dependencies = [
+ "nativelite-ansi",
+ "nativelite-fwcuda",
  "nativelite-pty",
  "nativelite-resmon",
+ "nativelite-vterm",
 ]
+
+[[package]]
+name = "nativelite-fwcuda"
+version = "0.1.0"
 
 [[package]]
 name = "nativelite-pty"
@@ -17,3 +28,15 @@ version = "0.4.1"
 [[package]]
 name = "nativelite-resmon"
 version = "0.1.0"
+
+[[package]]
+name = "nativelite-uwidth"
+version = "0.1.0"
+
+[[package]]
+name = "nativelite-vterm"
+version = "0.5.2"
+dependencies = [
+ "nativelite-ansi",
+ "nativelite-uwidth",
+]

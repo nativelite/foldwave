@@ -1,0 +1,18 @@
+[package]
+name = "nativelite-fwcuda"
+version = "0.1.0"
+description = "A minimal, runtime-loaded binding to the NVIDIA CUDA Driver API (nvcuda.dll) for memory and copy benchmarks, using only the Rust standard library."
+license = "MIT"
+keywords = ["cuda", "gpu", "benchmark", "ffi", "nativelite"]
+categories = ["hardware-support", "development-tools::profiling"]
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# nativelite core rule: ZERO third-party dependencies. Do not add to this.
+# (nvcuda.dll is loaded at run time through kernel32; nothing NVIDIA is linked.)
+[dependencies]
+
+[lib]
+name = "fwcuda"
+path = "src/lib.rs"

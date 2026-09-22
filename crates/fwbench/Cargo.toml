@@ -11,6 +11,9 @@ repository.workspace = true
 [dependencies]
 pty = { package = "nativelite-pty", version = "0.4.1", path = "../../../pty-rs" }
 resmon = { package = "nativelite-resmon", version = "0.1.0", path = "../resmon" }
+ansi = { package = "nativelite-ansi", version = "0.3.1", path = "../../../ansi-rs" }
+fwcuda = { package = "nativelite-fwcuda", version = "0.1.0", path = "../fwcuda" }
+vterm = { package = "nativelite-vterm", version = "0.5.2", path = "../../../vterm-rs" }
 
 [lib]
 name = "fwbench"

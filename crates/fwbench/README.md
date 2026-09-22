@@ -10,11 +10,14 @@ Covers three of the [`docs/design.md`](../../docs/design.md) §4 targets:
 | **Throughput** | N pty panes flooding at once, each drained on its own reader thread |
 | **Input latency** | key echo, timestamped the instant a blocking read returns |
 | **Resource attribution** | CPU, RAM, disk and GPU across the run, via [`resmon`](../resmon) (experiment E3) |
+| **Parse budget + GPU fit** | tokenize vs screen split, thread scaling, hidden-pane scan, start-state convergence (experiment E4) |
+| **Host↔GPU copy cost** | synchronous copies through the CUDA Driver API, via [`fwcuda`](../fwcuda) |
 
 Frame timing is deliberately absent: it needs a renderer, which is M3.
 
 **Zero third-party dependencies** — nativelite org crates (`nativelite-pty`,
-`nativelite-resmon`) and std only.
+`nativelite-resmon`, `nativelite-ansi`, `nativelite-vterm`, `nativelite-fwcuda`)
+and std only.
 
 ## Use
 
@@ -28,14 +31,24 @@ cargo run --release --bin fwbench -- combined --panes 8 --mib 32 --samples 120
 | `echo` | key-echo latency on an idle machine |
 | `combined` | echo latency measured **while** the panes flood — the §4 target |
 | `disk` | durable write rate of the log drive, three ways: the old buffered+fsync probe as control, then unbuffered write-through at queue depth 1 and N |
+| `parse` | experiment E4: `vterm` full emulation vs `ansi` tokenizing vs the bare state machine, thread scaling, the structural scan, and how fast every start state converges (the GPU fit) |
+| `gpu` | host→GPU and GPU→host copy cost, pinned and pageable, 64 KiB to 64 MiB, after a 2 s warm-up |
 
 Options: `--panes N`, `--mib N`, `--samples N`, `--gap-ms N`, `--shell NAME`,
 `--no-attrib`; for `disk`, `--path DIR` (the reference log drive is `E:\`),
 `--io-kib N` (default 1024) and `--qd N` (default 8), with `--mib` defaulting
-to 2048 per pattern.
+to 2048 per pattern. For `parse`, `--mib` (default 64, per pane), `--reps N`
+(default 5) and `--threads 1,2,4,...` (`none` skips scaling). Core placement is
+set from outside, so the harness stays free of `unsafe`:
+`cmd /c start /b /wait /affinity 555 fwbench parse` runs on one thread per
+P-core of the reference i5. For `gpu`, `--samples N` copies per cell (default
+200).
 
 ```
-cargo run --release --bin fwbench -- disk --path E:```
+cargo run --release --bin fwbench -- disk --path 'E:\'
+cmd /c start /b /wait /affinity 555 target\release\fwbench.exe parse
+cargo run --release --bin fwbench -- gpu
+```
 
 `disk` exists because the first E: figure in design §4.1 (479 MiB/s) measured
 a flush round-trip loop, not the drive: buffered appends through the page

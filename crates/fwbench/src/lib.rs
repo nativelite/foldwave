@@ -8,6 +8,8 @@
 //! - **Input latency** — key echo timed on arrival ([`echo`]).
 //! - **Storage** — the log drive measured the way the log writer will use
 //!   it: unbuffered write-through, queued ([`disk`]).
+//! - **Parsing** — the parse budget and the GPU fit, experiment E4 ([`parse`],
+//!   [`fsm`], [`scan`]), and the host-to-GPU copy cost behind it ([`gpu`]).
 //! - **Resource attribution** — where the machine went during the run, across
 //!   CPU, RAM, disk and GPU, via `resmon` (experiment E3, section 8.7b).
 //!
@@ -22,7 +24,11 @@ pub mod disk;
 pub mod echo;
 pub mod emit;
 pub mod flood;
+pub mod fsm;
+pub mod gpu;
+pub mod parse;
 pub mod report;
+pub mod scan;
 pub mod stats;
 
 pub use echo::EchoResult;

@@ -1,7 +1,7 @@
 //! `fwbench` — the foldwave M0 harness.
 
 use fwbench::flood::Transport;
-use fwbench::{disk, echo, emit, flood, report, Run};
+use fwbench::{disk, echo, emit, flood, gpu, parse as e4, report, Run};
 use std::io::{self, Write};
 use std::time::Duration;
 
@@ -16,6 +16,10 @@ modes:
   combined      echo latency measured WHILE the panes flood (the section 4 target)
   disk          durable write rate of the log drive: buffered+fsync (the old
                 probe, as control), then write-through at qd1 and qdN
+  parse         E4 parse budget + GPU fit: tokenize vs screen split, thread
+                scaling, structural scan, start-state convergence
+  gpu           host<->GPU copy cost via the CUDA driver (pinned and pageable,
+                64 KiB..64 MiB); --samples copies per cell (default 200)
 
 options:
   --panes N     panes to flood (default 8)
@@ -31,6 +35,10 @@ options:
                 the reference log drive is E:\\)
   --io-kib N    disk: bytes per write for the write-through patterns (default 1024)
   --qd N        disk: queue depth for the queued pattern (default 8)
+  --threads L   parse: comma-separated thread counts (default 1,2,4,6,8,12,16;
+                \"none\" skips scaling). Set core placement from outside, e.g.
+                cmd /c start /b /wait /affinity 0x555 fwbench parse ...
+  --reps N      parse: timed repetitions per cell (default 5)
   -h, --help    this message
 
 internal:
@@ -43,6 +51,8 @@ enum Mode {
     Echo,
     Combined,
     Disk,
+    Parse,
+    Gpu,
     Emit { bytes: u64 },
 }
 
@@ -59,6 +69,8 @@ struct Args {
     path: Option<String>,
     io_kib: usize,
     qd: usize,
+    threads: Vec<usize>,
+    reps: usize,
 }
 
 fn parse(argv: &[String]) -> Result<Args, String> {
@@ -73,6 +85,8 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut path = None;
     let mut io_kib = 1024usize;
     let mut qd = 8usize;
+    let mut threads = vec![1, 2, 4, 6, 8, 12, 16];
+    let mut reps = 5usize;
     let mut emit_bytes: Option<u64> = None;
 
     let mut i = 0;
@@ -103,6 +117,34 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "disk" => {
                 mode = Some(Mode::Disk);
                 i += 1;
+            }
+            "gpu" => {
+                mode = Some(Mode::Gpu);
+                i += 1;
+            }
+            "parse" => {
+                mode = Some(Mode::Parse);
+                i += 1;
+            }
+            "--threads" => {
+                let v = value(&mut i, "--threads")?;
+                threads = if v == "none" {
+                    Vec::new()
+                } else {
+                    v.split(',')
+                        .map(|t| match t.trim().parse::<usize>() {
+                            Ok(n) if n > 0 => Ok(n),
+                            _ => Err(format!("bad --threads {v:?}")),
+                        })
+                        .collect::<Result<_, _>>()?
+                };
+            }
+            "--reps" => {
+                let v = value(&mut i, "--reps")?;
+                reps = v.parse().map_err(|_| format!("bad --reps {v:?}"))?;
+                if reps == 0 {
+                    return Err("--reps must be at least 1".into());
+                }
             }
             "--path" => path = Some(value(&mut i, "--path")?),
             "--io-kib" => {
@@ -181,7 +223,11 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         None => return Err(USAGE.to_string()),
     };
     // A drive needs a long stream to show its sustained rate; panes do not.
-    let mib = mib.unwrap_or(if mode == Mode::Disk { 2048 } else { 32 });
+    let mib = mib.unwrap_or(match mode {
+        Mode::Disk => 2048,
+        Mode::Parse => 64,
+        _ => 32,
+    });
 
     Ok(Args {
         mode,
@@ -195,6 +241,8 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         path,
         io_kib,
         qd,
+        threads,
+        reps,
     })
 }
 
@@ -261,6 +309,44 @@ fn main() {
         return;
     }
 
+    if args.mode == Mode::Gpu {
+        eprintln!(
+            "gpu: warming up 2 s, then {} copies per cell...",
+            args.samples
+        );
+        match gpu::run(args.samples, Duration::from_secs(2)) {
+            Ok((label, cells)) => print!("{}", gpu::render(&label, &cells)),
+            Err(e) => {
+                eprintln!("fwbench: gpu measurement failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if args.mode == Mode::Parse {
+        let bytes = (args.mib * 1024 * 1024) as usize;
+        let cfg = e4::Config {
+            bytes,
+            reps: args.reps,
+            threads: args.threads.clone(),
+            offsets: 10_000,
+        };
+        eprintln!("parse: generating {} MiB workload...", args.mib);
+        let data = e4::workload(0, bytes);
+        eprintln!("parse: split ({} reps)...", cfg.reps);
+        let split = e4::split(&data, cfg.reps);
+        let mut scaling = Vec::new();
+        for &t in &cfg.threads {
+            eprintln!("parse: scaling, {t} thread(s)...");
+            scaling.push((t, e4::scaling(t, bytes, cfg.reps)));
+        }
+        eprintln!("parse: convergence over {} boundaries...", cfg.offsets);
+        let conv = e4::convergence(&data, cfg.offsets, e4::FEED);
+        print!("{}", e4::render(&cfg, &split, &scaling, &conv));
+        return;
+    }
+
     let exe = match std::env::current_exe() {
         Ok(p) => p.to_string_lossy().into_owned(),
         Err(e) => {
@@ -282,7 +368,7 @@ fn main() {
     let started = std::time::Instant::now();
 
     let run = match args.mode {
-        Mode::Emit { .. } | Mode::Disk => unreachable!("handled above"),
+        Mode::Emit { .. } | Mode::Disk | Mode::Parse | Mode::Gpu => unreachable!("handled above"),
         Mode::Flood => {
             eprintln!("flooding {} panes x {} MiB...", args.panes, args.mib);
             Run {
@@ -368,6 +454,24 @@ mod tests {
         assert_eq!(parse(&argv(&["echo"])).unwrap().mode, Mode::Echo);
         assert_eq!(parse(&argv(&["combined"])).unwrap().mode, Mode::Combined);
         assert_eq!(parse(&argv(&["disk"])).unwrap().mode, Mode::Disk);
+    }
+
+    #[test]
+    fn parse_options() {
+        let d = parse(&argv(&["parse"])).unwrap();
+        assert_eq!(d.mode, Mode::Parse);
+        assert_eq!(parse(&argv(&["gpu"])).unwrap().mode, Mode::Gpu);
+        assert_eq!(d.mib, 64);
+        assert_eq!(d.threads, vec![1, 2, 4, 6, 8, 12, 16]);
+        assert_eq!(d.reps, 5);
+        let a = parse(&argv(&["parse", "--threads", "1,3", "--reps", "2"])).unwrap();
+        assert_eq!((a.threads, a.reps), (vec![1, 3], 2));
+        assert!(parse(&argv(&["parse", "--threads", "none"]))
+            .unwrap()
+            .threads
+            .is_empty());
+        assert!(parse(&argv(&["parse", "--threads", "1,0"])).is_err());
+        assert!(parse(&argv(&["parse", "--reps", "0"])).is_err());
     }
 
     #[test]
