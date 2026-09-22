@@ -4,7 +4,7 @@
 # The dependency guard (tools/dep_guard.py) enforces it across every member.
 [workspace]
 resolver = "2"
-members = ["crates/resmon", "crates/fwbench", "crates/fwcuda"]
+members = ["crates/resmon", "crates/fwbench", "crates/fwcuda", "crates/fwrender"]
 
 [workspace.package]
 edition = "2021"

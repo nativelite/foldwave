@@ -1,0 +1,20 @@
+[package]
+name = "nativelite-fwrender"
+version = "0.1.0"
+description = "foldwave's M3 renderer spike: a cell frame with row damage, a glyph atlas, a CPU reference renderer and a hand-bound Vulkan backend, using only the Rust standard library."
+license = "MIT"
+keywords = ["terminal", "renderer", "vulkan", "gpu", "nativelite"]
+categories = ["rendering", "command-line-interface"]
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# nativelite core rule: ZERO third-party dependencies; org crates only.
+# (vulkan-1.dll and the Win32 DLLs are loaded or linked from the OS; nothing is
+# redistributed.)
+[dependencies]
+ansi = { package = "nativelite-ansi", version = "0.4.0", path = "../../../ansi-rs" }
+
+[lib]
+name = "fwrender"
+path = "src/lib.rs"

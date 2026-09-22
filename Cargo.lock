@@ -23,6 +23,13 @@ name = "nativelite-fwcuda"
 version = "0.1.0"
 
 [[package]]
+name = "nativelite-fwrender"
+version = "0.1.0"
+dependencies = [
+ "nativelite-ansi",
+]
+
+[[package]]
 name = "nativelite-panelog"
 version = "0.1.0"
 
