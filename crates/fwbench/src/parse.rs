@@ -4,7 +4,8 @@
 //! floods ([`crate::emit`]):
 //!
 //! 1. **The split.** How much of full emulation (`vterm::Term`) is the
-//!    tokenizer (`ansi::Parser`), how much is the bare state machine
+//!    tokenizer (`ansi::Parser`, allocating tokens and borrowing spans), how
+//!    much is the bare state machine
 //!    ([`crate::fsm`]), and how much is applying tokens to the screen? Only
 //!    the tokenizer half could move to a GPU; the screen half is sequential.
 //! 2. **Scaling.** Full emulation on 1..N threads, one independent pane per
@@ -104,6 +105,23 @@ pub fn split(data: &[u8], reps: usize) -> Vec<Rate> {
                 for c in data.chunks(FEED) {
                     sink ^= p.feed(c).len();
                 }
+            },
+        ),
+        time(
+            "ansi::Parser::feed_with (spans, no allocation)",
+            n,
+            reps,
+            || {
+                let mut p = ansi::Parser::new();
+                let mut seen = 0usize;
+                for c in data.chunks(FEED) {
+                    p.feed_with(c, |e| {
+                        if let ansi::Event::Text(t) = e {
+                            seen += t.len();
+                        }
+                    });
+                }
+                sink ^= seen;
             },
         ),
         time(
@@ -284,7 +302,7 @@ mod tests {
     fn split_and_scaling_run_small() {
         let data = workload(0, 64 * 1024);
         let s = split(&data, 2);
-        assert_eq!(s.len(), 5);
+        assert_eq!(s.len(), 6);
         assert!(s.iter().all(|r| r.reps.len() == 2 && r.median() > 0.0));
         let r = scaling(2, 16 * 1024, 1);
         assert!(r.bytes >= 32 * 1024);

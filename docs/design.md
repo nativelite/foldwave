@@ -454,16 +454,34 @@ measured **25–50 % low**. Those numbers are gone; these replace them.
 
 | Stage | Median MiB/s | Share of full emulation time |
 | --- | --- | --- |
-| `vterm` full emulation (tokenize + apply to screen) | 123.4 | 100 % |
-| `ansi::Parser` tokenize, one heap token per token | 206.9 | 60 % |
-| The state machine alone ([`fsm.rs`](../crates/fwbench/src/fsm.rs) table) | 565.6 | 22 % |
-| All 11 start states in lockstep (enumerative, no shortcut) | 383.3 | 32 % |
-| Structural scan, hidden-pane path (lines + OSC 133) | 1,798.4 | 7 % |
+| `vterm` full emulation (tokenize + apply to screen) | 120.6 | 100 % |
+| `ansi::Parser::feed` tokenize, one heap token per token | 192.5 | 63 % |
+| **`ansi::Parser::feed_with` tokenize, borrowed spans** | **876.3** | **14 %** |
+| The state machine alone ([`fsm.rs`](../crates/fwbench/src/fsm.rs) table) | 567.6 | 21 % |
+| All 11 start states in lockstep (enumerative, no shortcut) | 391.3 | 31 % |
+| Structural scan, hidden-pane path (lines + OSC 133) | 1,840.6 | 7 % |
 
-- **Applying tokens to the screen is ≈40 % of the time, tokenizing ≈60 %.**
-  Only 22 % is the state machine itself; the other ≈38 % is `ansi` allocating
-  a `String`/`Vec` per token. That part is recoverable on the CPU, with no
-  GPU, by a tokenizer that emits spans into a caller-owned buffer.
+*(This table is the follow-up run of 2026-09-22 that added the spans row; the
+scaling and convergence tables below are the earlier run of the same day, same
+conditions. Run-to-run spread between them is ≤ 7 %.)*
+
+- **Applying tokens to the screen is ≈37 % of the time, tokenizing ≈63 %.**
+  Only 21 % is the state machine itself; the rest was `ansi` allocating a
+  `String`/`Vec` per token.
+- **That allocation is now gone, and it was worth 4.6×.**
+  `nativelite-ansi` gained `Parser::feed_with`, the same state machine handing
+  a closure borrowed events (text runs point into the caller's buffer,
+  sequence payloads into reused scratch). Tokenizing went from 192.5 to
+  **876.3 MiB/s** — faster even than the bare table-driven machine above,
+  because a text run costs nothing per byte beyond its range check. `feed` is
+  now a thin adapter over it, so there is one machine, not two.
+  - **Unshipped as of writing:** `vterm` still calls `feed`, so the 120.6
+    MiB/s emulation figure is unchanged. Arithmetic on the rows above puts
+    screen apply at ≈322 MiB/s alone, so a `vterm` that consumed spans should
+    reach **≈235 MiB/s, about 2× today's** — a calculation, not a
+    measurement, and the next thing to build.
+  - Publishing `nativelite-ansi` with the new API is a founder call; foldwave
+    consumes it by path meanwhile.
 - **The hidden-pane scan runs at 1.8 GiB/s per core,** comfortably above the
   ≥1 GiB/s the §8.0 budget assumed.
 - **Core placement matters more than any tuning here:** the same single thread
