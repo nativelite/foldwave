@@ -99,7 +99,7 @@ throughput target has been measured.
 
 ### 4.1 Measured ceilings on the reference machine
 
-*Measured 2026-09-15/16, release builds, M0 harness and direct probes, against
+*Measured 2026-09-15/16 (SSD row re-measured 2026-09-21), release builds, M0 harness and direct probes, against
 the §4 aggregate target of 273 MiB/s (16 panes at 1 GB/min each). These are what
 each leg does in isolation, so a plan for using them together starts from facts.*
 
@@ -107,19 +107,21 @@ each leg does in isolation, so a plan for using them together starts from facts.
 | --- | --- | --- |
 | **RAM** — `memcpy`, 1 core | 23,235 MiB/s | 85× |
 | **CPU** — `vterm` full emulation, 16 threads | 723 MiB/s | 2.6× |
-| **SSD (E:)** — buffered append, `fsync` every 16 MiB, one write in flight | 479 MiB/s — **the method's ceiling, not the drive's** (see below) | 1.75× |
+| **SSD (E:)** — unbuffered write-through, 1 MiB appends, one write in flight, sustained past the SLC cache (`fwbench disk`, 2026-09-21) | ≈1,750 MiB/s (write p99 ≈1.1 ms); 3,477 MiB/s while the SLC cache lasts | **6.4×** |
 | **GPU** — RTX 3070 | not yet measured (experiment E1, [`compute.md`](compute.md)) | — |
 | *transport:* headless pipe, 16 panes | ≥ 1854 MiB/s | 6.8× (a floor, §8.9) |
 | *transport:* ConPTY, 16 panes | 139 MiB/s | **0.51× — misses** |
 
 **What this says about the architecture:**
 
-- **The §4 targets are reachable, and the margin is thin.** With agents headless,
-  every leg clears 273 MiB/s: CPU by 2.6×, the SSD by 1.75×. Nothing has orders
-  of magnitude to spare, and ConPTY misses outright.
-- **CPU and SSD are the binding pair,** within 1.5× of each other and far below
-  the transport. RAM is not a constraint at any point. Engineering effort
-  belongs in the parser and the log, not in moving bytes.
+- **The §4 targets are reachable.** With agents headless, every leg clears
+  273 MiB/s: the SSD by 6.4× (sustained), the CPU by 2.6×. ConPTY misses
+  outright.
+- **CPU parsing is the binding leg.** The SSD (≈1,750 MiB/s sustained) and the
+  pipe transport (≥ 1,854) are both more than 2× faster than parsing, and RAM is
+  never a constraint. Engineering effort belongs in the parser, not in moving or
+  storing bytes. (Before 2026-09-21 this line said "CPU and SSD are the binding
+  pair", based on the discredited 479 MiB/s figure.)
 - **This quantifies §8.7b's index-construction offload.** 723 MiB/s is *parsing
   alone*, with all 16 threads busy. A background indexer would compete for
   exactly those cores. Moving it to a GPU measured at 0% utilization is now the
@@ -127,19 +129,42 @@ each leg does in isolation, so a plan for using them together starts from facts.
 - **Parsing scales sublinearly:** 111 MiB/s on one thread, 723 on sixteen — 6.5×
   for 16× the threads, per-thread falling from 111 to 45 MiB/s. Budget cores
   accordingly; do not assume linear fan-out.
-- **The SSD row is the cost of a flush loop, not the drive.** That probe
-  handed the page cache 256 KiB at a time and stopped every 16 MiB for an
-  `fsync`; at the measured 26.7 ms fsync p50 the writer sat blocked for **80 %
-  of the wall clock** (33.4 ms per 16 MiB cycle, 6.7 ms of it filling), and the
-  device idled in between. It is the durable rate of *that pattern*, at queue
-  depth 1, and was wrongly promoted to a ceiling. The drive's own figure comes
-  from the pattern the log writer will use — unbuffered write-through
-  (`FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH`, every write durable on
-  return, no page cache, no flush) with a queue — which `fwbench disk` now
-  measures three ways, the old probe kept as the control. **Until it runs, the
-  SSD ceiling is unknown and 479 MiB/s is a floor.** Everything below that
-  leans on 479 (the "binding pair", §8.0's ingest bound and its 1.75× margin)
-  inherits that caveat.
+- **The SSD is not a binding leg; the earlier 479 MiB/s was an artifact.** The
+  first probe (2026-09-16: buffered append, `fsync` every 16 MiB) reported
+  479 MiB/s and was wrongly treated as the drive's ceiling. `fwbench disk`
+  measures the log writer's own pattern: unbuffered write-through
+  (`FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH`, each write durable when it
+  returns, no page cache, no flush). Measured on E: on 2026-09-21, release build,
+  machine quiet, 2 GiB per pattern, 3 runs per cell, p50/p90/p99 over every
+  write (2,048 samples at 1 MiB):
+
+  | pattern | SLC cache fresh | sustained, cache exhausted (≈140 GiB written) |
+  | --- | --- | --- |
+  | buffered + `fsync`/16 MiB (control) | 1,345 MiB/s, fsync p50 5.9 ms | — |
+  | write-through, 1 MiB, qd1 | **3,477 MiB/s**, p99 0.77 ms | **1,670–1,820 MiB/s**, p50 0.5 ms, p99 ≈1.1 ms |
+  | write-through, 1 MiB, qd8–32 | 4,581 MiB/s at qd8 | 1,890–2,050 MiB/s, **p99 17–470 ms** |
+  | write-through, 256 KiB, qd1 | 2,100–2,300 MiB/s | 1,370–1,630 MiB/s, p99 0.33 ms |
+  | write-through, 4 MiB, qd1 | — | 1,480–2,150 MiB/s, p99 ≈2.5 ms |
+
+  What this means:
+  - **One write in flight is the right design.** Once the cache is gone, qd1
+    gets within ≈10 % of the deepest queue. Deeper queues add almost no
+    throughput and multiply tail latency 15–400×. The log writer needs no I/O
+    queue.
+  - **Plan on the sustained figure, not the cache figure.** 1,750 MiB/s is
+    6.4× the target. The SLC figures hold only for bursts of a few tens of GiB.
+  - **The trap: NTFS compression.** `E:\` has the NTFS *compressed* attribute
+    set, and new directories inherit it. On a compressed directory the same
+    harness measured 47 MiB/s (qd1), 89 MiB/s (qd8) and 100–143 MiB/s
+    (control). An independent .NET write-through probe agreed (51 MiB/s), and
+    sequential reads stayed at 845 MiB/s. Compression costs **≈35×**. The log
+    directory must be created uncompressed (`compact /u`), and the writer should
+    refuse to run, or warn, on a compressed directory. Whether the 2026-09-16
+    probe hit the same attribute was **not verified**.
+  - **§8.0 is now stale.** It is built on ingest being SSD-bound at 479 MiB/s,
+    and that is no longer true. The SSD has more headroom than any leg except
+    RAM, and CPU parsing (723 MiB/s) is the binding leg. To be revised with the
+    founder.
 - **Ignore buffered write figures.** Every drive tested reported ≈3.6 GB/s
   buffered, because that is the OS page cache, not the device. Only durable
   (`fsync`) figures are real.
