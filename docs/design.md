@@ -1160,7 +1160,7 @@ Founder answers of 2026-09-15.
 | 3 | Reusing open source | **Inspiration over original code.** Copying is a rare exception | Now in [standards/zero-dependency.md](https://github.com/nativelite/ops/blob/main/standards/zero-dependency.md). Inspiration needs no notice; any copied code keeps its MIT/Apache notice (a legal requirement) |
 | 4 | GPU binding | **Our own bindings, not wgpu** | Backend order recommended in §8.6: Vulkan, CPU fallback, Metal later, D3D11 only if the spike needs it. To confirm after the M3 spike |
 | 5 | Platforms | **Windows first**, groundwork for others | Vulkan and a pane-transport interface keep Linux close; macOS gets Metal later |
-| 6 | Console host | **Decide by measurement (experiment E2).** Founder wants the most performant option. **Measured 2026-09-22: OpenConsole is clearly better** (3× throughput, p99 under a flood 0.31–0.43 ms vs 6.2–9.9 ms, 6× less host CPU per byte); *how* to ship it is open, see the E2 result | Built-in host vs bundled OpenConsole, below. Either way agents run headless over pipes where they document it, and Linux/macOS use ptys |
+| 6 | Console host | **Decide by measurement (experiment E2).** Founder wants the most performant option. **Measured 2026-09-22: OpenConsole is clearly better** (3× throughput, p99 under a flood 0.31–0.43 ms vs 6.2–9.9 ms, 6× less host CPU per byte). **Founder decision (2026-09-22): use OpenConsole, never depend on it.** At each start foldwave looks for the `OpenConsole.exe` that Windows Terminal installs (its path changes with every Terminal update), launches it with our own launcher, and falls back to the built-in `conhost.exe` whenever it is missing or fails — removing Windows Terminal makes those panes slower, never broken. Bundling Microsoft's binaries is **not** approved | Built-in host vs bundled OpenConsole, below. Either way agents run headless over pipes where they document it, and Linux/macOS use ptys |
 | 7 | GPU compute | **Use the GPU wherever it helps**, balanced across SSD, RAM, GPU and CPU | Every GPU path gets a CPU path and a benchmark; §8.7a lists the candidates; local AI stays out of process |
 | 8 | Targets | **Confirmed**, plus **fault isolation**: a crash recovers without taking the ship down | §4 targets; §8.8a design |
 | 9 | Leveraging the whole machine | **Aim offload at work that is GPU-shaped, not at the utilization number.** The governor's first input is CPU pressure | Founder observation 2026-09-15: CPU 80–99% while the GPU idles. §8.7b places every stage and names what will never move; index construction (§8.7a) is the new GPU candidate; E3 measures it |
@@ -1227,7 +1227,16 @@ too**, or every OpenConsole pane starts with a stall.
      Terminal, and the launcher leans on undocumented console-driver details.
   3. *Build OpenConsole from source* (MIT) as part of the release: no opaque
      binaries, but a large C++ build in a Rust project.
-  E2 answers *whether*; this is *how*, and it is not decided here.
+  E2 answers *whether*. **Founder decision (2026-09-22): route 2, with the
+  built-in host as the permanent fallback** — see §11 row 6. Microsoft's own
+  `winconpty` does the same, preferring an `OpenConsole.exe` and falling back
+  to `System32\conhost.exe` ([`prior-art.md`](prior-art.md)). Still to build:
+  the launcher (a port of `winconpty`), finding the installed OpenConsole
+  without depending on Windows Terminal's install path, and a per-pane health
+  check that retries on conhost if OpenConsole fails to start. Telemetry was
+  checked and is recorded in [`prior-art.md`](prior-art.md): OpenConsole has
+  no networking of its own, and its telemetry-flagged events are few,
+  per-session and carry no text.
 
 **Naming: foldwave (founder, 2026-09-15).**
 - **Meaning:** in Macross, a fold wave is a faster-than-light signal sent through
