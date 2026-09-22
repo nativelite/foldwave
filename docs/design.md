@@ -106,7 +106,7 @@ each leg does in isolation, so a plan for using them together starts from facts.
 | Leg | Ceiling | vs target |
 | --- | --- | --- |
 | **RAM** — `memcpy`, 1 core | 23,235 MiB/s | 85× |
-| **CPU** — `vterm` full emulation, 16 threads (E4, quiet machine, 2026-09-22) | **924.8 MiB/s**; 623.8 on the 6 P-cores alone, 125.5 on one P-core | **3.4×** |
+| **CPU** — `vterm` full emulation, 16 threads (E4, quiet machine, 2026-09-22, span tokenizer) | **1,828.3 MiB/s**; 1,158.2 on the 6 P-cores alone, 214.0 on one P-core | **6.7×** |
 | **SSD (E:)** — unbuffered write-through, 1 MiB appends, one write in flight (`fwbench disk`, 2026-09-21/22) | ≈1,800 MiB/s sustained past the SLC cache (p99 ≈1.1 ms); 4,295 MiB/s held across a 16 GiB burst inside it | **6.6×** |
 | **GPU** — RTX 3070 | not yet measured (experiment E1, [`compute.md`](compute.md)) | — |
 | *transport:* headless pipe, 16 panes | ≥ 1854 MiB/s | 6.8× (a floor, §8.9) |
@@ -115,17 +115,19 @@ each leg does in isolation, so a plan for using them together starts from facts.
 **What this says about the architecture:**
 
 - **The §4 targets are reachable with room to spare.** With agents headless,
-  every leg clears 273 MiB/s: the SSD by 6.6× (sustained), the CPU by 3.4×.
+  every leg clears 273 MiB/s: the SSD by 6.6× (sustained), the CPU by 6.7×.
   ConPTY misses outright.
-- **CPU parsing is still the binding leg, but it is no longer close.** The SSD
-  (≈1,800 MiB/s sustained) and the pipe transport (≥ 1,854) are about 2× faster
-  than parsing at 924.8, and RAM is never a constraint. Parsing also has known
-  headroom left: ≈38 % of its time is per-token allocation (E4). Engineering
-  effort belongs in the parser, not in moving or storing bytes.
-  - Two earlier framings were wrong and are recorded so they are not repeated:
-    "CPU and SSD are the binding pair" (from the discredited 479 MiB/s SSD
-    figure, corrected 2026-09-21), and the first E4 run's lower CPU numbers,
-    taken while a browser used ~1.1 cores (corrected 2026-09-22).
+- **There is no single binding leg any more.** After the span tokenizer
+  (`nativelite-ansi` 0.4.0, `nativelite-vterm` 0.5.3), the three working legs
+  land within 3 % of each other: CPU 1,828 MiB/s, SSD ≈1,800 sustained, pipe
+  transport ≥ 1,854. RAM is never a constraint. A plan that needs more than
+  ~1.8 GiB/s has to move *every* leg, not one.
+  - Three earlier framings were wrong and are recorded so they are not
+    repeated: "CPU and SSD are the binding pair" (from the discredited
+    479 MiB/s SSD figure, corrected 2026-09-21); the first E4 run's low CPU
+    numbers, taken while a browser used ~1.1 cores (corrected 2026-09-22); and
+    "CPU parsing is the binding leg", true only while the tokenizer allocated
+    a token per token (corrected the same day, below).
 - **This quantifies §8.7b's index-construction offload.** 723 MiB/s is *parsing
   alone*, with all 16 threads busy. A background indexer would compete for
   exactly those cores. Moving it to a GPU measured at 0% utilization is now the
@@ -454,34 +456,36 @@ measured **25–50 % low**. Those numbers are gone; these replace them.
 
 | Stage | Median MiB/s | Share of full emulation time |
 | --- | --- | --- |
-| `vterm` full emulation (tokenize + apply to screen) | 120.6 | 100 % |
-| `ansi::Parser::feed` tokenize, one heap token per token | 192.5 | 63 % |
-| **`ansi::Parser::feed_with` tokenize, borrowed spans** | **876.3** | **14 %** |
-| The state machine alone ([`fsm.rs`](../crates/fwbench/src/fsm.rs) table) | 567.6 | 21 % |
-| All 11 start states in lockstep (enumerative, no shortcut) | 391.3 | 31 % |
-| Structural scan, hidden-pane path (lines + OSC 133) | 1,840.6 | 7 % |
+| `vterm` full emulation (tokenize + apply to screen) | **208.2** | 100 % |
+| `ansi::Parser::feed` tokenize, one heap token per token | 307.1 | 68 % |
+| `ansi::Parser::feed_with` tokenize, borrowed spans | 858.6 | 24 % |
+| The state machine alone ([`fsm.rs`](../crates/fwbench/src/fsm.rs) table) | 555.7 | 37 % |
+| All 11 start states in lockstep (enumerative, no shortcut) | 389.9 | 53 % |
+| Structural scan, hidden-pane path (lines + OSC 133) | 1,833.4 | 11 % |
 
-*(This table is the follow-up run of 2026-09-22 that added the spans row; the
-scaling and convergence tables below are the earlier run of the same day, same
-conditions. Run-to-run spread between them is ≤ 7 %.)*
+*(Measured after `vterm` adopted spans. The convergence table below is the
+earlier run of the same day; it is deterministic and unaffected.)*
 
-- **Applying tokens to the screen is ≈37 % of the time, tokenizing ≈63 %.**
-  Only 21 % is the state machine itself; the rest was `ansi` allocating a
-  `String`/`Vec` per token.
-- **That allocation is now gone, and it was worth 4.6×.**
-  `nativelite-ansi` gained `Parser::feed_with`, the same state machine handing
-  a closure borrowed events (text runs point into the caller's buffer,
-  sequence payloads into reused scratch). Tokenizing went from 192.5 to
-  **876.3 MiB/s** — faster even than the bare table-driven machine above,
-  because a text run costs nothing per byte beyond its range check. `feed` is
-  now a thin adapter over it, so there is one machine, not two.
-  - **Unshipped as of writing:** `vterm` still calls `feed`, so the 120.6
-    MiB/s emulation figure is unchanged. Arithmetic on the rows above puts
-    screen apply at ≈322 MiB/s alone, so a `vterm` that consumed spans should
-    reach **≈235 MiB/s, about 2× today's** — a calculation, not a
-    measurement, and the next thing to build.
-  - Publishing `nativelite-ansi` with the new API is a founder call; foldwave
-    consumes it by path meanwhile.
+- **Removing per-token allocation was worth 1.76× on full emulation, and it
+  shipped.** `nativelite-ansi` 0.4.0 added `Parser::feed_with`: the same state
+  machine handing a closure borrowed events (text runs point into the caller's
+  buffer, sequence payloads into reused scratch), plus `Utf8Decoder` for
+  consumers that want `str`. `nativelite-vterm` 0.5.3 consumes it.
+  - Emulation **120.6 → 208–212 MiB/s**; on six P-cores 623.8 → 1,158.2; on
+    all 16 logical CPUs 924.8 → **1,828.3**.
+  - Tokenizing alone is 858.6 MiB/s with spans against 307.1 with owned
+    tokens, and beats the bare table-driven machine (555.7) because a text run
+    costs nothing per byte beyond its range check.
+  - The owned `feed` got faster too (192.5 → 307.1): it is now a thin adapter
+    over the same machine, and sequence scratch is reused rather than
+    reallocated.
+  - Neither crate's public API changed. `vterm`'s 60 behaviour tests and
+    atrium's 812 tests pass untouched, so atrium inherits the speedup without
+    a code change.
+- **Screen apply is now the larger half: ≈76 % of emulation time** (208.2 of a
+  possible 858.6 if tokenizing were free). The next parser-side win is
+  therefore in `Screen`, not in tokenizing — or in not applying at all, which
+  is what §8.0's hidden-pane path already does.
 - **The hidden-pane scan runs at 1.8 GiB/s per core,** comfortably above the
   ≥1 GiB/s the §8.0 budget assumed.
 - **Core placement matters more than any tuning here:** the same single thread
