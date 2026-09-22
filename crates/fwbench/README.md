@@ -132,7 +132,15 @@ console coalesces output on a **≈15.2 ms tick**, so key-echo latency through
 
 n=60 per row. Two consequences: the 0.1 ms "bare `cmd`" baseline is real but
 only at human typing cadence, and the §4 p99 target is **unreachable through
-ConPTY** — the wait happens before a terminal ever sees the bytes.
+the built-in `conhost.exe`** — the wait happens before a terminal ever sees the
+bytes.
+
+**The tick belongs to `conhost.exe`, not to ConPTY** (experiment E2,
+2026-09-22). With `--conpty` pointing at Windows Terminal's `conpty.dll`,
+OpenConsole echoes keys sent back to back in 0.01 ms at the median, and keeps
+p99 at 0.31–0.43 ms under an 8-pane flood where conhost reaches 6.2–9.9 ms. It
+also moves about 3× the flood throughput (433–444 MiB/s at 16 panes) at a
+sixth of the host CPU per byte. See design §11, experiment E2.
 
 So `--gap-ms` defaults to 25 ms, and any run below 16 ms prints a warning that
 the figure is the tick, not the echo.
