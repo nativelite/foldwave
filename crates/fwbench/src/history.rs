@@ -7,7 +7,7 @@
 use crate::emit::Rng;
 use crate::parse;
 use crate::stats::Summary;
-use panelog::{Config, Reader, Writer};
+use panelog::{Config, Reader, SearchOptions, Writer};
 use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -51,7 +51,32 @@ pub struct History {
     pub rebuild: Option<Summary>,
     /// Largest replay a rebuild needed, in bytes.
     pub max_replay: u64,
+    /// The search queries and what they found.
+    pub searches: Vec<Query>,
 }
+
+/// One timed search.
+#[derive(Debug, Clone)]
+pub struct Query {
+    /// What the query represents.
+    pub label: &'static str,
+    /// The needle.
+    pub needle: String,
+    /// Case-insensitive?
+    pub ignore_case: bool,
+    /// Result limit.
+    pub limit: usize,
+    /// Matches returned.
+    pub matches: usize,
+    /// First run, and a repeat (the repeat has the signatures in RAM).
+    pub first: Duration,
+    /// Second run.
+    pub second: Duration,
+}
+
+/// Unique marker lines planted through the log, one of which the rare query
+/// looks for.
+const MARKERS: u64 = 8;
 
 /// Write the log, open it, jump around it, remove it.
 pub fn run(plan: &Plan) -> io::Result<History> {
@@ -76,6 +101,8 @@ fn measure(plan: &Plan, dir: &std::path::Path) -> io::Result<History> {
         let mut since = 0u64;
         let mut written = 0u64;
         let mut at = 0usize;
+        let marker_every = (plan.bytes / MARKERS).max(1);
+        let (mut next_marker, mut planted) = (marker_every / 2, 0u64);
         const CHUNK: usize = 64 * 1024;
         while written < plan.bytes {
             if at + CHUNK > source.len() {
@@ -96,6 +123,12 @@ fn measure(plan: &Plan, dir: &std::path::Path) -> io::Result<History> {
             }
             at += take;
             written += take as u64;
+            if planted < MARKERS && written >= next_marker {
+                let line = format!("fwbench-marker-{planted:02} planted here\n");
+                w.append(line.as_bytes(), epoch.elapsed().as_nanos() as u64)?;
+                planted += 1;
+                next_marker += marker_every;
+            }
         }
         w.flush()?;
     }
@@ -147,6 +180,32 @@ fn measure(plan: &Plan, dir: &std::path::Path) -> io::Result<History> {
         rebuild = Some(Summary::of(&samples));
     }
 
+    let queries: [(&'static str, &str, bool, usize); 4] = [
+        ("rare: one planted marker", "fwbench-marker-03", false, 1000),
+        ("absent", "zq-not-in-this-log-7f3a", false, 1000),
+        ("common word, first 1,000", "Compiling", false, 1000),
+        ("common word, any case, first 100", "warn", true, 100),
+    ];
+    let mut searches = Vec::new();
+    for (label, needle, ignore_case, limit) in queries {
+        let opts = SearchOptions { ignore_case, limit };
+        let t = Instant::now();
+        let matches = r.search(needle.as_bytes(), &opts)?.len();
+        let first = t.elapsed();
+        let t = Instant::now();
+        std::hint::black_box(r.search(needle.as_bytes(), &opts)?);
+        let second = t.elapsed();
+        searches.push(Query {
+            label,
+            needle: needle.to_string(),
+            ignore_case,
+            limit,
+            matches,
+            first,
+            second,
+        });
+    }
+
     let (mut files, mut disk_bytes) = (0usize, 0u64);
     for e in std::fs::read_dir(dir)? {
         let e = e?;
@@ -164,6 +223,7 @@ fn measure(plan: &Plan, dir: &std::path::Path) -> io::Result<History> {
         checkpoints: r.checkpoint_count(),
         rebuild,
         max_replay,
+        searches,
     })
 }
 
@@ -209,6 +269,19 @@ pub fn render(plan: &Plan, h: &History) -> String {
             h.max_replay as f64 / (1024.0 * 1024.0),
         ),
         None => String::new(),
+    } + &{
+        let mut o = String::new();
+        for q in &h.searches {
+            o += &format!(
+                "| search, {}: `{}` | {} match(es); {:.1} ms, again {:.1} ms |\n",
+                q.label,
+                q.needle,
+                q.matches,
+                ms(q.first),
+                ms(q.second)
+            );
+        }
+        o
     }
 }
 
@@ -228,7 +301,10 @@ mod tests {
             checkpoint_every: 512 * 1024,
         };
         let h = run(&plan).expect("history");
-        assert_eq!(h.bytes, plan.bytes);
+        assert!(h.bytes >= plan.bytes, "markers add a few bytes");
+        let rare = &h.searches[0];
+        assert_eq!(rare.matches, 1, "exactly one planted marker matches");
+        assert_eq!(h.searches[1].matches, 0, "the absent needle");
         assert!(h.lines > 1000);
         assert_eq!(h.jumps.count, 50);
         assert!(h.checkpoints >= 4, "{} checkpoints", h.checkpoints);

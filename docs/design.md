@@ -835,7 +835,28 @@ the records that validate, cuts a torn tail and rebuilds maps and index;
   overshoots. The difference costs 0.6 % more disk. This supersedes §8.0's
   arithmetic figure (3.3 MiB) and E6's ~2 MiB proposal: measured end to end,
   the tail needs the smaller interval.
-- Still to come in M1: marks, search, compression of cold segments.
+- **Search (built and measured 2026-09-22).** Each 1 MiB block of log carries
+  a 2^16-bit trigram signature (0.78 % of the data); a query reads only blocks
+  whose signature, with the next block's, holds every trigram of the needle,
+  and scans those on all cores, newest first, up to a limit. Tested against a
+  brute-force scan, including a match straddling a block boundary.
+  `fwbench history`, 100 GB (93.1 GiB, 1.97 G lines) on E:, eight marker
+  lines planted through the log:
+
+  | Query | Matches | Time (repeat) |
+  | --- | --- | --- |
+  | rare: one planted marker | 1 | **400 ms** (422) |
+  | absent: must consider every block | 0 | **498 ms** (395) |
+  | common word, first 1,000 | 1,000 | 236 ms (118) |
+  | common word, any case, first 100 | 100 | 115 ms (113) |
+
+  **The §4 history target is met at 100 GB: open 299–433 ms, jump to any line
+  0.1–0.3 ms, search ≤ 0.5 s.** Costs: 1.29 % disk overhead in total, and the
+  write rate falls to 363–388 MiB/s because signatures are built at ingest —
+  still more than 20× what one pane needs. Limits, stated in the API: matching
+  is on raw bytes (a colour change mid-word hides that match), and needles
+  under three bytes scan everything.
+- Still to come in M1: marks, compression of cold segments.
 
 - Writes are batched and flushed on a cadence and at checkpoints; the governor
   watches write latency.
