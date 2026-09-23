@@ -13,7 +13,8 @@
 //! * **pipe** (`--pipe`): the program gets no console at all; its stdout and
 //!   stderr come through plain pipes at native speed and its stdin takes the
 //!   keys. For agent CLIs in their documented non-interactive modes. As a
-//!   tty's line discipline would, a bare line feed becomes CR LF.
+//!   tty's line discipline would, a line feed also returns to column 0 (the
+//!   emulator's new line mode, so no byte is rewritten).
 //!
 //! Threads: a reader moves shell output into the emulator (answering the
 //! console host's startup queries on the way) and wakes the window; the UI
@@ -286,31 +287,6 @@ options:
         }
     }
 
-    /// Turns bare line feeds into CR LF, across chunk boundaries, as a tty's
-    /// output processing (ONLCR) does for programs writing to pipes.
-    #[derive(Default)]
-    struct Onlcr {
-        after_cr: bool,
-    }
-
-    impl Onlcr {
-        fn convert<'a>(&mut self, chunk: &'a [u8], out: &'a mut Vec<u8>) -> &'a [u8] {
-            if !chunk.contains(&b'\n') {
-                self.after_cr = chunk.last() == Some(&b'\r');
-                return chunk;
-            }
-            out.clear();
-            for &b in chunk {
-                if b == b'\n' && !self.after_cr {
-                    out.push(b'\r');
-                }
-                out.push(b);
-                self.after_cr = b == b'\r';
-            }
-            out
-        }
-    }
-
     struct Shared {
         term: Mutex<Term>,
         pending: AtomicBool,
@@ -387,7 +363,15 @@ options:
         let (rows, cols) = grid(w, h);
         let shell_args: Vec<&str> = args.shell[1..].iter().map(String::as_str).collect();
         let shared = Arc::new(Shared {
-            term: Mutex::new(Term::new(rows as usize, cols as usize)),
+            term: Mutex::new({
+                let mut t = Term::new(rows as usize, cols as usize);
+                if args.pipe {
+                    // No tty turns LF into CR LF on a pipe: new line mode
+                    // (LNM) makes the emulator do it, with no copy.
+                    t.feed(b"[20h");
+                }
+                t
+            }),
             pending: AtomicBool::new(true),
             exited: AtomicBool::new(false),
         });
@@ -395,13 +379,10 @@ options:
         // Move one output stream into the emulator until it ends.
         let pump = |mut source: Box<dyn FnMut(&mut [u8]) -> io::Result<usize> + Send>,
                     session: Option<Arc<Mutex<Session>>>,
-                    lf_to_crlf: bool,
                     last: bool| {
             let (shared, waker) = (shared.clone(), waker.clone());
             std::thread::spawn(move || {
                 let mut buf = vec![0u8; 64 * 1024];
-                let mut converted = Vec::with_capacity(128 * 1024);
-                let mut onlcr = Onlcr::default();
                 let mut watcher = fwbench::terminal::Watcher::new();
                 loop {
                     let n = match source(&mut buf) {
@@ -413,12 +394,7 @@ options:
                             let _ = session.lock().unwrap().write(reply);
                         }
                     }
-                    let bytes = if lf_to_crlf {
-                        onlcr.convert(&buf[..n], &mut converted)
-                    } else {
-                        &buf[..n]
-                    };
-                    shared.term.lock().unwrap().feed(bytes);
+                    shared.term.lock().unwrap().feed(&buf[..n]);
                     if !shared.pending.swap(true, Ordering::AcqRel) {
                         waker.wake();
                     }
@@ -444,18 +420,8 @@ options:
                 child.stdout.take().expect("piped"),
                 child.stderr.take().expect("piped"),
             );
-            pump(
-                Box::new(move |b| io::Read::read(&mut err, b)),
-                None,
-                true,
-                false,
-            );
-            pump(
-                Box::new(move |b| io::Read::read(&mut out, b)),
-                None,
-                true,
-                true,
-            );
+            pump(Box::new(move |b| io::Read::read(&mut err, b)), None, false);
+            pump(Box::new(move |b| io::Read::read(&mut out, b)), None, true);
             let stdin = child.stdin.take();
             Arc::new(Mutex::new(Session::Pipe { child, stdin }))
         } else {
@@ -465,7 +431,6 @@ options:
             pump(
                 Box::new(move |b| reader.read(b)),
                 Some(session.clone()),
-                false,
                 true,
             );
             session
@@ -571,20 +536,6 @@ options:
             assert!(parse(&argv(&["--backend", "gl"])).is_err());
             assert!(parse(&argv(&["--size", "10x10"])).is_err());
             assert_eq!(parse(&argv(&[])).unwrap().shell, ["cmd.exe"]);
-        }
-
-        #[test]
-        fn bare_line_feeds_become_cr_lf_across_chunks() {
-            let mut o = Onlcr::default();
-            let mut out = Vec::new();
-            assert_eq!(o.convert(b"a\nb\r\nc", &mut out), b"a\r\nb\r\nc");
-            assert_eq!(o.convert(b"x\r", &mut out), b"x\r");
-            assert_eq!(
-                o.convert(b"\ny\n", &mut out),
-                b"\ny\r\n",
-                "CR ended the last chunk"
-            );
-            assert_eq!(o.convert(b"no newline", &mut out), b"no newline");
         }
 
         #[test]

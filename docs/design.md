@@ -1189,12 +1189,33 @@ measure it.
   | Text into cells, the rest | ~60 ms | ~80 → less with `Screen::write_ascii` (no scratch cells) |
   | **`Term::feed` total** | **347 ms, 188 MiB/s** | **198 ms, 330 MiB/s (1.75×)** |
 
-  End to end in fwterm (`fwprobe throughput`, 3 runs): **pipe lane
-  173.1 → 254.6 MiB/s; console lane on OpenConsole 1.24 82.9 → 102.5 MiB/s**,
-  against Windows Terminal's 115.2 on the same host. The pipe lane still sits
-  below `vterm`'s 330 on its own: the reader's CR-LF pass, the pane lock the
-  renderer shares, and the render thread are next. Ahead of them all, the
-  parser is now the largest single stage (~84 ms of ~198).
+  End to end in fwterm (`fwprobe throughput`, 3 runs): pipe lane
+  173.1 → 254.6 MiB/s; console lane on OpenConsole 1.24 82.9 → 102.5 MiB/s,
+  against Windows Terminal's 115.2 on the same host.
+
+  **Second pass, the same day:**
+  - **The pipe lane's CR-LF copy was its whole overhead.** It is replaced by
+    `vterm`'s new line mode (LNM, `CSI 20 h`): a line feed also returns to
+    column 0, so no byte is rewritten. Pipe lane 254.6 → 325.8 MiB/s, level
+    with `vterm` alone.
+  - **The parser skips plain text a word at a time** (a SWAR test for C0 and
+    DEL over 8 bytes): `feed_with` 777 → 2,168 MiB/s.
+  - **`vterm`'s ASCII check on text runs** is now std's word-wide `is_ascii`,
+    since the parser never passes controls in text.
+
+  | | Start of the day | Now |
+  | --- | --- | --- |
+  | `vterm` `Term::feed`, 64 MiB at 177x47 | 188 MiB/s | **570 MiB/s (3.0×)** |
+  | fwterm pipe lane, 256 MiB | 173.1 MiB/s | **543.0 MiB/s** (526.6, 543.0, 551.2) |
+  | fwterm console lane, OpenConsole 1.24, 32 MiB | 82.9 MiB/s | **120.4 MiB/s** (120.0, 120.4, 121.2) |
+  | Windows Terminal 1.24, 32 MiB (re-measured with the above) | 115.2 MiB/s | 118.1 MiB/s (116.0, 118.1, 119.6) |
+
+  - **The console lane now matches Windows Terminal** on the same console
+    host (120.4 against 118.1, within run-to-run noise), so that lane is
+    host-bound again.
+  - **The pipe lane is 4.6× Windows Terminal.** That pane now spends ~115 ms
+    per 64 MiB emulating: parser ~30, UTF-8 decode ~28, the rest in `vterm`
+    and the screen.
 
 ### 8.7 The agent layer
 - **Blocks:** prompt, command, output and exit status from shell-integration
