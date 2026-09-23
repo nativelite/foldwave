@@ -702,7 +702,11 @@ mod stage_profile {
 
     fn rate(label: &str, bytes: usize, t: Instant) {
         let s = t.elapsed().as_secs_f64();
-        println!("{label:<44} {:>8.1} MiB/s  ({:.1} ms)", bytes as f64 / 1048576.0 / s, s * 1e3);
+        println!(
+            "{label:<44} {:>8.1} MiB/s  ({:.1} ms)",
+            bytes as f64 / 1048576.0 / s,
+            s * 1e3
+        );
     }
 
     #[test]
@@ -725,7 +729,11 @@ mod stage_profile {
             let mut p = Parser::new();
             let mut k = 0usize;
             for c in data.chunks(64 * 1024) {
-                p.feed_with(c, |e| if let Event::Text(b) = e { k += b.len() });
+                p.feed_with(c, |e| {
+                    if let Event::Text(b) = e {
+                        k += b.len()
+                    }
+                });
             }
             std::hint::black_box(k);
             rate("A parser only (feed_with)", n, t);
@@ -735,7 +743,11 @@ mod stage_profile {
             let mut d = Utf8Decoder::new();
             let mut k = 0usize;
             for c in data.chunks(64 * 1024) {
-                p.feed_with(c, |e| if let Event::Text(b) = e { d.decode(b, |s| k += s.len()) });
+                p.feed_with(c, |e| {
+                    if let Event::Text(b) = e {
+                        d.decode(b, |s| k += s.len())
+                    }
+                });
             }
             std::hint::black_box(k);
             rate("B parser + UTF-8 decode", n, t);
@@ -756,7 +768,9 @@ mod stage_profile {
 
             // Screen work alone: one scroll + one row blit per line.
             let mut s = Screen::new(47, 177);
-            let row: Vec<Cell> = (0..(n / lines)).map(|_| Cell::new('x', Style::default())).collect();
+            let row: Vec<Cell> = (0..(n / lines))
+                .map(|_| Cell::new('x', Style::default()))
+                .collect();
             let t = Instant::now();
             for _ in 0..lines {
                 s.scroll_rows_up(0, 46, 1, Cell::default());
