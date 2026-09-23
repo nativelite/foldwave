@@ -17,7 +17,7 @@ mod sys;
 mod window;
 
 pub use font::GdiRasterizer;
-pub use window::{display_refresh_hz, CpuPresenter, Event, Waker, Window};
+pub use window::{display_refresh_hz, raise_thread_priority, CpuPresenter, Event, Waker, Window};
 
 #[cfg(test)]
 mod tests;

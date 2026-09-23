@@ -358,6 +358,10 @@ extern "system" {
 #[link(name = "kernel32")]
 extern "system" {
     pub fn GetModuleHandleW(name: *const u16) -> Hinstance;
+    /// Returns a pseudo-handle for the calling thread (no need to close).
+    pub fn GetCurrentThread() -> Handle;
+    /// `priority`: THREAD_PRIORITY_ABOVE_NORMAL is 1, NORMAL 0 (processthreadsapi.h).
+    pub fn SetThreadPriority(thread: Handle, priority: i32) -> i32;
     pub fn CreateWaitableTimerExW(
         attributes: *const c_void,
         name: *const u16,

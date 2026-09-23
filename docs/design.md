@@ -1239,9 +1239,38 @@ measure it.
     its 17.1 MiB/s share**, on a noisy machine. The machine's 16 logical cores
     are shared by 16 emitters, 16 readers and 16 renderers, so this is the
     whole system under load, not a transport ceiling.
-  - **Not yet measured under this load:** frame rate per pane (§4 wants ≥ 60
-    fps for visible panes), the console lane at 16 panes, and latency while
-    16 panes flood.
+- **Frame rate and the console lane under the 16-pane load (2026-09-23).**
+  `fwterm --stats` records every frame drawn while output flows.
+  - **The display in use sets the pace.** The first 16-pane runs drew a steady
+    ~31 fps per pane: the founder was connected through Remote Desktop, and
+    the session's display ("Microsoft Remote Display Adapter") runs at 32 Hz,
+    so fwterm correctly paced to it. It was not a bug. A normal-priority
+    render thread also waited scheduler slices with every core busy (worst
+    gap 115 ms); the UI thread now runs above normal
+    (`fwrender::win::raise_thread_priority`), and the worst gap became 38 ms.
+    The reader also steps aside for the renderer's lock, as `fwbench render`
+    already did.
+  - **Sixteen panes flooding at 4.22 GB/s combined, paced at 165 fps (the
+    local display's rate, forced with `--max-fps 165`): every pane drew
+    139.6–141.7 fps.** Frame gaps: median 7.0 ms, p99 8.6–10.3 ms, worst
+    10.9–29.5 ms. **§4's ≥ 60 fps for visible panes is met 2.3×** under the
+    full load. Measured through a remote session, so this is what the loop
+    sustains, not what that session's 32 Hz display showed.
+  - **Console lane, 16 panes at once, on Microsoft's OpenConsole 1.24**
+    (`fwprobe throughput`, 256 MiB each):
+
+    | 16 panes | Combined | Per pane | Emit times |
+    | --- | --- | --- | --- |
+    | **fwterm** | **842 MiB/s** (≥ 596 counting window launch) | 51.8–54.4 MiB/s | 4.70–4.94 s |
+    | Windows Terminal 1.24 | 456 MiB/s (≥ 337) | 26.4–31.6 MiB/s | 8.11–9.69 s |
+
+    **1.85× Windows Terminal on the same console host.** A shorter 64 MiB run
+    gave 1,006 against 700. At one pane the two tie (120.4 against 118.1).
+    Under load fwterm's cheaper emulation and rendering leave more of the
+    machine to the console hosts. Both clear the §4 target (273 MiB/s).
+  - **Not measured: latency while 16 panes flood.** Through Remote Desktop the
+    screen-capture instrument resolves only the session's 32 Hz frames
+    (~31 ms). To run at the machine.
 
 ### 8.7 The agent layer
 - **Blocks:** prompt, command, output and exit status from shell-integration

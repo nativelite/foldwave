@@ -551,3 +551,15 @@ pub fn display_refresh_hz() -> Option<u32> {
     let (width, hz) = (mode[172 / 4], mode[184 / 4]);
     (ok != 0 && width > 0 && hz > 1).then_some(hz)
 }
+
+/// Run the calling thread at above-normal priority (THREAD_PRIORITY_ABOVE_NORMAL).
+///
+/// For a render thread: it sleeps nearly all the time, but when a frame is
+/// due it must get a core at once. With every core busy moving output (16
+/// flooding panes), a normal-priority render thread waited one or two
+/// scheduler slices (~15.6 ms each) after waking, which held each pane to 30
+/// fps. Returns false if Windows refused.
+pub fn raise_thread_priority() -> bool {
+    // SAFETY: the pseudo-handle for the current thread is always valid.
+    unsafe { SetThreadPriority(GetCurrentThread(), 1) != 0 }
+}

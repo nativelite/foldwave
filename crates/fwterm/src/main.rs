@@ -61,6 +61,8 @@ options:
   --no-sharpen  draw the raw glyph outlines (no fitting or stem snapping)
   --max-fps N   frame-rate cap (default: the display's refresh rate)
   --title T     window title (default fwterm)
+  --stats PATH  on exit, write frame statistics for the time output flowed:
+                frames, frames per second, gaps between frames
 ";
 
     struct Args {
@@ -72,6 +74,7 @@ options:
         max_fps: Option<u32>,
         title: String,
         pipe: bool,
+        stats: Option<String>,
         shell: Vec<String>,
     }
 
@@ -85,6 +88,7 @@ options:
             max_fps: None,
             title: "fwterm".into(),
             pipe: false,
+            stats: None,
             shell: vec!["cmd.exe".into()],
         };
         let mut i = 0;
@@ -137,6 +141,7 @@ options:
                     );
                 }
                 "--title" => a.title = value(&mut i, "--title")?,
+                "--stats" => a.stats = Some(value(&mut i, "--stats")?),
                 "--" => {
                     if i + 1 < argv.len() {
                         a.shell = argv[i + 1..].to_vec();
@@ -291,6 +296,48 @@ options:
         term: Mutex<Term>,
         pending: AtomicBool,
         exited: AtomicBool,
+        /// The renderer is waiting for `term`; readers step aside. The lock is
+        /// not fair, and a reader that releases and immediately re-takes it
+        /// otherwise holds the renderer off for tens of milliseconds.
+        want: AtomicBool,
+        /// Nanoseconds since `epoch` of the first and latest output read.
+        first_output: std::sync::atomic::AtomicU64,
+        last_output: std::sync::atomic::AtomicU64,
+        epoch: Instant,
+    }
+
+    /// Frame statistics over the time output was arriving, for `--stats`.
+    fn write_stats(path: &str, shared: &Shared, frames: &[u64]) -> io::Result<()> {
+        let (first, last) = (
+            shared.first_output.load(Ordering::Acquire),
+            shared.last_output.load(Ordering::Acquire),
+        );
+        let during: Vec<u64> = frames
+            .iter()
+            .copied()
+            .filter(|&t| t >= first && t <= last + 50_000_000)
+            .collect();
+        let secs = (last.saturating_sub(first)) as f64 / 1e9;
+        let mut gaps: Vec<u64> = during.windows(2).map(|w| w[1] - w[0]).collect();
+        gaps.sort_unstable();
+        let pct = |q: f64| -> f64 {
+            if gaps.is_empty() {
+                0.0
+            } else {
+                gaps[((gaps.len() - 1) as f64 * q).round() as usize] as f64 / 1e6
+            }
+        };
+        let text = format!(
+            "frames {}\nseconds {:.3}\nfps {:.1}\ngap_p50_ms {:.2}\ngap_p90_ms {:.2}\ngap_p99_ms {:.2}\ngap_max_ms {:.2}\n",
+            during.len(),
+            secs,
+            if secs > 0.0 { during.len() as f64 / secs } else { 0.0 },
+            pct(0.5),
+            pct(0.9),
+            pct(0.99),
+            gaps.last().map_or(0.0, |&g| g as f64 / 1e6),
+        );
+        std::fs::write(path, text)
     }
 
     pub fn run() -> i32 {
@@ -374,6 +421,10 @@ options:
             }),
             pending: AtomicBool::new(true),
             exited: AtomicBool::new(false),
+            want: AtomicBool::new(false),
+            first_output: std::sync::atomic::AtomicU64::new(u64::MAX),
+            last_output: std::sync::atomic::AtomicU64::new(0),
+            epoch: Instant::now(),
         });
         let waker = surface.window().waker();
         // Move one output stream into the emulator until it ends.
@@ -394,7 +445,13 @@ options:
                             let _ = session.lock().unwrap().write(reply);
                         }
                     }
+                    while shared.want.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
                     shared.term.lock().unwrap().feed(&buf[..n]);
+                    let now = shared.epoch.elapsed().as_nanos() as u64;
+                    shared.first_output.fetch_min(now, Ordering::AcqRel);
+                    shared.last_output.store(now, Ordering::Release);
                     if !shared.pending.swap(true, Ordering::AcqRel) {
                         waker.wake();
                     }
@@ -436,6 +493,9 @@ options:
             session
         };
 
+        // This thread draws: it must win a core when a frame is due, even with
+        // every core busy moving output.
+        fwrender::win::raise_thread_priority();
         let hz = args.max_fps.or_else(display_refresh_hz).unwrap_or(60);
         let min_interval = Duration::from_secs_f64(1.0 / hz as f64);
         let palette = Palette::default();
@@ -443,6 +503,14 @@ options:
         let mut events = Vec::new();
         let mut input = Vec::new();
         let mut last_draw: Option<Instant> = None;
+        let mut frames: Vec<u64> = Vec::new();
+        let finish = |frames: &[u64]| {
+            if let Some(path) = &args.stats {
+                if let Err(e) = write_stats(path, &shared, frames) {
+                    eprintln!("fwterm: --stats {path}: {e}");
+                }
+            }
+        };
         loop {
             // Sleep until an event, new output, or the next allowed frame.
             let timeout = match last_draw {
@@ -475,6 +543,7 @@ options:
                         shared.pending.store(true, Ordering::Release);
                     }
                     Event::CloseRequested => {
+                        finish(&frames);
                         // Take the shell down with the window.
                         session.lock().unwrap().kill();
                         return Ok(0);
@@ -488,6 +557,7 @@ options:
                 let _ = session.lock().unwrap().write(&input);
             }
             if shared.exited.load(Ordering::Acquire) {
+                finish(&frames);
                 return Ok(session.lock().unwrap().wait());
             }
             if last_draw.map_or(false, |t| t.elapsed() < min_interval) {
@@ -497,7 +567,9 @@ options:
                 continue;
             }
             {
+                shared.want.store(true, Ordering::Release);
                 let mut term = shared.term.lock().unwrap();
+                shared.want.store(false, Ordering::Release);
                 term.take_dirty();
                 frame.update(term.screen(), true, &palette, &mut atlas, &mut raster);
             }
@@ -505,6 +577,9 @@ options:
                 surface.draw(&frame, &mut atlas)?;
                 frame.clear_damage();
                 last_draw = Some(Instant::now());
+                if args.stats.is_some() {
+                    frames.push(shared.epoch.elapsed().as_nanos() as u64);
+                }
             }
         }
     }
