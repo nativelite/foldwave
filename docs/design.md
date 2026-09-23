@@ -1086,10 +1086,74 @@ measure it.
 - **Result for decision 4:** Vulkan on Windows did not fall short, so the spike
   gave no reason for D3D11. **The founder confirmed Vulkan first on
   2026-09-22 (§11).**
-- **Not yet measured:** the same workload in other terminals (Windows Terminal,
-  Alacritty, WezTerm). Their frames can't be timestamped from inside, so that
-  needs an external method: a photodiode, or screen capture with a visible
-  marker. That is next, before any cross-terminal claim.
+- **Against other terminals (measured 2026-09-22).** Two new tools:
+  - `crates/fwterm`: a minimal foldwave terminal. It runs one real shell
+    through ConPTY, with `vterm`, our glyphs and Vulkan, and handles keys,
+    resize and query replies. It has no scrollback or configuration yet.
+  - `crates/fwprobe`: measures any terminal from the outside, the same way
+    for all.
+    - **Latency:** it launches the terminal running `cmd`, sizes and raises
+      the window, types a character with `SendInput`, and reads the echo
+      region with `BitBlt` until the pixels change (the Typometer method). The
+      prompt forces a steady cursor, keystrokes are 60–140 ms apart, and each
+      terminal gets 200 samples.
+    - **Throughput:** the terminal runs `fwprobe emit`, which writes 32 MiB of
+      agent-like output with raw `WriteFile` and times it from the inside.
+      Three runs each.
+
+  Every terminal ran in its default configuration, at a 1200x760 window on
+  the reference machine. It was **not a quiet machine** (other Claude
+  sessions, a browser).
+
+  **Key press to pixels on screen** (includes the console host, the terminal
+  and the desktop compositor):
+
+  | Terminal | Console host | p50 / p90 / p99 | min / max | n |
+  | --- | --- | --- | --- | --- |
+  | **fwterm** (Vulkan) | built-in conhost | **6.90 / 11.60 / 13.46 ms** | 1.59 / 14.54 | 200 |
+  | fwterm (Vulkan) | OpenConsole 1.24 (Microsoft's ConPTY package) | 7.87 / 12.24 / 15.13 ms | 1.96 / 15.47 | 200 |
+  | Alacritty 0.17.0 | built-in conhost | 7.22 / 12.40 / 14.27 ms | 1.66 / 16.08 | 200 |
+  | Windows Terminal 1.24 | its OpenConsole | 8.48 / 12.03 / 13.77 ms | 2.33 / 14.24 | 200 |
+  | fwterm (Vulkan) | WezTerm's bundled OpenConsole (2024) | 21.60 / 27.81 / 32.47 ms | 11.42 / 34.64 | 200 |
+  | WezTerm 20240203 | its bundled OpenConsole (2024) | 39.19 / 44.67 / 48.62 ms | 26.24 / 74.61 | 200 |
+
+  - **The instrument resolves ~6.1 ms, not better.** A GDI read of the screen
+    waits for the compositor's next frame (165 Hz → 6.06 ms; measured read cost
+    6.04–6.12 ms in every run), so every sample is quantized to compositor
+    frames.
+  - **fwterm, Alacritty and Windows Terminal are therefore tied** at about one
+    to two compositor frames. fwterm had the lowest p50 and p99, but by less
+    than one frame. This supports "as fast as the fastest", not "faster".
+  - **The console host dominates.** WezTerm's bundled 2024 OpenConsole adds
+    ~15 ms even under fwterm, and WezTerm itself is slowest.
+  - **What the probe cannot see:** our in-process measure — output arrival
+    to present, p99 ≤ 7.2 ms (above) — is below this instrument's resolution.
+    To separate terminals by less than a frame needs a photodiode, or the
+    compositor's own frame statistics.
+
+  **Output throughput** (32 MiB, 3 runs, median):
+
+  | Terminal | Console host | MiB/s (runs) |
+  | --- | --- | --- |
+  | Windows Terminal 1.24 | its OpenConsole | **115.2** (91.8, 115.2, 119.5) |
+  | fwterm | OpenConsole 1.24 | 82.9 (82.2, 82.9, 84.0) |
+  | fwterm | built-in conhost | 14.9 (12.9, 14.9, 14.9) |
+  | WezTerm 20240203 | its bundled OpenConsole (2024) | 12.6 (12.6, 12.6, 12.6) |
+  | Alacritty 0.17.0 | built-in conhost | did not finish: 1 MiB at 17.6 MiB/s, but 8 and 32 MiB stalled past 120–200 s; cause not investigated |
+
+  - **The console host sets the ceiling.** fwterm moved 14.9 MiB/s through
+    conhost, and 15.9 with `vterm` switched off entirely (a one-off
+    experiment), so the host is the limit there, not our code. That matches
+    M0: 139 MiB/s across 16 conhost panes is ~8.7 per pane.
+  - **On the same modern host, fwterm reaches 83 MiB/s against Windows
+    Terminal's 115.** The remaining gap is ours to find. Candidates: the
+    reader hands 64 KiB chunks to `vterm` under a lock the renderer also
+    takes; the pane lock contention seen in `fwbench render`; and how fast
+    we drain the pipe. Not yet profiled.
+  - **This makes the §11 row 6 decision concrete:** running on the built-in
+    host costs fwterm ~5.5× in throughput. The installed-OpenConsole launcher
+    is still unbuilt, and it is the most valuable missing piece for
+    throughput.
 
 ### 8.7 The agent layer
 - **Blocks:** prompt, command, output and exit status from shell-integration
@@ -1401,7 +1465,7 @@ One concern each; names are placeholders.
 | M1 status (2026-09-22) | **Delivered, headless.** `panelog` (append, crash-safe recovery, sparse line index, checkpoints, trigram search, marks), `vterm` checkpoint/restore and `ansi::MarkScanner`, driven by `fwbench history`. §4 history target met at 100 GB: open 0.3–0.4 s, jump to any line 0.1–0.3 ms, search ≤ 0.5 s; pane rebuild p99 6.9 ms with 1 MiB checkpoints; last failed command found in 0.18 ms. Open: compression of cold segments (a proposal), and running checkpointing off the writer thread | [`panelog-rs`](https://github.com/nativelite/panelog-rs), [`crates/fwbench`](../crates/fwbench) |
 | **M2 atrium adopts it** | unbounded history, search and crash replay inside atrium | atrium benchmarks don't regress; replay after a kill |
 | **M3 Renderer spike** | one platform (Windows; Vulkan per §8.6, D3D11 only if it falls short), glyph atlas, damaged-row redraw, CPU fallback | frame time and latency under flood vs. baseline |
-| M3 status (2026-09-22) | **Spike delivered on Windows with Vulkan, not D3D11** (§8.6 puts Vulkan first; this row said D3D11). `fwrender`: frame with row damage, glyph atlas, CPU reference renderer, a Vulkan backend that matches it pixel for pixel, and a Win32 window. `fwbench render` at 164 fps: output to present p99 ≤ 7.2 ms on Vulkan against 10.7–18.3 ms on CPU; Vulkan's frame cost is flat at ~0.2 ms up to 2560x1400; idle draws 0 frames. Our own glyph rasterizer (`glyphs-rs`) replaces GDI: the same cells, and with the default sharpening (vertical fit, stem align, stem snap; switchable off) about as crisp as GDI's hinting at the same cost per glyph. Open: a comparison with other terminals (needs an external timing method). Decision 4 is confirmed as Vulkan, and the `vterm` scroll-region cost found here is fixed | [`crates/fwrender`](../crates/fwrender), §8.6 |
+| M3 status (2026-09-22) | **Spike delivered on Windows with Vulkan, not D3D11** (§8.6 puts Vulkan first; this row said D3D11). `fwrender`: frame with row damage, glyph atlas, CPU reference renderer, a Vulkan backend that matches it pixel for pixel, and a Win32 window. `fwbench render` at 164 fps: output to present p99 ≤ 7.2 ms on Vulkan against 10.7–18.3 ms on CPU; Vulkan's frame cost is flat at ~0.2 ms up to 2560x1400; idle draws 0 frames. Our own glyph rasterizer (`glyphs-rs`) replaces GDI: the same cells, and with the default sharpening (vertical fit, stem align, stem snap; switchable off) about as crisp as GDI's hinting at the same cost per glyph. Measured against Windows Terminal, Alacritty and WezTerm from the outside (`fwprobe`): key-to-screen latency tied with the fastest within the instrument's one-frame resolution; throughput set by the console host, where fwterm reaches 83 MiB/s on OpenConsole 1.24 against Windows Terminal's 115. Open: the throughput gap on the same host, and the installed-OpenConsole launcher (§11 row 6). Decision 4 is confirmed as Vulkan, and the `vterm` scroll-region cost found here is fixed | [`crates/fwrender`](../crates/fwrender), §8.6 |
 | **M4 App alpha** | window, panes, blocks, cross-pane search, governor | all §4 targets measured on the reference machine |
 
 M1–M2 pay off in atrium before any GPU work, which de-risks the expensive part.

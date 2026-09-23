@@ -352,7 +352,11 @@ options:
                         frame.damage_all();
                         shared.pending.store(true, Ordering::Release);
                     }
-                    Event::CloseRequested => return Ok(0),
+                    Event::CloseRequested => {
+                        // Take the shell down with the window.
+                        let _ = pty.lock().unwrap().kill();
+                        return Ok(0);
+                    }
                     _ => {}
                 }
             }

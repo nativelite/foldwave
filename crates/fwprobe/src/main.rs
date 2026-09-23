@@ -38,7 +38,7 @@ mod probe {
     use fwbench::stats::Summary;
     use std::io;
     use std::path::PathBuf;
-    use std::process::{Child, Command};
+    use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
     const USAGE: &str = "\
@@ -46,7 +46,7 @@ fwprobe - measure a terminal from the outside
 
 usage:
   fwprobe latency    --name NAME [--samples N] [--size WxH] -- LAUNCH...
-  fwprobe throughput --name NAME [--mib N] [--runs N] -- LAUNCH...
+  fwprobe throughput --name NAME [--mib N] [--runs N] [--limit SECS] -- LAUNCH...
   fwprobe emit BYTES REPORT        (run inside the terminal by throughput)
 
 LAUNCH is the terminal's command line, with {cmd} where the shell command
@@ -66,6 +66,7 @@ goes and {title} where a window title can go, e.g.
         size: (i32, i32),
         mib: u64,
         runs: usize,
+        limit: u64,
         launch: Vec<String>,
         rest: Vec<String>,
     }
@@ -78,6 +79,7 @@ goes and {title} where a window title can go, e.g.
             size: (1200, 760),
             mib: 256,
             runs: 3,
+            limit: 120,
             launch: Vec::new(),
             rest: Vec::new(),
         };
@@ -93,6 +95,7 @@ goes and {title} where a window title can go, e.g.
                 "--samples" => a.samples = v(i)?.parse().map_err(|_| "bad --samples")?,
                 "--mib" => a.mib = v(i)?.parse().map_err(|_| "bad --mib")?,
                 "--runs" => a.runs = v(i)?.parse().map_err(|_| "bad --runs")?,
+                "--limit" => a.limit = v(i)?.parse().map_err(|_| "bad --limit")?,
                 "--size" => {
                     let s = v(i)?;
                     a.size = s
@@ -152,14 +155,23 @@ goes and {title} where a window title can go, e.g.
                 words.push(w.replace("{title}", title));
             }
         }
-        Command::new(&words[0]).args(&words[1..]).spawn()
+        // Null stdio: a terminal that outlives us must not hold our output
+        // pipe open.
+        Command::new(&words[0])
+            .args(&words[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
     }
 
-    /// Wait for a visible window whose title contains `title`.
-    fn find(title: &str, within: Duration) -> io::Result<sys::Hwnd> {
+    /// Wait for a visible window whose title contains `title`, or that the
+    /// launched process `pid` owns (for terminals that do not show the
+    /// shell's title).
+    fn find(title: &str, pid: u32, within: Duration) -> io::Result<sys::Hwnd> {
         let start = Instant::now();
         while start.elapsed() < within {
-            if let Some((h, _)) = sys::find_windows(title).into_iter().next() {
+            if let Some((h, _)) = sys::find_windows(title, pid).into_iter().next() {
                 return Ok(h);
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -221,7 +233,7 @@ goes and {title} where a window title can go, e.g.
         let setup = format!("title {title} & prompt $E[2 q$P$G");
         let cmd = vec!["cmd.exe".into(), "/k".into(), setup];
         let mut child = launch(a, &title, &cmd)?;
-        let h = find(&title, Duration::from_secs(20))?;
+        let h = find(&title, child.id(), Duration::from_secs(20))?;
         sys::place(h, 80, 80, a.size.0, a.size.1);
         sys::topmost(h, true);
         let result = measure(a, h);
@@ -361,14 +373,24 @@ goes and {title} where a window title can go, e.g.
             let title = unique(&a.name);
             let report: PathBuf = std::env::temp_dir().join(format!("{title}.txt"));
             let _ = std::fs::remove_file(&report);
+            // No quotes inside: cmd /k takes the rest of its line as is, and
+            // escaped quotes reach it as literal backslashes.
+            for p in [&me, &report] {
+                if p.to_string_lossy().contains(' ') {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("{} has a space; run from a path without one", p.display()),
+                    ));
+                }
+            }
             let setup = format!(
-                "title {title} & \"{}\" emit {bytes} \"{}\"",
+                "title {title} & {} emit {bytes} {}",
                 me.display(),
                 report.display()
             );
             let cmd = vec!["cmd.exe".into(), "/k".into(), setup];
             let mut child = launch(a, &title, &cmd)?;
-            let h = find(&title, Duration::from_secs(20))?;
+            let h = find(&title, child.id(), Duration::from_secs(20))?;
             sys::place(h, 80, 80, a.size.0, a.size.1);
             let start = Instant::now();
             let secs = loop {
@@ -377,7 +399,7 @@ goes and {title} where a window title can go, e.g.
                         break Some(v);
                     }
                 }
-                if start.elapsed() > Duration::from_secs(300) {
+                if start.elapsed() > Duration::from_secs(a.limit) {
                     break None;
                 }
                 std::thread::sleep(Duration::from_millis(50));

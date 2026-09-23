@@ -38,6 +38,7 @@ those parts on std (`std::arch` or word-at-a-time tricks).
 - License `Apache-2.0` — https://github.com/alacritty/alacritty/blob/master/alacritty/Cargo.toml
 - Parser: the `vte` crate (0.15) — https://github.com/alacritty/alacritty/blob/master/alacritty_terminal/Cargo.toml
 - Renderer: OpenGL, with a GLES2 or GLSL3 path chosen at runtime — https://github.com/alacritty/alacritty/blob/master/alacritty/src/renderer/mod.rs
+- Windows: 0.17.0 (winget) ships no `conpty.dll`, so it uses the system's built-in console host (*observed*: only `alacritty.exe` in `C:\Program Files\Alacritty`). Measured with `fwprobe` (design §8.6): 7.2 ms p50 key-to-screen; a 1 MiB write at 17.6 MiB/s, but 8 and 32 MiB writes stalled for minutes (cause not investigated; *unverified* whether it is Alacritty or our harness).
   - Glyph atlas — https://github.com/alacritty/alacritty/blob/master/alacritty/src/renderer/text/mod.rs
   - Per-line damage tracking — https://github.com/alacritty/alacritty/blob/master/alacritty_terminal/src/term/mod.rs
 - Scrollback: in-memory ring buffer rotated by a `zero` offset — https://github.com/alacritty/alacritty/blob/master/alacritty_terminal/src/grid/storage.rs
@@ -56,6 +57,8 @@ those parts on std (`std::arch` or word-at-a-time tricks).
 - Scrollback: in-memory `VecDeque<Line>` — https://github.com/wezterm/wezterm/blob/main/term/src/screen.rs
   - Default `scrollback_lines = 3500` — https://wezterm.org/config/lua/config/scrollback_lines.html
 - Shell integration: OSC 133 zones, OSC 7, OSC 1337 — https://wezterm.org/shell-integration.html
+- Windows: the 20240203 installer ships its own `conpty.dll` (99,328 bytes, dated 2024-02-03) and `OpenConsole.exe` in `C:\Program Files\WezTerm` (*observed* in the winget install, 2026-09-22). Measured with `fwprobe` (design §8.6): 39 ms p50 key-to-screen and 12.6 MiB/s, and that OpenConsole also slows fwterm, so the bundled host, not only WezTerm, is slow.
+- Window title: shows the process (`cmd.exe`), not the title the shell sets with `title` (*observed*, default config).
 
 ### Ghostty (Zig)
 - License MIT — https://github.com/ghostty-org/ghostty/blob/main/LICENSE

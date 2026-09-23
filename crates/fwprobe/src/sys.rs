@@ -95,6 +95,7 @@ extern "system" {
     fn EnumWindows(f: EnumProc, l: isize) -> i32;
     fn GetWindowTextW(h: Hwnd, buf: *mut u16, n: i32) -> i32;
     fn IsWindowVisible(h: Hwnd) -> i32;
+    fn GetWindowThreadProcessId(h: Hwnd, pid: *mut u32) -> u32;
     fn SetForegroundWindow(h: Hwnd) -> i32;
     fn GetForegroundWindow() -> Hwnd;
     fn ShowWindow(h: Hwnd, cmd: i32) -> i32;
@@ -146,10 +147,12 @@ fn last_error(what: &str) -> io::Error {
     io::Error::new(e.kind(), format!("{what}: {e}"))
 }
 
-/// Visible top-level windows whose title contains `needle`.
-pub fn find_windows(needle: &str) -> Vec<(Hwnd, String)> {
+/// Visible, titled top-level windows whose title contains `needle` or that
+/// belong to process `pid`.
+pub fn find_windows(needle: &str, pid: u32) -> Vec<(Hwnd, String)> {
     struct Found {
         needle: String,
+        pid: u32,
         out: Vec<(Hwnd, String)>,
     }
     unsafe extern "system" fn visit(h: Hwnd, l: isize) -> i32 {
@@ -163,7 +166,9 @@ pub fn find_windows(needle: &str) -> Vec<(Hwnd, String)> {
             let mut buf = [0u16; 512];
             let n = GetWindowTextW(h, buf.as_mut_ptr(), buf.len() as i32);
             let title = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
-            if title.contains(&found.needle) {
+            let mut owner = 0u32;
+            GetWindowThreadProcessId(h, &mut owner);
+            if title.contains(&found.needle) || (owner == found.pid && !title.is_empty()) {
                 found.out.push((h, title));
             }
         }
@@ -171,6 +176,7 @@ pub fn find_windows(needle: &str) -> Vec<(Hwnd, String)> {
     }
     let mut found = Found {
         needle: needle.to_string(),
+        pid,
         out: Vec::new(),
     };
     // SAFETY: the callback only runs during this call; `found` outlives it.
