@@ -1177,6 +1177,24 @@ measure it.
   - **Other terminals have no pipe lane:** they run every program under a
     console. This is foldwave's structural advantage for agent output, not a
     tuning win.
+- **The emulator gap, profiled and narrowed (2026-09-23).** Stage by stage on
+  64 MiB of agent output through `vterm` at 177x47 (1.32 M lines of ~52 bytes;
+  `profile_vterm_stages` in `fwbench`, reproducible):
+
+  | Stage | Before | After |
+  | --- | --- | --- |
+  | Parser (`feed_with`) | 79 ms | 84 ms (unchanged; noise) |
+  | + UTF-8 decode | +44 ms | +26 ms: std's validator takes the longest valid prefix in one call |
+  | Clearing the row each scroll brings in | **~165 ms** | **~7 ms**: rows clear lazily (written length + blank per row) |
+  | Text into cells, the rest | ~60 ms | ~80 → less with `Screen::write_ascii` (no scratch cells) |
+  | **`Term::feed` total** | **347 ms, 188 MiB/s** | **198 ms, 330 MiB/s (1.75×)** |
+
+  End to end in fwterm (`fwprobe throughput`, 3 runs): **pipe lane
+  173.1 → 254.6 MiB/s; console lane on OpenConsole 1.24 82.9 → 102.5 MiB/s**,
+  against Windows Terminal's 115.2 on the same host. The pipe lane still sits
+  below `vterm`'s 330 on its own: the reader's CR-LF pass, the pane lock the
+  renderer shares, and the render thread are next. Ahead of them all, the
+  parser is now the largest single stage (~84 ms of ~198).
 
 ### 8.7 The agent layer
 - **Blocks:** prompt, command, output and exit status from shell-integration

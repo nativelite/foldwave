@@ -691,3 +691,87 @@ mod tests {
         assert!(render(&config, &r).contains("output arrival to present"));
     }
 }
+
+/// Where one pane's emulation time goes, stage by stage, on 64 MiB of agent
+/// output (177x47): `cargo test --release -p nativelite-fwbench
+/// profile_vterm_stages -- --ignored --nocapture`.
+#[cfg(test)]
+mod stage_profile {
+    use ansi::{Cell, Event, Parser, Screen, Style, Utf8Decoder};
+    use std::time::Instant;
+
+    fn rate(label: &str, bytes: usize, t: Instant) {
+        let s = t.elapsed().as_secs_f64();
+        println!("{label:<44} {:>8.1} MiB/s  ({:.1} ms)", bytes as f64 / 1048576.0 / s, s * 1e3);
+    }
+
+    #[test]
+    #[ignore]
+    fn profile_vterm_stages() {
+        let data = super::workload(64 << 20);
+        let n = data.len();
+        let lines = data.iter().filter(|&&b| b == b'\n').count();
+        let (mut text, mut ctl, mut csi, mut other) = (0usize, 0usize, 0usize, 0usize);
+        let mut p = Parser::new();
+        p.feed_with(&data, |e| match e {
+            Event::Text(b) => text += b.len(),
+            Event::Control(_) => ctl += 1,
+            Event::Csi { .. } => csi += 1,
+            _ => other += 1,
+        });
+        println!("{n} bytes, {lines} lines ({:.1} B/line), text {text} B, controls {ctl}, CSI {csi}, other {other}", n as f64 / lines as f64);
+        for _ in 0..2 {
+            let t = Instant::now();
+            let mut p = Parser::new();
+            let mut k = 0usize;
+            for c in data.chunks(64 * 1024) {
+                p.feed_with(c, |e| if let Event::Text(b) = e { k += b.len() });
+            }
+            std::hint::black_box(k);
+            rate("A parser only (feed_with)", n, t);
+
+            let t = Instant::now();
+            let mut p = Parser::new();
+            let mut d = Utf8Decoder::new();
+            let mut k = 0usize;
+            for c in data.chunks(64 * 1024) {
+                p.feed_with(c, |e| if let Event::Text(b) = e { d.decode(b, |s| k += s.len()) });
+            }
+            std::hint::black_box(k);
+            rate("B parser + UTF-8 decode", n, t);
+
+            let t = Instant::now();
+            let mut term = vterm::Term::new(47, 177);
+            for c in data.chunks(64 * 1024) {
+                term.feed(c);
+            }
+            rate("C vterm Term::feed, 177x47", n, t);
+
+            let t = Instant::now();
+            let mut term = vterm::Term::new(47, 80);
+            for c in data.chunks(64 * 1024) {
+                term.feed(c);
+            }
+            rate("C' vterm Term::feed, 80x47", n, t);
+
+            // Screen work alone: one scroll + one row blit per line.
+            let mut s = Screen::new(47, 177);
+            let row: Vec<Cell> = (0..(n / lines)).map(|_| Cell::new('x', Style::default())).collect();
+            let t = Instant::now();
+            for _ in 0..lines {
+                s.scroll_rows_up(0, 46, 1, Cell::default());
+                s.copy_cells(46, 0, &row[..row.len().min(176)]);
+            }
+            std::hint::black_box(&s);
+            rate("D screen only: scroll + blit per line", n, t);
+
+            let t = Instant::now();
+            for _ in 0..lines {
+                s.scroll_rows_up(0, 46, 1, Cell::default());
+            }
+            std::hint::black_box(&s);
+            rate("E scroll only (fill 177 cells)", n, t);
+        }
+        println!("size_of Cell = {} bytes", std::mem::size_of::<Cell>());
+    }
+}
