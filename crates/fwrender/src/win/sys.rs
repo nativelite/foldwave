@@ -185,6 +185,8 @@ pub const WM_NCDESTROY: u32 = 0x0082;
 pub const WM_KEYDOWN: u32 = 0x0100;
 pub const WM_KEYUP: u32 = 0x0101;
 pub const WM_CHAR: u32 = 0x0102;
+/// winuser.h.
+pub const WM_MOUSEWHEEL: u32 = 0x020A;
 pub const WM_APP: u32 = 0x8000;
 
 /// `QS_ALLINPUT` for Windows 8 and later: `QS_INPUT` (mouse, key, raw input,
@@ -267,6 +269,8 @@ extern "system" {
     pub fn TranslateMessage(msg: *const Msg) -> Bool;
     pub fn DispatchMessageW(msg: *const Msg) -> isize;
     pub fn PostMessageW(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> Bool;
+    /// High bit set (negative) while the key is down.
+    pub fn GetKeyState(vk: i32) -> i16;
     pub fn MsgWaitForMultipleObjectsEx(
         count: u32,
         handles: *const Handle,

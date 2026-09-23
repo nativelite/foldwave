@@ -169,7 +169,66 @@ impl Frame {
         atlas: &mut Atlas,
         raster: &mut dyn Rasterizer,
     ) -> usize {
-        let (rows, cols) = (screen.rows(), screen.cols());
+        let at = cursor.then(|| screen.cursor());
+        self.update_with(
+            screen.rows(),
+            screen.cols(),
+            at,
+            |r, c| screen.cell(r, c),
+            palette,
+            atlas,
+            raster,
+        )
+    }
+
+    /// Like [`Frame::update`], with the view scrolled back `back` lines into
+    /// `history`'s scrollback (`ansi::Screen::history_cell`): the top `back`
+    /// rows show history, newest lowest, and the rest the top of `screen`. The
+    /// cursor shows only if it is still in view. `back` is clamped to the
+    /// history held.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_view(
+        &mut self,
+        screen: &Screen,
+        history: &Screen,
+        back: usize,
+        cursor: bool,
+        palette: &Palette,
+        atlas: &mut Atlas,
+        raster: &mut dyn Rasterizer,
+    ) -> usize {
+        let back = back.min(history.history_len());
+        let rows = screen.rows();
+        let at = screen.cursor();
+        let at = (cursor && at.row + back < rows).then(|| ansi::Cursor::new(at.row + back, at.col));
+        self.update_with(
+            rows,
+            screen.cols(),
+            at,
+            |r, c| {
+                if r < back {
+                    history.history_cell(back - 1 - r, c)
+                } else {
+                    screen.cell(r - back, c)
+                }
+            },
+            palette,
+            atlas,
+            raster,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_with(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        at: Option<ansi::Cursor>,
+        cell_at: impl Fn(usize, usize) -> ansi::Cell,
+        palette: &Palette,
+        atlas: &mut Atlas,
+        raster: &mut dyn Rasterizer,
+    ) -> usize {
         let mut newly = 0;
         if rows != self.rows || cols != self.cols || palette.bg != self.background {
             self.rows = rows;
@@ -179,12 +238,11 @@ impl Frame {
             self.background = palette.bg;
             newly = rows;
         }
-        let at = screen.cursor();
         for r in 0..rows {
             self.scratch.clear();
             let mut lead = ' ';
             for c in 0..cols {
-                let cell = screen.cell(r, c);
+                let cell = cell_at(r, c);
                 let s = cell.style;
                 let mut fg = palette.resolve(s.fg, palette.fg, s.bold);
                 let mut bg = palette.resolve(s.bg, palette.bg, false);
@@ -194,7 +252,7 @@ impl Frame {
                 if s.dim {
                     fg = halfway(fg, bg);
                 }
-                if cursor && r == at.row && c == at.col {
+                if at.map_or(false, |a| a.row == r && a.col == c) {
                     std::mem::swap(&mut fg, &mut bg);
                 }
                 let style = if s.bold { BOLD } else { 0 } | if s.italic { ITALIC } else { 0 };
@@ -326,6 +384,42 @@ mod tests {
         assert_ne!(row[2].glyph, row[0].glyph);
         assert_eq!((row[3].fg, row[3].bg), (p.bg, p.fg), "block cursor");
         assert_eq!(row[3].glyph, 0, "a space is blank");
+    }
+
+    #[test]
+    fn a_scrolled_back_view_shows_history_above_the_screen() {
+        let (p, mut a, mut r) = setup();
+        let mut s = Screen::with_history(3, 4, 10);
+        for k in 0..6u8 {
+            s.scroll_rows_up(0, 2, 1, Cell::default());
+            s.write_str(2, 0, &format!("L{k}"), Style::default());
+        }
+        s.set_cursor(Cursor::new(2, 2));
+        // On screen L3, L4, L5; history newest first L2, L1, L0, blanks.
+        let ch = |f: &Frame, a: &Atlas, row: usize| f.row(row)[1].glyph != 0 && a.used() > 0;
+        let mut f = Frame::new();
+        f.update_view(&s, &s, 0, true, &p, &mut a, &mut r);
+        let at_bottom: Vec<u32> = (0..3).map(|row| f.row(row)[1].glyph).collect();
+        f.update_view(&s, &s, 2, true, &p, &mut a, &mut r);
+        // Scrolled back 2: rows show L1, L2, L3; the cursor (on L5) is out of view.
+        assert_eq!(
+            f.row(2)[1].glyph,
+            at_bottom[0],
+            "L3 moved down to the last row"
+        );
+        assert!(ch(&f, &a, 0));
+        assert!(f.cells().iter().all(|c| c.bg == p.bg), "no cursor drawn");
+        let mut plain = Frame::new();
+        plain.update(&s, true, &p, &mut a, &mut r);
+        let mut zero = Frame::new();
+        zero.update_view(&s, &s, 0, true, &p, &mut a, &mut r);
+        assert_eq!(plain.cells(), zero.cells(), "back 0 is the plain view");
+        // Asking for more than is held clamps to the history.
+        let mut far = Frame::new();
+        far.update_view(&s, &s, 1_000, false, &p, &mut a, &mut r);
+        let mut max = Frame::new();
+        max.update_view(&s, &s, s.history_len(), false, &p, &mut a, &mut r);
+        assert_eq!(far.cells(), max.cells());
     }
 
     #[test]

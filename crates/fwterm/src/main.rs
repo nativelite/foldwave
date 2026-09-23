@@ -61,6 +61,9 @@ options:
   --no-sharpen  draw the raw glyph outlines (no fitting or stem snapping)
   --max-fps N   frame-rate cap (default: the display's refresh rate)
   --title T     window title (default fwterm)
+  --history N   lines of scrollback kept in memory (default 10000); scroll
+                with the mouse wheel or Shift+PageUp/PageDown, and typing
+                returns to the bottom
   --stats PATH  on exit, write frame statistics for the time output flowed:
                 frames, frames per second, gaps between frames
 ";
@@ -75,6 +78,7 @@ options:
         title: String,
         pipe: bool,
         stats: Option<String>,
+        history: usize,
         shell: Vec<String>,
     }
 
@@ -89,6 +93,7 @@ options:
             title: "fwterm".into(),
             pipe: false,
             stats: None,
+            history: 10_000,
             shell: vec!["cmd.exe".into()],
         };
         let mut i = 0;
@@ -142,6 +147,10 @@ options:
                 }
                 "--title" => a.title = value(&mut i, "--title")?,
                 "--stats" => a.stats = Some(value(&mut i, "--stats")?),
+                "--history" => {
+                    let v = value(&mut i, "--history")?;
+                    a.history = v.parse().map_err(|_| format!("bad --history {v:?}"))?;
+                }
                 "--" => {
                     if i + 1 < argv.len() {
                         a.shell = argv[i + 1..].to_vec();
@@ -411,7 +420,7 @@ options:
         let shell_args: Vec<&str> = args.shell[1..].iter().map(String::as_str).collect();
         let shared = Arc::new(Shared {
             term: Mutex::new({
-                let mut t = Term::new(rows as usize, cols as usize);
+                let mut t = Term::with_history(rows as usize, cols as usize, args.history);
                 if args.pipe {
                     // No tty turns LF into CR LF on a pipe: new line mode
                     // (LNM) makes the emulator do it, with no copy.
@@ -503,6 +512,11 @@ options:
         let mut events = Vec::new();
         let mut input = Vec::new();
         let mut last_draw: Option<Instant> = None;
+        // Scrollback view: how many lines back from live, and the history's
+        // line count when last drawn, so the view stays on the same text
+        // while output keeps scrolling in.
+        let (mut back, mut seen_scrolled) = (0usize, 0u64);
+        let page = |h: u32| (h / m.cell_h).max(2) as usize - 1;
         let mut frames: Vec<u64> = Vec::new();
         let finish = |frames: &[u64]| {
             if let Some(path) = &args.stats {
@@ -524,11 +538,36 @@ options:
             input.clear();
             for e in &events {
                 match *e {
-                    Event::Char(c) => char_bytes(c, &mut input),
+                    Event::Char(c) => {
+                        // Typing returns the view to live output.
+                        back = 0;
+                        char_bytes(c, &mut input);
+                    }
                     Event::Key { vk, down: true } => {
-                        if let Some(b) = key_bytes(vk) {
-                            input.extend_from_slice(b);
+                        let (_, h) = surface.window().client_size();
+                        match vk {
+                            0x21 if fwrender::win::shift_down() => back += page(h),
+                            0x22 if fwrender::win::shift_down() => {
+                                back = back.saturating_sub(page(h))
+                            }
+                            _ => {
+                                if let Some(b) = key_bytes(vk) {
+                                    back = 0;
+                                    input.extend_from_slice(b);
+                                }
+                            }
                         }
+                        shared.pending.store(true, Ordering::Release);
+                    }
+                    Event::Wheel(delta) => {
+                        // Three lines a notch, away from the user = back.
+                        let lines = (delta.unsigned_abs() as usize * 3).div_euclid(120).max(1);
+                        back = if delta > 0 {
+                            back + lines
+                        } else {
+                            back.saturating_sub(lines)
+                        };
+                        shared.pending.store(true, Ordering::Release);
                     }
                     Event::Resized(w, h) if w > 0 && h > 0 => {
                         surface.resize(w, h)?;
@@ -571,7 +610,25 @@ options:
                 let mut term = shared.term.lock().unwrap();
                 shared.want.store(false, Ordering::Release);
                 term.take_dirty();
-                frame.update(term.screen(), true, &palette, &mut atlas, &mut raster);
+                let history = term.scrollback();
+                let scrolled = history.scrolled_lines();
+                if term.in_alternate_screen() {
+                    back = 0; // full-screen programs: always live
+                } else if back > 0 {
+                    // New lines pushed the text we are looking at further up.
+                    back += (scrolled - seen_scrolled) as usize;
+                }
+                seen_scrolled = scrolled;
+                back = back.min(history.history_len());
+                frame.update_view(
+                    term.screen(),
+                    history,
+                    back,
+                    true,
+                    &palette,
+                    &mut atlas,
+                    &mut raster,
+                );
             }
             if frame.damaged_rows() > 0 {
                 surface.draw(&frame, &mut atlas)?;

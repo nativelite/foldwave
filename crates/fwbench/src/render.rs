@@ -760,6 +760,20 @@ mod stage_profile {
             rate("C vterm Term::feed, 177x47", n, t);
 
             let t = Instant::now();
+            let mut term = vterm::Term::with_history(47, 177, 10_000);
+            for c in data.chunks(64 * 1024) {
+                term.feed(c);
+            }
+            rate("C+ vterm with 10,000 lines of history", n, t);
+
+            let t = Instant::now();
+            let mut term = vterm::Term::with_history(47, 177, 100);
+            for c in data.chunks(64 * 1024) {
+                term.feed(c);
+            }
+            rate("C+ vterm with 100 lines of history", n, t);
+
+            let t = Instant::now();
             let mut term = vterm::Term::new(47, 80);
             for c in data.chunks(64 * 1024) {
                 term.feed(c);

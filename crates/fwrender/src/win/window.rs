@@ -26,6 +26,9 @@ pub enum Event {
         /// `true` for down (including auto-repeat), `false` for up.
         down: bool,
     },
+    /// The mouse wheel turned (`WM_MOUSEWHEEL`): `delta` in Windows units,
+    /// 120 per notch, positive away from the user.
+    Wheel(i32),
     /// The user asked to close the window (`WM_CLOSE`). The window stays
     /// open; drop the [`Window`] to close it.
     CloseRequested,
@@ -441,6 +444,11 @@ unsafe extern "system" fn wnd_proc(hwnd: Hwnd, msg: u32, wparam: usize, lparam: 
             push(Event::CloseRequested);
             0
         }
+        WM_MOUSEWHEEL => {
+            // The high word of wparam is the signed wheel delta.
+            push(Event::Wheel(((wparam >> 16) & 0xFFFF) as u16 as i16 as i32));
+            0
+        }
         WM_PAINT => {
             // SAFETY: a null rect validates the whole update region, which
             // stops WM_PAINT repeating; the caller repaints by presenting.
@@ -562,4 +570,11 @@ pub fn display_refresh_hz() -> Option<u32> {
 pub fn raise_thread_priority() -> bool {
     // SAFETY: the pseudo-handle for the current thread is always valid.
     unsafe { SetThreadPriority(GetCurrentThread(), 1) != 0 }
+}
+
+/// Whether a Shift key is down now (`GetKeyState`, as of the message being
+/// handled), for key combinations such as Shift+PageUp.
+pub fn shift_down() -> bool {
+    // SAFETY: GetKeyState takes a virtual-key code and has no preconditions.
+    unsafe { GetKeyState(0x10) < 0 }
 }
