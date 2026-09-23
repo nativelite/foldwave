@@ -51,7 +51,8 @@ usage: fwterm [options] [-- SHELL [ARGS...]]   (default shell: cmd.exe)
 options:
   --backend B   vulkan (default; falls back to cpu if Vulkan cannot start) or cpu
   --conpty DLL  host the shell with this conpty.dll (e.g. one that starts an
-                OpenConsole.exe beside it) instead of the built-in console host
+                OpenConsole.exe beside it). Without it, a conpty.dll beside
+                fwterm.exe is used if present, else the built-in console host
   --pipe        run the program with no console: output over plain pipes
                 (native speed), keys to its stdin
   --px N        font size in pixels per em (default 16)
@@ -335,8 +336,24 @@ options:
     }
 
     fn start(args: &Args) -> io::Result<i32> {
+        // Console lane host (design §11 row 6): an explicit --conpty, else a
+        // conpty.dll shipped beside fwterm.exe (Microsoft's ConPTY package,
+        // with OpenConsole.exe next to it), else the built-in console host.
         if let Some(dll) = &args.conpty {
             pty::use_conpty_library(std::path::Path::new(dll))?;
+        } else if !args.pipe {
+            let beside = std::env::current_exe()
+                .ok()
+                .and_then(|e| Some(e.parent()?.join("conpty.dll")))
+                .filter(|p| p.exists());
+            if let Some(dll) = beside {
+                if let Err(e) = pty::use_conpty_library(&dll) {
+                    eprintln!(
+                        "fwterm: {} would not load ({e}); using the built-in console host",
+                        dll.display()
+                    );
+                }
+            }
         }
         let mut raster = FontRasterizer::consolas(args.px)?;
         if !args.sharpen {

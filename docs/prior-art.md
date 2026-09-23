@@ -94,6 +94,17 @@ those parts on std (`std::arch` or word-at-a-time tricks).
 
 ### Windows Terminal (C++)
 - License MIT — https://github.com/microsoft/terminal/blob/main/LICENSE
+- ConPTY hosting: Windows Terminal builds `winconpty` in and starts its own `OpenConsole.exe`; the install has `OpenConsole.exe` but no `conpty.dll` (*observed*, 1.24.11911.0). `winconpty` opens the console driver's server handle (`CreateServerHandle`, via `ntdll`) and starts the host with `--headless … --signal … --server …` — https://github.com/microsoft/terminal/blob/main/src/winconpty/winconpty.cpp
+  - Outside Windows builds, `conpty.dll` looks for `OpenConsole.exe` beside itself (then an architecture subfolder) and otherwise falls back to `System32\conhost.exe` (`_ConsoleHostPath`, same file).
+- Microsoft documents two ways for an app to host consoles: `CreatePseudoConsole` in kernel32 (the built-in host, Windows 10 1809+) — https://learn.microsoft.com/en-us/windows/console/createpseudoconsole — and the `Microsoft.Windows.Console.ConPTY` NuGet package, which "allows applications to host Windows Console sessions" on 10.0.17763+ and contains `conpty.dll` + `OpenConsole.exe` — https://www.nuget.org/packages/Microsoft.Windows.Console.ConPTY . Driving an installed Windows Terminal's OpenConsole from another app is not documented.
+
+### Others that host consoles on Windows
+- **node-pty** (Microsoft; the pty library behind VS Code's terminal): a `useConptyDll` option loads a `conpty.dll` shipped beside it instead of the system's — https://github.com/microsoft/node-pty/blob/main/src/windowsPtyAgent.ts . Its README: winpty support removed, Windows 10 1809+ required — https://github.com/microsoft/node-pty/blob/main/README.md
+- **winpty** (MIT, before ConPTY): an agent process with a hidden console window polls the console's screen buffer and turns changes into escape codes — https://github.com/rprichard/winpty/blob/master/README.md
+- **Wine** (LGPL, so study only): its own `conhost` answers the console driver's requests (`IOCTL_CONDRV_*`) against Wine's emulated driver, not Windows' — https://github.com/wine-mirror/wine/blob/master/programs/conhost/conhost.c
+- **ReactOS** console server (GPL): not checked (*unverified*).
+- No project outside Microsoft was found driving an installed Windows Terminal's OpenConsole with its own launcher (a short survey, 2026-09-23, not exhaustive).
+
 - Parser: `StateMachine::ProcessString` prints plain runs in bulk, using `FindActionableControlCharacter` (SSE2)
   - https://github.com/microsoft/terminal/blob/main/src/terminal/parser/stateMachine.cpp
   - https://github.com/microsoft/terminal/blob/main/src/types/utils.cpp
