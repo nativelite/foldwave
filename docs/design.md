@@ -1268,9 +1268,24 @@ measure it.
     gave 1,006 against 700. At one pane the two tie (120.4 against 118.1).
     Under load fwterm's cheaper emulation and rendering leave more of the
     machine to the console hosts. Both clear the §4 target (273 MiB/s).
-  - **Not measured: latency while 16 panes flood.** Through Remote Desktop the
-    screen-capture instrument resolves only the session's 32 Hz frames
-    (~31 ms). To run at the machine.
+  - **Latency while 16 panes flood: measured coarsely (2026-09-23, founder's
+    call to run it through Remote Desktop).** `fwprobe latency`, 200 samples
+    each, all four on the same 32 Hz remote display, so every screen read
+    cost ~31 ms (one frame) and every sample is quantized to it:
+
+    | Terminal | p50 / p90 / p99 | min / max |
+    | --- | --- | --- |
+    | fwterm, idle | 22.07 / 33.89 / 38.25 ms | 2.24 / 39.20 |
+    | fwterm, 16 pipe-lane panes flooding | 23.08 / 33.34 / 37.12 ms | 4.49 / 37.25 |
+    | Windows Terminal, idle | 23.82 / 36.12 / 42.60 ms | 1.91 / 42.65 |
+    | Windows Terminal, same load | 23.24 / 33.59 / 36.73 ms | 4.48 / 37.34 |
+
+    - **The load moved nothing by even one display frame.** fwterm under 16
+      flooding panes is within 1 ms of idle, far inside this instrument's
+      ~31 ms step; no sample was missed. fwterm and Windows Terminal are tied.
+    - **This cannot confirm §4's p99 < 5 ms.** That needs the local 164 Hz
+      display (~6 ms resolution) or a 240 fps camera on keyboard and screen
+      (~4 ms, end to end including the display).
 
 ### 8.7 The agent layer
 - **Blocks:** prompt, command, output and exit status from shell-integration
