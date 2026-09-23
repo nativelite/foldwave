@@ -279,6 +279,9 @@ extern "system" {
     // Windows 10 1607+ (1703+ for the V2 context); foldwave targets Windows 11.
     pub fn SetProcessDpiAwarenessContext(context: isize) -> Bool;
     pub fn GetDpiForWindow(hwnd: Hwnd) -> u32;
+    /// `mode` is a DEVMODEW (220 bytes); `index` ENUM_CURRENT_SETTINGS
+    /// (0xFFFFFFFF) reads the current mode.
+    pub fn EnumDisplaySettingsW(device: *const u16, index: u32, mode: *mut c_void) -> Bool;
     pub fn AdjustWindowRectExForDpi(
         rect: *mut Rect,
         style: u32,

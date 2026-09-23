@@ -1,0 +1,17 @@
+[package]
+name = "nativelite-fwprobe"
+version = "0.1.0"
+description = "Measures any terminal from the outside: key-to-screen latency by typing and watching the screen (the Typometer method), and output throughput by timing a large write, using only the Rust standard library and Win32."
+license = "MIT"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# nativelite core rule: ZERO third-party dependencies; org crates only.
+[dependencies]
+fwbench = { package = "nativelite-fwbench", version = "0.1.0", path = "../fwbench" }
+
+[[bin]]
+name = "fwprobe"
+path = "src/main.rs"

@@ -154,3 +154,12 @@ fn window_events_waker_and_present() {
     drop(w);
     late.wake(); // Waking a dropped window is a no-op.
 }
+
+#[test]
+fn the_display_reports_a_plausible_refresh_rate() {
+    let hz = super::display_refresh_hz();
+    println!("display refresh: {hz:?}");
+    if let Some(hz) = hz {
+        assert!((24..=1000).contains(&hz), "{hz} Hz");
+    }
+}

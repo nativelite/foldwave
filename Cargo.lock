@@ -24,11 +24,28 @@ name = "nativelite-fwcuda"
 version = "0.1.0"
 
 [[package]]
+name = "nativelite-fwprobe"
+version = "0.1.0"
+dependencies = [
+ "nativelite-fwbench",
+]
+
+[[package]]
 name = "nativelite-fwrender"
 version = "0.1.0"
 dependencies = [
  "nativelite-ansi",
  "nativelite-glyphs",
+]
+
+[[package]]
+name = "nativelite-fwterm"
+version = "0.1.0"
+dependencies = [
+ "nativelite-fwbench",
+ "nativelite-fwrender",
+ "nativelite-pty",
+ "nativelite-vterm",
 ]
 
 [[package]]

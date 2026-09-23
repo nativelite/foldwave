@@ -533,3 +533,21 @@ impl CpuPresenter {
         Ok(())
     }
 }
+
+/// The primary display's refresh rate in Hz, from its current mode
+/// (`EnumDisplaySettingsW`), or `None` if Windows reports none (0 or 1 mean
+/// "hardware default").
+pub fn display_refresh_hz() -> Option<u32> {
+    // DEVMODEW is 220 bytes: dmSize (u16) at offset 68, dmPelsWidth (u32) at
+    // 172 and dmDisplayFrequency (u32) at 184 (wingdi.h, x64). A u32 array
+    // keeps it aligned.
+    let mut mode = [0u32; 55];
+    let bytes = 220u16.to_le_bytes();
+    mode[17] = u32::from_le_bytes([bytes[0], bytes[1], 0, 0]); // dmSize at 68
+                                                               // SAFETY: `mode` is a writable 220-byte DEVMODEW with dmSize set; a null
+                                                               // device name means the display the calling thread is on.
+    let ok =
+        unsafe { EnumDisplaySettingsW(std::ptr::null(), 0xFFFF_FFFF, mode.as_mut_ptr().cast()) };
+    let (width, hz) = (mode[172 / 4], mode[184 / 4]);
+    (ok != 0 && width > 0 && hz > 1).then_some(hz)
+}
