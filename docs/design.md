@@ -1286,6 +1286,11 @@ measure it.
     - **This cannot confirm §4's p99 < 5 ms.** That needs the local 164 Hz
       display (~6 ms resolution) or a 240 fps camera on keyboard and screen
       (~4 ms, end to end including the display).
+    - **Founder call (2026-09-23): tying or beating Windows Terminal on
+      key-to-screen latency, with no degradation under load, is the bar for
+      now.** A difference this small is not visible to a person typing. The
+      p99 < 5 ms check on the local display or a 240 fps camera stays
+      available, but it is not blocking.
 
 ### 8.7 The agent layer
 - **Blocks:** prompt, command, output and exit status from shell-integration
