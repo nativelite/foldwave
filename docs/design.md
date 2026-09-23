@@ -994,9 +994,43 @@ the records that validate, cuts a torn tail and rebuilds maps and index;
     Windows' `OS/2` metrics, as GDI does. What remains is **hinting**: GDI
     snaps Consolas's stems and cap height to whole pixels, and we draw the
     true outline, so small text is softer.
-  - **Not yet:** hinting (or another way to sharpen small sizes), CFF/OTF
-    fonts, colour emoji, and looking fonts up by family name (Consolas's files
-    are named directly for now).
+  - **Sharpening without hinting (2026-09-22), a switch:**
+    `fwrender::Sharpening`, on by default, and `Sharpening::OFF` (or
+    `fwbench render --no-sharpen`) for the raw outline. There are three
+    cheap steps:
+    - **vertical fit** (`glyphs::VerticalFit`): baseline, x-height and cap
+      height land on whole pixel rows;
+    - **stem align:** each glyph moves by under half a pixel so its left edge
+      sits on a pixel column;
+    - **stem snap:** the glyph is drawn again, shifted right by what the
+      font's stem (the width of `|`) lacks of a whole pixel, so vertical
+      strokes become whole pixels wide with both edges on columns.
+
+    A gamma curve on coverage was also measured. `fwbench glyphs`, Consolas
+    16 px, printable ASCII regular and bold, 20 rounds, n = 3,760 each:
+
+    | Glyphs | Per glyph p50 / p99 | Grey share of ink (lower is crisper) | Mean difference from GDI |
+    | --- | --- | --- | --- |
+    | ours, raw (`OFF`) | 2.1 / 7.8 µs | 70.7 % | 20.4 |
+    | + vertical fit | 2.2 / 8.1 µs | 68.5 % | 20.5 |
+    | + stem align | 2.2 / 8.0 µs | 66.0 % | 19.1 |
+    | + gamma 0.65 (no snap) | 2.2 / 8.1 µs | 63.8 % | 18.0 |
+    | **+ stem snap (the default)** | **4.1 / 15.9 µs** | **39.6 %** | 19.9 |
+    | GDI, hinted | 4.3 / 5.0 µs | 32.1 % | 0 |
+
+    Stem width is what made unhinted text look soft. At 16 px Consolas's
+    stems are ~1.2 px, one solid column plus a grey one, and GDI's hinting
+    rounds them to 2 px. Snapping them cuts the grey share almost to GDI's,
+    for one extra outline pass: the same median cost per glyph as GDI, paid
+    once per glyph since the atlas keeps it. Side by side
+    ([full sheet](img/m3-glyphs-compare.png): raw, the steps as in the table,
+    GDI last; [4x zoom](img/m3-glyphs-zoom.png): raw, default, GDI), the
+    default looks as clean as GDI and slightly heavier where three stems
+    share the 9 px `m`. The remaining difference from GDI is weight and
+    placement, not blur. Full TrueType hinting (running the fonts' own
+    programs) is not needed on this evidence.
+  - **Not yet:** CFF/OTF fonts, colour emoji, and looking fonts up by family
+    name (Consolas's files are named directly for now).
 
 **Correctness:** the Vulkan output equals the CPU reference **pixel for pixel**
 (largest channel difference 0) on the RTX 3070. The test covers colours,
@@ -1367,7 +1401,7 @@ One concern each; names are placeholders.
 | M1 status (2026-09-22) | **Delivered, headless.** `panelog` (append, crash-safe recovery, sparse line index, checkpoints, trigram search, marks), `vterm` checkpoint/restore and `ansi::MarkScanner`, driven by `fwbench history`. §4 history target met at 100 GB: open 0.3–0.4 s, jump to any line 0.1–0.3 ms, search ≤ 0.5 s; pane rebuild p99 6.9 ms with 1 MiB checkpoints; last failed command found in 0.18 ms. Open: compression of cold segments (a proposal), and running checkpointing off the writer thread | [`panelog-rs`](https://github.com/nativelite/panelog-rs), [`crates/fwbench`](../crates/fwbench) |
 | **M2 atrium adopts it** | unbounded history, search and crash replay inside atrium | atrium benchmarks don't regress; replay after a kill |
 | **M3 Renderer spike** | one platform (Windows; Vulkan per §8.6, D3D11 only if it falls short), glyph atlas, damaged-row redraw, CPU fallback | frame time and latency under flood vs. baseline |
-| M3 status (2026-09-22) | **Spike delivered on Windows with Vulkan, not D3D11** (§8.6 puts Vulkan first; this row said D3D11). `fwrender`: frame with row damage, glyph atlas, CPU reference renderer, a Vulkan backend that matches it pixel for pixel, and a Win32 window. `fwbench render` at 164 fps: output to present p99 ≤ 7.2 ms on Vulkan against 10.7–18.3 ms on CPU; Vulkan's frame cost is flat at ~0.2 ms up to 2560x1400; idle draws 0 frames. Our own glyph rasterizer (`glyphs-rs`) replaces GDI: the same cells, faster per glyph at p50, and softer because it is unhinted. Open: a comparison with other terminals (needs an external timing method), and sharpening small text (hinting or an alternative). Decision 4 is confirmed as Vulkan, and the `vterm` scroll-region cost found here is fixed | [`crates/fwrender`](../crates/fwrender), §8.6 |
+| M3 status (2026-09-22) | **Spike delivered on Windows with Vulkan, not D3D11** (§8.6 puts Vulkan first; this row said D3D11). `fwrender`: frame with row damage, glyph atlas, CPU reference renderer, a Vulkan backend that matches it pixel for pixel, and a Win32 window. `fwbench render` at 164 fps: output to present p99 ≤ 7.2 ms on Vulkan against 10.7–18.3 ms on CPU; Vulkan's frame cost is flat at ~0.2 ms up to 2560x1400; idle draws 0 frames. Our own glyph rasterizer (`glyphs-rs`) replaces GDI: the same cells, and with the default sharpening (vertical fit, stem align, stem snap; switchable off) about as crisp as GDI's hinting at the same cost per glyph. Open: a comparison with other terminals (needs an external timing method). Decision 4 is confirmed as Vulkan, and the `vterm` scroll-region cost found here is fixed | [`crates/fwrender`](../crates/fwrender), §8.6 |
 | **M4 App alpha** | window, panes, blocks, cross-pane search, governor | all §4 targets measured on the reference machine |
 
 M1–M2 pay off in atrium before any GPU work, which de-risks the expensive part.

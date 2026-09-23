@@ -40,5 +40,5 @@ pub mod win;
 
 pub use atlas::{Atlas, GlyphKey, GlyphPart, Metrics, Rasterizer, TestRasterizer, BOLD, ITALIC};
 pub use cpu::{blend, CpuRenderer};
-pub use font::{system_font_dir, FontFile, FontRasterizer};
+pub use font::{system_font_dir, FontFile, FontRasterizer, Sharpening};
 pub use frame::{CellInstance, Frame, Palette, STRIKE, UNDERLINE};

@@ -39,8 +39,10 @@ modes:
                 fifo|mailbox|immediate (vulkan), --px N (default 16), --size
                 WxH (default 1600x900), --max-fps N caps the frame rate
                 (default 0: draw on change). Glyphs come from our TrueType
-                rasterizer with the system's Consolas files; --gdi uses
-                Windows GDI instead, with --font NAME (default Consolas)
+                rasterizer with the system's Consolas files, sharpened (fit,
+                stem align, stem snap); --no-sharpen draws the raw outline;
+                --gdi uses Windows GDI instead, with --font NAME (default
+                Consolas)
   glyphs        M3: our TrueType rasterizer (Consolas files) against GDI
                 (--font, default Consolas) at --px (default 16): time per glyph
                 over printable ASCII regular + bold, --reps rounds (default 5),
@@ -146,6 +148,7 @@ struct RenderArgs {
     size: (u32, u32),
     max_fps: u32,
     gdi: bool,
+    no_sharpen: bool,
 }
 
 impl Default for RenderArgs {
@@ -159,6 +162,7 @@ impl Default for RenderArgs {
             size: (1600, 900),
             max_fps: 0,
             gdi: false,
+            no_sharpen: false,
         }
     }
 }
@@ -260,6 +264,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--font" => render.font = value(&mut i, "--font")?,
             "--gdi" => {
                 render.gdi = true;
+                i += 1;
+            }
+            "--no-sharpen" => {
+                render.no_sharpen = true;
                 i += 1;
             }
             "--max-fps" => {
@@ -1205,7 +1213,12 @@ fn run_render(args: &Args) -> i32 {
     let raster: io::Result<Box<dyn fwrender::Rasterizer>> = if r.gdi {
         fwrender::win::GdiRasterizer::new(&r.font, r.px).map(|g| Box::new(g) as _)
     } else {
-        fwrender::FontRasterizer::consolas(r.px as f32).map(|f| Box::new(f) as _)
+        fwrender::FontRasterizer::consolas(r.px as f32).map(|mut f| {
+            if r.no_sharpen {
+                f.set_sharpening(fwrender::Sharpening::OFF);
+            }
+            Box::new(f) as _
+        })
     };
     let mut raster = match raster {
         Ok(g) => g,
@@ -1251,19 +1264,47 @@ fn run_render(_: &Args) -> i32 {
     1
 }
 
-/// `glyphs` mode: our rasterizer against GDI.
+/// `glyphs` mode: our rasterizer, raw and with each sharpening step, against
+/// GDI; writes `target/glyphs-compare.png` (and a 4x zoom) to look at.
 #[cfg(windows)]
 fn run_glyphs(args: &Args) -> i32 {
     use fwbench::glyphs;
+    use fwrender::{Rasterizer, Sharpening};
     let r = &args.render;
     let px = r.px as f32;
-    let mut ours = match fwrender::FontRasterizer::consolas(px) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("fwbench: our rasterizer: {e}");
-            return 1;
-        }
+    let step = |fit, align, snap, gamma| Sharpening {
+        vertical_fit: fit,
+        align_stems: align,
+        snap_stems: snap,
+        gamma,
     };
+    let variants = [
+        ("ours, raw (Sharpening::OFF)", Sharpening::OFF),
+        ("ours, vertical fit", step(true, false, false, 1.0)),
+        ("ours, fit + stem align", step(true, true, false, 1.0)),
+        (
+            "ours, fit + align + gamma 0.65",
+            step(true, true, false, 0.65),
+        ),
+        ("ours, fit + align + stem snap", step(true, true, true, 1.0)),
+        (
+            "ours, fit + align + snap + gamma 0.8",
+            step(true, true, true, 0.8),
+        ),
+    ];
+    let mut ours = Vec::new();
+    for (name, sharp) in variants {
+        match fwrender::FontRasterizer::consolas(px) {
+            Ok(mut f) => {
+                f.set_sharpening(sharp);
+                ours.push((name, f));
+            }
+            Err(e) => {
+                eprintln!("fwbench: our rasterizer: {e}");
+                return 1;
+            }
+        }
+    }
     let mut gdi = match fwrender::win::GdiRasterizer::new(&r.font, r.px) {
         Ok(g) => g,
         Err(e) => {
@@ -1271,12 +1312,50 @@ fn run_glyphs(args: &Args) -> i32 {
             return 1;
         }
     };
-    let runs = vec![
-        glyphs::time("glyphs (ours)", &mut ours, args.reps),
-        glyphs::time("GDI", &mut gdi, args.reps),
+    let mut runs = Vec::new();
+    for (name, f) in ours.iter_mut() {
+        runs.push(glyphs::time(name, f, args.reps));
+    }
+    runs.push(glyphs::time("GDI (hinted)", &mut gdi, args.reps));
+    print!("{}", glyphs::render(&r.font, px, &runs, None));
+    println!("\n| rasterizer | differs from GDI (mean, of 255) | softness (grey share of ink) |");
+    println!("| --- | --- | --- |");
+    for (name, f) in ours.iter_mut() {
+        let d = glyphs::difference(f, &mut gdi).map_or("-".into(), |d| format!("{d:.1}"));
+        println!("| {name} | {d} | {:.1} % |", 100.0 * glyphs::softness(f));
+    }
+    println!(
+        "| GDI (hinted) | 0 | {:.1} % |",
+        100.0 * glyphs::softness(&mut gdi)
+    );
+
+    let lines = [
+        "The quick brown fox jumps over the lazy dog. 0123456789",
+        "fn main() { let x = [1, 2]; println!(\"{x:?}\"); } // ok",
+        "$ cargo test --release -- --nocapture | grep -E 'ok|FAIL'",
+        "il1|I! oO0 mnrw ,.;: {}[]<>()/\\ @#%&*~^",
     ];
-    let diff = glyphs::difference(&mut ours, &mut gdi);
-    print!("{}", glyphs::render(&r.font, px, &runs, diff));
+    let mut rasters: Vec<&mut dyn Rasterizer> = Vec::new();
+    for (_, f) in ours.iter_mut() {
+        rasters.push(f);
+    }
+    rasters.push(&mut gdi);
+    let (w, h, pixels) = glyphs::sheet(&mut rasters, &lines);
+    let (zw, zh, zoomed) = glyphs::zoom(w, h, &pixels, 4);
+    let dir = std::path::Path::new("target");
+    for (name, w, h, px) in [
+        ("glyphs-compare.png", w, h, &pixels),
+        ("glyphs-compare-x4.png", zw, zh, &zoomed),
+    ] {
+        let path = dir.join(name);
+        match std::fs::write(&path, glyphs::png(w, h, px)) {
+            Ok(()) => println!(
+                "wrote {} ({w}x{h}): blocks top to bottom as in the table, GDI last",
+                path.display()
+            ),
+            Err(e) => eprintln!("fwbench: writing {}: {e}", path.display()),
+        }
+    }
     0
 }
 

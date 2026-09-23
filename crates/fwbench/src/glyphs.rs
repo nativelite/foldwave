@@ -125,3 +125,147 @@ mod tests {
         assert!(render("x", 16.0, &[t], Some(0.0)).contains("| test | 8x16 |"));
     }
 }
+
+/// Share of inked pixels (coverage >= 32) that are grey (<= 223) rather than
+/// solid, over printable ASCII (regular): lower is crisper.
+pub fn softness(r: &mut dyn Rasterizer) -> f64 {
+    let m = r.metrics();
+    let mut out = vec![0u8; (m.cell_w * m.cell_h) as usize];
+    let (mut grey, mut inked) = (0u64, 0u64);
+    for c in chars() {
+        out.iter_mut().for_each(|v| *v = 0);
+        r.rasterize(c, 0, 1, &mut out);
+        for &v in &out {
+            if v >= 32 {
+                inked += 1;
+                if v <= 223 {
+                    grey += 1;
+                }
+            }
+        }
+    }
+    grey as f64 / inked.max(1) as f64
+}
+
+/// Draw `lines` of text with each rasterizer, one block per rasterizer,
+/// light grey on the terminal's dark background, as `0xAARRGGBB` pixels.
+/// Returns `(width, height, pixels)`.
+pub fn sheet(rasters: &mut [&mut dyn Rasterizer], lines: &[&str]) -> (usize, usize, Vec<u32>) {
+    let (fg, bg) = (0xFFCC_CCCCu32, 0xFF0C_0C0Cu32);
+    let gap = 6;
+    let cols = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let cw = rasters
+        .iter()
+        .map(|r| r.metrics().cell_w as usize)
+        .max()
+        .unwrap_or(1);
+    let width = cols * cw + 2 * gap;
+    let height: usize = rasters
+        .iter()
+        .map(|r| r.metrics().cell_h as usize * lines.len() + gap)
+        .sum::<usize>()
+        + gap;
+    let mut px = vec![bg; width * height];
+    let mut y0 = gap;
+    for r in rasters.iter_mut() {
+        let m = r.metrics();
+        let (w, h) = (m.cell_w as usize, m.cell_h as usize);
+        let mut cell = vec![0u8; w * h];
+        for (li, line) in lines.iter().enumerate() {
+            for (ci, ch) in line.chars().enumerate() {
+                cell.iter_mut().for_each(|v| *v = 0);
+                r.rasterize(ch, 0, 1, &mut cell);
+                for y in 0..h {
+                    for x in 0..w {
+                        let at = (y0 + li * h + y) * width + gap + ci * w + x;
+                        px[at] = fwrender::blend(fg, bg, cell[y * w + x]);
+                    }
+                }
+            }
+        }
+        y0 += h * lines.len() + gap;
+    }
+    (width, height, px)
+}
+
+/// `pixels` scaled up `k` times (nearest neighbour), for looking closely.
+pub fn zoom(width: usize, height: usize, pixels: &[u32], k: usize) -> (usize, usize, Vec<u32>) {
+    let (w, h) = (width * k, height * k);
+    let mut out = vec![0; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            out[y * w + x] = pixels[(y / k) * width + x / k];
+        }
+    }
+    (w, h, out)
+}
+
+/// A PNG of `0xAARRGGBB` pixels (RGB, 8-bit), stored uncompressed: std has no
+/// deflate, and stored blocks are valid deflate.
+pub fn png(width: usize, height: usize, pixels: &[u32]) -> Vec<u8> {
+    fn crc(data: &[u8]) -> u32 {
+        let mut c = 0xFFFF_FFFFu32;
+        for &b in data {
+            c ^= b as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 {
+                    0xEDB8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+            }
+        }
+        !c
+    }
+    fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let mut body = kind.to_vec();
+        body.extend_from_slice(data);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&crc(&body).to_be_bytes());
+    }
+    let mut raw = Vec::with_capacity(height * (1 + 3 * width));
+    for row in pixels.chunks(width) {
+        raw.push(0); // filter: none
+        for &p in row {
+            raw.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, p as u8]);
+        }
+    }
+    // zlib: header, stored blocks of at most 65535 bytes, Adler-32.
+    let mut z = vec![0x78, 0x01];
+    let blocks: Vec<&[u8]> = raw.chunks(65535).collect();
+    for (i, b) in blocks.iter().enumerate() {
+        z.push(u8::from(i + 1 == blocks.len()));
+        z.extend_from_slice(&(b.len() as u16).to_le_bytes());
+        z.extend_from_slice(&(!(b.len() as u16)).to_le_bytes());
+        z.extend_from_slice(b);
+    }
+    let (mut a, mut b) = (1u32, 0u32);
+    for &x in &raw {
+        a = (a + x as u32) % 65521;
+        b = (b + a) % 65521;
+    }
+    z.extend_from_slice(&((b << 16) | a).to_be_bytes());
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&(width as u32).to_be_bytes());
+    ihdr.extend_from_slice(&(height as u32).to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit RGB
+    chunk(&mut out, b"IHDR", &ihdr);
+    chunk(&mut out, b"IDAT", &z);
+    chunk(&mut out, b"IEND", &[]);
+    out
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn png_has_a_valid_signature_and_known_crc() {
+        let p = png(2, 1, &[0xFFFF_0000, 0xFF00_FF00]);
+        assert_eq!(&p[..8], b"\x89PNG\r\n\x1a\n");
+        // IEND's CRC is fixed: AE 42 60 82.
+        assert_eq!(&p[p.len() - 4..], &[0xAE, 0x42, 0x60, 0x82]);
+    }
+}

@@ -11,11 +11,14 @@
 //! lost to placing a pre-rendered bitmap. A fallback glyph whose advance
 //! differs from its cells is centred in them.
 //!
-//! No hinting (see `glyphs`): stems are not snapped to pixels, so small sizes
-//! look softer than GDI's hinted Consolas.
+//! There is no TrueType hinting. [`Sharpening`] instead offers cheap steps
+//! toward crisp small text, each optional: fit the baseline, x-height and cap
+//! height to whole pixel rows, shift each glyph so its left edge sits on a
+//! pixel column, and a gamma curve on coverage. [`Sharpening::OFF`] draws the
+//! raw outline.
 
 use crate::atlas::{Metrics, Rasterizer, BOLD, ITALIC};
-use glyphs::{Canvas, Font};
+use glyphs::{Canvas, Font, VerticalFit};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -23,6 +26,10 @@ use std::path::{Path, PathBuf};
 struct Face {
     font: Font,
     scale: f32,
+    fit: VerticalFit,
+    /// Horizontal overstrike, in pixels, that takes this face's stem (the
+    /// width of `|`) up to the next whole pixel; 0 when it already is one.
+    stem_widen: f32,
 }
 
 impl Face {
@@ -35,7 +42,28 @@ impl Face {
             )
         })?;
         let scale = px_per_em / font.units_per_em() as f32;
-        Ok(Face { font, scale })
+        let fit = VerticalFit::new(&font, px_per_em);
+        // `|` is a single vertical stem in most fonts: its width is the stem.
+        let stem = font
+            .glyph_index('|')
+            .and_then(|g| font.bbox(g))
+            .map(|b| (b.x_max - b.x_min) as f32 * scale)
+            .filter(|&w| w > 0.0 && w < px_per_em / 3.0);
+        let stem_widen = stem.map_or(0.0, |w| {
+            let d = w.ceil().max(1.0) - w;
+            // Already whole (or nearly): nothing to do.
+            if d < 0.05 || d > 0.95 {
+                0.0
+            } else {
+                d
+            }
+        });
+        Ok(Face {
+            font,
+            scale,
+            fit,
+            stem_widen,
+        })
     }
 }
 
@@ -65,6 +93,52 @@ pub fn system_font_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/usr/share/fonts"))
 }
 
+/// How much work goes into crisp small text. Each step is cheap and
+/// independent; [`Sharpening::OFF`] is the raw, exact outline.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sharpening {
+    /// Snap baseline, x-height and cap height to whole pixel rows
+    /// ([`glyphs::VerticalFit`]).
+    pub vertical_fit: bool,
+    /// Shift each glyph (by under half a pixel) so its left edge lies on a
+    /// pixel column, so the left stems are crisp.
+    pub align_stems: bool,
+    /// Coverage `c` becomes `c^gamma`: below 1 thickens light strokes, 1 is
+    /// neutral.
+    pub gamma: f32,
+    /// Widen vertical strokes to whole pixels: the glyph is drawn a second
+    /// time, shifted right by what the font's stem (the width of `|`) lacks
+    /// of the next whole pixel, and the two copies merge. With
+    /// `align_stems`, both edges of a stem then fall on pixel columns. Costs
+    /// one more outline pass.
+    pub snap_stems: bool,
+}
+
+impl Sharpening {
+    /// The raw outline, nothing adjusted.
+    pub const OFF: Sharpening = Sharpening {
+        vertical_fit: false,
+        align_stems: false,
+        gamma: 1.0,
+        snap_stems: false,
+    };
+}
+
+impl Default for Sharpening {
+    /// Vertical fit, stem alignment and stem snapping, neutral gamma: the
+    /// best measured in `fwbench glyphs` (Consolas 16 px: grey share of ink
+    /// 39.6 % against 70.7 % raw and GDI's 32.1 %, at about GDI's cost per
+    /// glyph). Gamma added nothing visible once stems snap.
+    fn default() -> Self {
+        Sharpening {
+            vertical_fit: true,
+            align_stems: true,
+            gamma: 1.0,
+            snap_stems: true,
+        }
+    }
+}
+
 /// Rasterizes cells with TrueType fonts.
 pub struct FontRasterizer {
     /// Regular, bold, italic, bold italic (by the `BOLD | ITALIC` bits).
@@ -72,6 +146,9 @@ pub struct FontRasterizer {
     fallbacks: Vec<Face>,
     metrics: Metrics,
     canvas: Canvas,
+    sharpening: Sharpening,
+    /// `sharpening.gamma` as a table; `None` when neutral.
+    curve: Option<[u8; 256]>,
 }
 
 impl FontRasterizer {
@@ -140,6 +217,8 @@ impl FontRasterizer {
             fallbacks,
             metrics,
             canvas: Canvas::new(0, 0),
+            sharpening: Sharpening::default(),
+            curve: None,
         })
     }
 
@@ -169,6 +248,25 @@ impl FontRasterizer {
         )
     }
 
+    /// Change how glyphs are sharpened. Glyphs already in an atlas keep
+    /// their old look; start a new atlas to redraw them.
+    pub fn set_sharpening(&mut self, sharpening: Sharpening) {
+        self.sharpening = sharpening;
+        let g = sharpening.gamma;
+        self.curve = (g.is_finite() && g > 0.0 && (g - 1.0).abs() > 1e-6).then(|| {
+            let mut t = [0u8; 256];
+            for (i, v) in t.iter_mut().enumerate() {
+                *v = (255.0 * (i as f32 / 255.0).powf(g)).round() as u8;
+            }
+            t
+        });
+    }
+
+    /// The current sharpening.
+    pub fn sharpening(&self) -> Sharpening {
+        self.sharpening
+    }
+
     /// How many fallback fonts loaded.
     pub fn fallback_count(&self) -> usize {
         self.fallbacks.len()
@@ -195,6 +293,8 @@ impl Rasterizer for FontRasterizer {
             fallbacks,
             metrics,
             canvas,
+            sharpening,
+            curve,
         } = self;
         let styled = styled(styles, style);
         let (face, glyph) = match styled.font.glyph_index(ch) {
@@ -213,22 +313,42 @@ impl Rasterizer for FontRasterizer {
         // Centre a glyph whose advance differs from its cells (fallbacks,
         // wide glyphs); the main font's glyphs sit at the cell's left edge.
         let advance = face.font.h_metrics(glyph).0 as f32 * face.scale;
-        let pen_x = if std::ptr::eq(face, styled) && columns == 1 {
+        let mut pen_x = if std::ptr::eq(face, styled) && columns == 1 {
             0.0
         } else {
             ((w as f32 - advance) / 2.0).max(0.0)
         };
+        if sharpening.align_stems {
+            if let Some(b) = face.font.bbox(glyph) {
+                let left = b.x_min as f32 * face.scale + pen_x;
+                pen_x += left.round() - left;
+            }
+        }
         if canvas.width() != w || canvas.height() != h {
             *canvas = Canvas::new(w, h);
         } else {
             canvas.clear();
         }
-        let drawn = {
-            let mut pen = canvas.pen(face.scale, pen_x, m.baseline as f32);
-            face.font.outline(glyph, &mut pen)
+        let passes: &[f32] = if sharpening.snap_stems && face.stem_widen > 0.0 {
+            &[0.0, 1.0]
+        } else {
+            &[0.0]
         };
+        let mut drawn = Ok(false);
+        for &k in passes {
+            let mut pen = canvas.pen(face.scale, pen_x + k * face.stem_widen, m.baseline as f32);
+            drawn = if sharpening.vertical_fit {
+                face.font.outline(glyph, &mut face.fit.apply(&mut pen))
+            } else {
+                face.font.outline(glyph, &mut pen)
+            };
+        }
         if matches!(drawn, Ok(true)) {
-            canvas.to_bytes(&mut out[..w * h]);
+            let out = &mut out[..w * h];
+            canvas.to_bytes(out);
+            if let Some(t) = curve {
+                out.iter_mut().for_each(|v| *v = t[*v as usize]);
+            }
         }
     }
 }
@@ -271,6 +391,21 @@ mod tests {
             });
             assert!(left > 0 && right > 0, "ink in both halves: {left} {right}");
         }
+        // Sharpening changes the look but not the ink much; OFF is the raw
+        // outline.
+        let sharp = raster(&mut r, 'x', 0, 1);
+        r.set_sharpening(Sharpening::OFF);
+        let raw = raster(&mut r, 'x', 0, 1);
+        assert_ne!(sharp, raw, "fitting moves edges");
+        r.set_sharpening(Sharpening {
+            gamma: 0.7,
+            ..Sharpening::OFF
+        });
+        assert!(
+            ink(&raster(&mut r, 'x', 0, 1)) > ink(&raw),
+            "gamma < 1 thickens"
+        );
+        r.set_sharpening(Sharpening::default());
         // A character no font has is blank, not a panic.
         assert!(raster(&mut r, '\u{10FFFD}', 0, 1).iter().all(|&v| v == 0));
     }
