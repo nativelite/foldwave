@@ -1351,7 +1351,7 @@ One concern each; names are placeholders.
 | `vterm-rs` next | emulator with compact lines, checkpoint/restore, no whole-screen clones | extend ours; study Ghostty's `PageList` (MIT) and Windows Terminal's `textBuffer` (MIT) |
 | `textindex` | n-gram index over log segments | reimplement likely (small) |
 | `governor` | budgets from machine pressure | extract from atrium (memguard, compile pool, job/cgroup) |
-| `glyphs` | font loading and rasterization | evaluate a permissive rasterizer first |
+| `glyphs` | font loading and rasterization | **built as [`glyphs-rs`](https://github.com/nativelite/glyphs-rs)** (2026-09-22): our own TrueType parser and exact-area rasterizer, the technique of stb_truetype / font-rs re-derived, no code taken (§8.6) |
 | `gpu-*` | per-platform draw backends (D3D11, Metal, Vulkan/GL) + CPU fallback | study Windows Terminal's AtlasEngine (MIT, D3D + D2D fallback) and Ghostty's Metal/OpenGL renderers (MIT) |
 | `http-rs` (or reuse `web-server-rs` parts) | minimal HTTP client over std sockets, for a local model server | our own; std has none |
 | `gpuscan` (spike) | optional GPU text scan: CUDA Driver API, Vulkan/Metal later, CPU fallback | spike only if the M0 harness shows unindexed scans matter |

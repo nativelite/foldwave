@@ -28,7 +28,12 @@ name = "nativelite-fwrender"
 version = "0.1.0"
 dependencies = [
  "nativelite-ansi",
+ "nativelite-glyphs",
 ]
+
+[[package]]
+name = "nativelite-glyphs"
+version = "0.1.0"
 
 [[package]]
 name = "nativelite-panelog"
