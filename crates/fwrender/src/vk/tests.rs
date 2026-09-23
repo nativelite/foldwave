@@ -252,179 +252,6 @@ fn the_wrong_atlas_is_rejected() {
     );
 }
 
-// ------------------------------------------------------- a minimal window
-
-mod win32 {
-    use std::ffi::c_void;
-
-    pub type Hwnd = *mut c_void;
-
-    /// `WNDCLASSEXW` (winuser.h).
-    #[repr(C)]
-    pub struct WndClassExW {
-        pub cb_size: u32,
-        pub style: u32,
-        pub wnd_proc: unsafe extern "system" fn(Hwnd, u32, usize, isize) -> isize,
-        pub cls_extra: i32,
-        pub wnd_extra: i32,
-        pub instance: *mut c_void,
-        pub icon: *mut c_void,
-        pub cursor: *mut c_void,
-        pub background: *mut c_void,
-        pub menu_name: *const u16,
-        pub class_name: *const u16,
-        pub icon_small: *mut c_void,
-    }
-
-    pub const WS_POPUP: u32 = 0x8000_0000;
-    pub const WS_VISIBLE: u32 = 0x1000_0000;
-    pub const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
-    pub const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
-    pub const SWP_NOMOVE: u32 = 0x0002;
-    pub const SWP_NOZORDER: u32 = 0x0004;
-    pub const SWP_NOACTIVATE: u32 = 0x0010;
-    pub const PM_REMOVE: u32 = 0x0001;
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        pub fn GetModuleHandleW(name: *const u16) -> *mut c_void;
-    }
-
-    #[link(name = "user32")]
-    extern "system" {
-        pub fn RegisterClassExW(class: *const WndClassExW) -> u16;
-        pub fn UnregisterClassW(name: *const u16, instance: *mut c_void) -> i32;
-        pub fn CreateWindowExW(
-            ex_style: u32,
-            class: *const u16,
-            title: *const u16,
-            style: u32,
-            x: i32,
-            y: i32,
-            w: i32,
-            h: i32,
-            parent: Hwnd,
-            menu: *mut c_void,
-            instance: *mut c_void,
-            param: *mut c_void,
-        ) -> Hwnd;
-        pub fn DestroyWindow(hwnd: Hwnd) -> i32;
-        pub fn DefWindowProcW(hwnd: Hwnd, msg: u32, w: usize, l: isize) -> isize;
-        pub fn SetWindowPos(
-            hwnd: Hwnd,
-            after: Hwnd,
-            x: i32,
-            y: i32,
-            cx: i32,
-            cy: i32,
-            flags: u32,
-        ) -> i32;
-        pub fn PeekMessageW(msg: *mut c_void, hwnd: Hwnd, min: u32, max: u32, remove: u32) -> i32;
-        pub fn TranslateMessage(msg: *const c_void) -> i32;
-        pub fn DispatchMessageW(msg: *const c_void) -> isize;
-    }
-
-    /// A tiny borderless tool window, destroyed on drop.
-    pub struct Window {
-        pub hinstance: *mut c_void,
-        pub hwnd: Hwnd,
-        class: Vec<u16>,
-    }
-
-    impl Window {
-        pub fn new(w: i32, h: i32) -> Option<Window> {
-            let class: Vec<u16> = "fwrender-vk-test\0".encode_utf16().collect();
-            // SAFETY: plain Win32 calls with NUL-terminated UTF-16 strings
-            // that outlive them; DefWindowProcW is a valid window procedure.
-            unsafe {
-                let hinstance = GetModuleHandleW(std::ptr::null());
-                let wc = WndClassExW {
-                    cb_size: std::mem::size_of::<WndClassExW>() as u32,
-                    style: 0,
-                    wnd_proc: DefWindowProcW,
-                    cls_extra: 0,
-                    wnd_extra: 0,
-                    instance: hinstance,
-                    icon: std::ptr::null_mut(),
-                    cursor: std::ptr::null_mut(),
-                    background: std::ptr::null_mut(),
-                    menu_name: std::ptr::null(),
-                    class_name: class.as_ptr(),
-                    icon_small: std::ptr::null_mut(),
-                };
-                RegisterClassExW(&wc); // an existing class is fine
-                let hwnd = CreateWindowExW(
-                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                    class.as_ptr(),
-                    class.as_ptr(),
-                    WS_POPUP | WS_VISIBLE,
-                    0,
-                    0,
-                    w,
-                    h,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    hinstance,
-                    std::ptr::null_mut(),
-                );
-                if hwnd.is_null() {
-                    return None;
-                }
-                Some(Window {
-                    hinstance,
-                    hwnd,
-                    class,
-                })
-            }
-        }
-
-        pub fn resize(&self, w: i32, h: i32) {
-            // SAFETY: a live window owned by this struct.
-            unsafe {
-                SetWindowPos(
-                    self.hwnd,
-                    std::ptr::null_mut(),
-                    0,
-                    0,
-                    w,
-                    h,
-                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-            }
-        }
-
-        /// Drain this thread's message queue.
-        pub fn pump(&self) {
-            // `MSG` is 48 bytes on x64; reserve more, 8-aligned.
-            let mut msg = [0u64; 8];
-            // SAFETY: `msg` is a writable buffer at least as large as MSG.
-            unsafe {
-                while PeekMessageW(
-                    msg.as_mut_ptr().cast(),
-                    std::ptr::null_mut(),
-                    0,
-                    0,
-                    PM_REMOVE,
-                ) != 0
-                {
-                    TranslateMessage(msg.as_ptr().cast());
-                    DispatchMessageW(msg.as_ptr().cast());
-                }
-            }
-        }
-    }
-
-    impl Drop for Window {
-        fn drop(&mut self) {
-            // SAFETY: the window and class this struct created.
-            unsafe {
-                DestroyWindow(self.hwnd);
-                UnregisterClassW(self.class.as_ptr(), self.hinstance);
-            }
-        }
-    }
-}
-
 #[test]
 fn a_window_swapchain_draws_resizes_and_draws_again() {
     let palette = Palette::default();
@@ -434,17 +261,22 @@ fn a_window_swapchain_draws_resizes_and_draws_again() {
     let mut frame = Frame::new();
     frame.update(&s, true, &palette, &mut atlas, &mut raster);
 
-    let Some(window) = win32::Window::new(96, 80) else {
-        println!("skipping: could not create a window");
-        return;
+    let mut window = match crate::win::Window::new("fwrender vk test", 96, 80) {
+        Ok(w) => w,
+        Err(e) => {
+            println!("skipping: could not create a window: {e}");
+            return;
+        }
     };
+    let mut events = Vec::new();
+    let (w, h) = window.client_size();
     // SAFETY: the window outlives the renderer (dropped after it below).
     let made = unsafe {
         VkRenderer::for_window(
-            window.hinstance,
-            window.hwnd,
-            96,
-            80,
+            window.hinstance(),
+            window.hwnd(),
+            w,
+            h,
             &atlas,
             PresentMode::Fifo,
         )
@@ -465,7 +297,7 @@ fn a_window_swapchain_draws_resizes_and_draws_again() {
 
     let mut drawn = 0;
     for i in 0..10 {
-        window.pump();
+        window.poll(&mut events);
         let text = format!("frame {i}");
         s.write_str(i % 4, 0, &text, Style::default());
         frame.update(&s, i % 3 == 0, &palette, &mut atlas, &mut raster);
@@ -477,8 +309,8 @@ fn a_window_swapchain_draws_resizes_and_draws_again() {
     }
     assert!(drawn > 0, "at least one frame reached the swapchain");
 
-    window.resize(130, 70);
-    window.pump();
+    window.set_client_size(130, 70).expect("resize the window");
+    window.poll(&mut events);
     gpu.resize(130, 70).expect("resize");
     s.write_str(0, 0, "resized", Style::default());
     frame.update(&s, true, &palette, &mut atlas, &mut raster);
@@ -487,7 +319,7 @@ fn a_window_swapchain_draws_resizes_and_draws_again() {
     assert_eq!(gpu.size(), (130, 70), "the swapchain follows the window");
     frame.clear_damage();
     for _ in 0..3 {
-        window.pump();
+        window.poll(&mut events);
         gpu.draw(&frame, &mut atlas).expect("draw");
     }
     drop(gpu);

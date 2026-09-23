@@ -34,6 +34,7 @@ pub mod echo;
 pub mod emit;
 pub mod flood;
 pub mod fsm;
+pub mod glyphs;
 pub mod gpu;
 pub mod history;
 pub mod noise;

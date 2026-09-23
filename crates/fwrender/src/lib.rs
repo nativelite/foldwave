@@ -30,6 +30,7 @@
 
 mod atlas;
 mod cpu;
+mod font;
 mod frame;
 pub mod spirv;
 #[cfg(windows)]
@@ -39,4 +40,5 @@ pub mod win;
 
 pub use atlas::{Atlas, GlyphKey, GlyphPart, Metrics, Rasterizer, TestRasterizer, BOLD, ITALIC};
 pub use cpu::{blend, CpuRenderer};
+pub use font::{system_font_dir, FontFile, FontRasterizer};
 pub use frame::{CellInstance, Frame, Palette, STRIKE, UNDERLINE};

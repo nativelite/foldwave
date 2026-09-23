@@ -36,9 +36,15 @@ modes:
                 out) for --seconds (default 10), drawn by --backend cpu|vulkan;
                 times frame update, render, present and output-to-present
                 latency, then idles 3 s and counts frames and CPU. --present
-                fifo|mailbox|immediate (vulkan), --font NAME (default
-                Consolas), --px N (default 16), --size WxH (default 1600x900),
-                --max-fps N caps the frame rate (default 0: draw on change)
+                fifo|mailbox|immediate (vulkan), --px N (default 16), --size
+                WxH (default 1600x900), --max-fps N caps the frame rate
+                (default 0: draw on change). Glyphs come from our TrueType
+                rasterizer with the system's Consolas files; --gdi uses
+                Windows GDI instead, with --font NAME (default Consolas)
+  glyphs        M3: our TrueType rasterizer (Consolas files) against GDI
+                (--font, default Consolas) at --px (default 16): time per glyph
+                over printable ASCII regular + bold, --reps rounds (default 5),
+                and the mean coverage difference
   gpu           host<->GPU copy cost via the CUDA driver (pinned and pageable,
                 64 KiB..64 MiB); --samples copies per cell (default 200)
   read          read rate of --path DIR, unbuffered and buffered, with the CPU
@@ -95,6 +101,7 @@ enum Mode {
     CrashWriter,
     History,
     Render,
+    Glyphs,
     Emit { bytes: u64 },
 }
 
@@ -138,6 +145,7 @@ struct RenderArgs {
     px: i32,
     size: (u32, u32),
     max_fps: u32,
+    gdi: bool,
 }
 
 impl Default for RenderArgs {
@@ -150,6 +158,7 @@ impl Default for RenderArgs {
             px: 16,
             size: (1600, 900),
             max_fps: 0,
+            gdi: false,
         }
     }
 }
@@ -224,6 +233,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                 mode = Some(Mode::Render);
                 i += 1;
             }
+            "glyphs" => {
+                mode = Some(Mode::Glyphs);
+                i += 1;
+            }
             "--backend" => {
                 let v = value(&mut i, "--backend")?;
                 if v != "cpu" && v != "vulkan" {
@@ -245,6 +258,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                 render.present = v;
             }
             "--font" => render.font = value(&mut i, "--font")?,
+            "--gdi" => {
+                render.gdi = true;
+                i += 1;
+            }
             "--max-fps" => {
                 let v = value(&mut i, "--max-fps")?;
                 render.max_fps = v.parse().map_err(|_| format!("bad --max-fps {v:?}"))?;
@@ -621,6 +638,10 @@ fn run(args: &Args) -> i32 {
         return run_render(args);
     }
 
+    if args.mode == Mode::Glyphs {
+        return run_glyphs(args);
+    }
+
     if args.mode == Mode::History {
         let plan = history::Plan {
             dir: std::path::PathBuf::from(args.path.as_deref().unwrap_or(".")),
@@ -806,7 +827,8 @@ fn run(args: &Args) -> i32 {
         | Mode::Replay
         | Mode::CrashWriter
         | Mode::History
-        | Mode::Render => {
+        | Mode::Render
+        | Mode::Glyphs => {
             unreachable!("handled above")
         }
         Mode::Flood => {
@@ -1180,7 +1202,12 @@ mod tests {
 fn run_render(args: &Args) -> i32 {
     use fwbench::render;
     let r = &args.render;
-    let mut raster = match fwrender::win::GdiRasterizer::new(&r.font, r.px) {
+    let raster: io::Result<Box<dyn fwrender::Rasterizer>> = if r.gdi {
+        fwrender::win::GdiRasterizer::new(&r.font, r.px).map(|g| Box::new(g) as _)
+    } else {
+        fwrender::FontRasterizer::consolas(r.px as f32).map(|f| Box::new(f) as _)
+    };
+    let mut raster = match raster {
         Ok(g) => g,
         Err(e) => {
             eprintln!("fwbench: font {:?} at {} px: {e}", r.font, r.px);
@@ -1206,7 +1233,7 @@ fn run_render(args: &Args) -> i32 {
         }
     };
     eprintln!("render: {} for {} s...", target.name(), r.seconds);
-    match render::run(&config, target.as_mut(), &mut raster) {
+    match render::run(&config, target.as_mut(), raster.as_mut()) {
         Ok(out) => {
             print!("{}", render::render(&config, &out));
             0
@@ -1221,5 +1248,40 @@ fn run_render(args: &Args) -> i32 {
 #[cfg(not(windows))]
 fn run_render(_: &Args) -> i32 {
     eprintln!("fwbench: render mode is Windows-only in the M3 spike");
+    1
+}
+
+/// `glyphs` mode: our rasterizer against GDI.
+#[cfg(windows)]
+fn run_glyphs(args: &Args) -> i32 {
+    use fwbench::glyphs;
+    let r = &args.render;
+    let px = r.px as f32;
+    let mut ours = match fwrender::FontRasterizer::consolas(px) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("fwbench: our rasterizer: {e}");
+            return 1;
+        }
+    };
+    let mut gdi = match fwrender::win::GdiRasterizer::new(&r.font, r.px) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("fwbench: GDI {:?}: {e}", r.font);
+            return 1;
+        }
+    };
+    let runs = vec![
+        glyphs::time("glyphs (ours)", &mut ours, args.reps),
+        glyphs::time("GDI", &mut gdi, args.reps),
+    ];
+    let diff = glyphs::difference(&mut ours, &mut gdi);
+    print!("{}", glyphs::render(&r.font, px, &runs, diff));
+    0
+}
+
+#[cfg(not(windows))]
+fn run_glyphs(_: &Args) -> i32 {
+    eprintln!("fwbench: glyphs compares against GDI, so it is Windows-only");
     1
 }

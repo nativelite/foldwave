@@ -212,8 +212,16 @@ impl Window {
             },
         };
 
-        // Size the frame for the requested client area at the DPI of the
-        // monitor the window actually landed on.
+        window.set_client_size(width, height)?;
+        // SAFETY: `hwnd` is live. The return value is the previous visibility.
+        unsafe { ShowWindow(hwnd, SW_SHOW) };
+        Ok(window)
+    }
+
+    /// Resize the window so its client area is `width x height` physical
+    /// pixels, at the DPI of the monitor it is on. The resulting
+    /// [`Event::Resized`] arrives with the next `poll` / `wait`.
+    pub fn set_client_size(&self, width: u32, height: u32) -> io::Result<()> {
         let mut r = Rect {
             left: 0,
             top: 0,
@@ -222,10 +230,10 @@ impl Window {
         };
         // SAFETY: `hwnd` is live; `r` is a valid in/out RECT.
         let ok = unsafe {
-            let dpi = GetDpiForWindow(hwnd);
-            AdjustWindowRectExForDpi(&mut r, style, 0, 0, dpi) != 0
+            let dpi = GetDpiForWindow(self.hwnd);
+            AdjustWindowRectExForDpi(&mut r, WS_OVERLAPPEDWINDOW, 0, 0, dpi) != 0
                 && SetWindowPos(
-                    hwnd,
+                    self.hwnd,
                     std::ptr::null_mut(),
                     0,
                     0,
@@ -234,12 +242,11 @@ impl Window {
                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
                 ) != 0
         };
-        if !ok {
-            return Err(last_error("sizing the window"));
+        if ok {
+            Ok(())
+        } else {
+            Err(last_error("sizing the window"))
         }
-        // SAFETY: `hwnd` is live. The return value is the previous visibility.
-        unsafe { ShowWindow(hwnd, SW_SHOW) };
-        Ok(window)
     }
 
     /// The `HWND`, for creating a GPU surface.

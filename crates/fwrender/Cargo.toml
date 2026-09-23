@@ -14,6 +14,7 @@ repository.workspace = true
 # redistributed.)
 [dependencies]
 ansi = { package = "nativelite-ansi", version = "0.4.0", path = "../../../ansi-rs" }
+glyphs = { package = "nativelite-glyphs", version = "0.1.0", path = "../../../glyphs-rs" }
 
 [lib]
 name = "fwrender"
