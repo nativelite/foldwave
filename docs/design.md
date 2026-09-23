@@ -1216,6 +1216,32 @@ measure it.
   - **The pipe lane is 4.6× Windows Terminal.** That pane now spends ~115 ms
     per 64 MiB emulating: parser ~30, UTF-8 decode ~28, the rest in `vterm`
     and the screen.
+- **Third pass: ASCII skips the decoder, and 16 panes at once (2026-09-23).**
+  - With no partial character held (`ansi::Utf8Decoder::is_idle`), plain
+    ASCII text goes straight to the cells: `vterm` 570 → **631 MiB/s** (3.4×
+    this morning's 188).
+  - **One pane, pipe lane, 1 GiB:** 613.8 MiB/s on Vulkan (609.4, 613.8,
+    617.0), 618.8 on the CPU backend. That is ~3 % below `vterm` alone, so the
+    renderer's 165 Hz snapshot of the pane costs next to nothing, and the
+    backend does not matter for throughput.
+  - **Sixteen panes at once, pipe lane, measured end to end:** 16 fwterm
+    windows on screen, each fed 1 GiB of agent output by its own emitter,
+    with full emulation and drawing on every pane. Launched together, their
+    emits overlap: finishing times within 0.15–0.16 s of each other.
+
+    | Run | Combined (sum of concurrent panes) | Per pane | Wall clock, window launch included |
+    | --- | --- | --- | --- |
+    | 1 | 4,371 MiB/s | 270–279 MiB/s | ≥ 2,875 MiB/s |
+    | 2 | 4,420 MiB/s | 273–285 MiB/s | ≥ 2,913 MiB/s |
+    | 3 | 4,646 MiB/s | 284–297 MiB/s | ≥ 3,099 MiB/s |
+
+    **Median 4.42 GB/s: 16× the §4 target of 273 MiB/s, and each pane ~16×
+    its 17.1 MiB/s share**, on a noisy machine. The machine's 16 logical cores
+    are shared by 16 emitters, 16 readers and 16 renderers, so this is the
+    whole system under load, not a transport ceiling.
+  - **Not yet measured under this load:** frame rate per pane (§4 wants ≥ 60
+    fps for visible panes), the console lane at 16 panes, and latency while
+    16 panes flood.
 
 ### 8.7 The agent layer
 - **Blocks:** prompt, command, output and exit status from shell-integration
