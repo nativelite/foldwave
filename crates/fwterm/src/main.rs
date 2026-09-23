@@ -1,11 +1,19 @@
 //! `fwterm` — foldwave's minimal terminal prototype.
 //!
-//! One pane: a real shell through ConPTY (the built-in console host, or any
-//! `conpty.dll` given with `--conpty`), `vterm` for the screen, and the
+//! One pane, in one of two lanes, `vterm` for the screen, and the
 //! `fwrender` window and backends for drawing. It exists to be measured
 //! against other terminals with the same outside instruments, so it does the
 //! least a terminal must: keys to the shell, output to the screen, resize.
 //! No scrollback, selection, tabs or configuration yet.
+//!
+//! The lanes (design §8.1):
+//! * **console** (default): the program runs under ConPTY — the built-in
+//!   console host, or any `conpty.dll` given with `--conpty` — for shells and
+//!   full-screen programs that need a console.
+//! * **pipe** (`--pipe`): the program gets no console at all; its stdout and
+//!   stderr come through plain pipes at native speed and its stdin takes the
+//!   keys. For agent CLIs in their documented non-interactive modes. As a
+//!   tty's line discipline would, a bare line feed becomes CR LF.
 //!
 //! Threads: a reader moves shell output into the emulator (answering the
 //! console host's startup queries on the way) and wakes the window; the UI
@@ -44,6 +52,8 @@ options:
   --backend B   vulkan (default; falls back to cpu if Vulkan cannot start) or cpu
   --conpty DLL  host the shell with this conpty.dll (e.g. one that starts an
                 OpenConsole.exe beside it) instead of the built-in console host
+  --pipe        run the program with no console: output over plain pipes
+                (native speed), keys to its stdin
   --px N        font size in pixels per em (default 16)
   --size WxH    client area in pixels (default 1200x720)
   --no-sharpen  draw the raw glyph outlines (no fitting or stem snapping)
@@ -59,6 +69,7 @@ options:
         sharpen: bool,
         max_fps: Option<u32>,
         title: String,
+        pipe: bool,
         shell: Vec<String>,
     }
 
@@ -71,6 +82,7 @@ options:
             sharpen: true,
             max_fps: None,
             title: "fwterm".into(),
+            pipe: false,
             shell: vec!["cmd.exe".into()],
         };
         let mut i = 0;
@@ -104,6 +116,10 @@ options:
                         .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
                         .filter(|&(w, h): &(u32, u32)| w >= 64 && h >= 64)
                         .ok_or(format!("bad --size {v:?}"))?;
+                }
+                "--pipe" => {
+                    a.pipe = true;
+                    i += 1;
                 }
                 "--no-sharpen" => {
                     a.sharpen = false;
@@ -222,6 +238,78 @@ options:
         })
     }
 
+    /// The program on the other side, in either lane.
+    enum Session {
+        Console(pty::Pty),
+        Pipe {
+            child: std::process::Child,
+            stdin: Option<std::process::ChildStdin>,
+        },
+    }
+
+    impl Session {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+            match self {
+                Session::Console(p) => p.write(bytes).map(|_| ()),
+                Session::Pipe { stdin, .. } => match stdin {
+                    Some(s) => io::Write::write_all(s, bytes),
+                    None => Ok(()),
+                },
+            }
+        }
+
+        fn resize(&mut self, rows: u16, cols: u16) {
+            if let Session::Console(p) = self {
+                let _ = p.resize(rows, cols);
+            }
+        }
+
+        fn kill(&mut self) {
+            match self {
+                Session::Console(p) => {
+                    let _ = p.kill();
+                }
+                Session::Pipe { child, .. } => {
+                    let _ = child.kill();
+                }
+            }
+        }
+
+        fn wait(&mut self) -> i32 {
+            match self {
+                Session::Console(p) => p.wait().unwrap_or(0),
+                Session::Pipe { child, .. } => {
+                    child.wait().ok().and_then(|s| s.code()).unwrap_or(0)
+                }
+            }
+        }
+    }
+
+    /// Turns bare line feeds into CR LF, across chunk boundaries, as a tty's
+    /// output processing (ONLCR) does for programs writing to pipes.
+    #[derive(Default)]
+    struct Onlcr {
+        after_cr: bool,
+    }
+
+    impl Onlcr {
+        fn convert<'a>(&mut self, chunk: &'a [u8], out: &'a mut Vec<u8>) -> &'a [u8] {
+            if !chunk.contains(&b'\n') {
+                self.after_cr = chunk.last() == Some(&b'\r');
+                return chunk;
+            }
+            out.clear();
+            for &b in chunk {
+                if b == b'\n' && !self.after_cr {
+                    out.push(b'\r');
+                }
+                out.push(b);
+                self.after_cr = b == b'\r';
+            }
+            out
+        }
+    }
+
     struct Shared {
         term: Mutex<Term>,
         pending: AtomicBool,
@@ -281,38 +369,90 @@ options:
         let grid = |w: u32, h: u32| ((h / m.cell_h).max(1) as u16, (w / m.cell_w).max(1) as u16);
         let (rows, cols) = grid(w, h);
         let shell_args: Vec<&str> = args.shell[1..].iter().map(String::as_str).collect();
-        let pty = pty::Pty::spawn(&args.shell[0], &shell_args, rows, cols)?;
-        let mut reader = pty.reader()?;
-        let pty = Arc::new(Mutex::new(pty));
         let shared = Arc::new(Shared {
             term: Mutex::new(Term::new(rows as usize, cols as usize)),
             pending: AtomicBool::new(true),
             exited: AtomicBool::new(false),
         });
-
         let waker = surface.window().waker();
-        {
-            let (shared, pty, waker) = (shared.clone(), pty.clone(), waker.clone());
+        // Move one output stream into the emulator until it ends.
+        let pump = |mut source: Box<dyn FnMut(&mut [u8]) -> io::Result<usize> + Send>,
+                    session: Option<Arc<Mutex<Session>>>,
+                    lf_to_crlf: bool,
+                    last: bool| {
+            let (shared, waker) = (shared.clone(), waker.clone());
             std::thread::spawn(move || {
                 let mut buf = vec![0u8; 64 * 1024];
+                let mut converted = Vec::with_capacity(128 * 1024);
+                let mut onlcr = Onlcr::default();
                 let mut watcher = fwbench::terminal::Watcher::new();
                 loop {
-                    let n = match reader.read(&mut buf) {
+                    let n = match source(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => n,
                     };
-                    for reply in watcher.replies(&buf[..n]) {
-                        let _ = pty.lock().unwrap().write(reply);
+                    if let Some(session) = &session {
+                        for reply in watcher.replies(&buf[..n]) {
+                            let _ = session.lock().unwrap().write(reply);
+                        }
                     }
-                    shared.term.lock().unwrap().feed(&buf[..n]);
+                    let bytes = if lf_to_crlf {
+                        onlcr.convert(&buf[..n], &mut converted)
+                    } else {
+                        &buf[..n]
+                    };
+                    shared.term.lock().unwrap().feed(bytes);
                     if !shared.pending.swap(true, Ordering::AcqRel) {
                         waker.wake();
                     }
                 }
-                shared.exited.store(true, Ordering::Release);
-                waker.wake();
+                if last {
+                    shared.exited.store(true, Ordering::Release);
+                    waker.wake();
+                }
             });
-        }
+        };
+        let session = if args.pipe {
+            use std::os::windows::process::CommandExt;
+            use std::process::{Command, Stdio};
+            // CREATE_NO_WINDOW: no console at all, not even a hidden one.
+            let mut child = Command::new(&args.shell[0])
+                .args(&shell_args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .creation_flags(0x0800_0000)
+                .spawn()?;
+            let (mut out, mut err) = (
+                child.stdout.take().expect("piped"),
+                child.stderr.take().expect("piped"),
+            );
+            pump(
+                Box::new(move |b| io::Read::read(&mut err, b)),
+                None,
+                true,
+                false,
+            );
+            pump(
+                Box::new(move |b| io::Read::read(&mut out, b)),
+                None,
+                true,
+                true,
+            );
+            let stdin = child.stdin.take();
+            Arc::new(Mutex::new(Session::Pipe { child, stdin }))
+        } else {
+            let pty = pty::Pty::spawn(&args.shell[0], &shell_args, rows, cols)?;
+            let mut reader = pty.reader()?;
+            let session = Arc::new(Mutex::new(Session::Console(pty)));
+            pump(
+                Box::new(move |b| reader.read(b)),
+                Some(session.clone()),
+                false,
+                true,
+            );
+            session
+        };
 
         let hz = args.max_fps.or_else(display_refresh_hz).unwrap_or(60);
         let min_interval = Duration::from_secs_f64(1.0 / hz as f64);
@@ -348,23 +488,25 @@ options:
                             .lock()
                             .unwrap()
                             .resize(rows as usize, cols as usize);
-                        let _ = pty.lock().unwrap().resize(rows, cols);
+                        session.lock().unwrap().resize(rows, cols);
                         frame.damage_all();
                         shared.pending.store(true, Ordering::Release);
                     }
                     Event::CloseRequested => {
                         // Take the shell down with the window.
-                        let _ = pty.lock().unwrap().kill();
+                        session.lock().unwrap().kill();
                         return Ok(0);
                     }
                     _ => {}
                 }
             }
             if !input.is_empty() {
-                pty.lock().unwrap().write(&input)?;
+                // A pipe program that has exited or closed stdin just
+                // drops the keys.
+                let _ = session.lock().unwrap().write(&input);
             }
             if shared.exited.load(Ordering::Acquire) {
-                return Ok(pty.lock().unwrap().wait().unwrap_or(0));
+                return Ok(session.lock().unwrap().wait());
             }
             if last_draw.map_or(false, |t| t.elapsed() < min_interval) {
                 continue;
@@ -407,9 +549,25 @@ options:
             .unwrap();
             assert_eq!((a.backend.as_str(), a.px), ("cpu", 18.0));
             assert_eq!(a.shell, ["pwsh", "-NoLogo"]);
+            assert!(!a.pipe);
+            assert!(parse(&argv(&["--pipe", "--", "x"])).unwrap().pipe);
             assert!(parse(&argv(&["--backend", "gl"])).is_err());
             assert!(parse(&argv(&["--size", "10x10"])).is_err());
             assert_eq!(parse(&argv(&[])).unwrap().shell, ["cmd.exe"]);
+        }
+
+        #[test]
+        fn bare_line_feeds_become_cr_lf_across_chunks() {
+            let mut o = Onlcr::default();
+            let mut out = Vec::new();
+            assert_eq!(o.convert(b"a\nb\r\nc", &mut out), b"a\r\nb\r\nc");
+            assert_eq!(o.convert(b"x\r", &mut out), b"x\r");
+            assert_eq!(
+                o.convert(b"\ny\n", &mut out),
+                b"\ny\r\n",
+                "CR ended the last chunk"
+            );
+            assert_eq!(o.convert(b"no newline", &mut out), b"no newline");
         }
 
         #[test]

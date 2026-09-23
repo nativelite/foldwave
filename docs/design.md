@@ -1151,9 +1151,32 @@ measure it.
     takes; the pane lock contention seen in `fwbench render`; and how fast
     we drain the pipe. Not yet profiled.
   - **This makes the §11 row 6 decision concrete:** running on the built-in
-    host costs fwterm ~5.5× in throughput. The installed-OpenConsole launcher
-    is still unbuilt, and it is the most valuable missing piece for
-    throughput.
+    host costs fwterm ~5.5× in throughput. Decided 2026-09-23: ship
+    Microsoft's ConPTY package, and use pipes for agents.
+- **The pipe lane (built and measured 2026-09-23).** `fwterm --pipe` starts
+  the program with no console (`CREATE_NO_WINDOW`). Its stdout and stderr
+  reach the emulator through plain pipes, with bare LF turned into CR LF as a
+  tty would. Same `fwprobe throughput`, 3 runs each:
+
+  | fwterm lane | MiB/s (runs) |
+  | --- | --- |
+  | **pipe, 256 MiB** | **173.1** (172.2, 173.1, 173.3) |
+  | pipe, 32 MiB | 169.8 (159.4, 169.8, 170.5) |
+  | pipe, emulation switched off (one-off experiment, 1 GiB) | 1,249 (1,238, 1,249, 1,258) |
+  | console, OpenConsole 1.24 | 82.9 |
+  | console, built-in conhost | 14.9 |
+
+  - **The pipe lane is 1.5× Windows Terminal (115.2) and 11.6× fwterm on
+    conhost** for the same output.
+  - **The limit is now our emulator, not the transport.** One pane's full
+    emulation (a full-screen scroll per line) runs at ~173 MiB/s on one core,
+    and without it the same path moves 1,249 MiB/s. 173 MiB/s is already ~10×
+    the §4 per-pane need (17.1 MiB/s); per-pane emulation speed is the next
+    lever for single floods, alongside §8.0's cheaper path for panes nobody
+    is looking at.
+  - **Other terminals have no pipe lane:** they run every program under a
+    console. This is foldwave's structural advantage for agent output, not a
+    tuning win.
 
 ### 8.7 The agent layer
 - **Blocks:** prompt, command, output and exit status from shell-integration
@@ -1481,7 +1504,7 @@ Founder answers of 2026-09-15.
 | 3 | Reusing open source | **Inspiration over original code.** Copying is a rare exception | Now in [standards/zero-dependency.md](https://github.com/nativelite/ops/blob/main/standards/zero-dependency.md). Inspiration needs no notice; any copied code keeps its MIT/Apache notice (a legal requirement) |
 | 4 | GPU binding | **Our own bindings, not wgpu.** **Founder decision (2026-09-22), after the M3 spike: Vulkan first**, CPU fallback, Metal later | The spike found Vulkan on Windows pixel-exact against the CPU reference, at ~0.2 ms of CPU per frame at any window size (§8.6), so there is no case for D3D11 or D3D12. One thing to watch: FIFO presentation did not pace to the 164 Hz display on the reference machine, and we pace frames ourselves. If pacing or remote desktop ever fall short, a DXGI flip-model present path is the Windows-native answer to test |
 | 5 | Platforms | **Windows first**, groundwork for others | Vulkan and a pane-transport interface keep Linux close; macOS gets Metal later |
-| 6 | Console host | **Decide by measurement (experiment E2).** Founder wants the most performant option. **Measured 2026-09-22: OpenConsole is clearly better** (3× throughput, p99 under a flood 0.31–0.43 ms vs 6.2–9.9 ms, 6× less host CPU per byte). **Founder decision (2026-09-22): use OpenConsole, never depend on it.** At each start foldwave looks for the `OpenConsole.exe` that Windows Terminal installs (its path changes with every Terminal update), launches it with our own launcher, and falls back to the built-in `conhost.exe` whenever it is missing or fails — removing Windows Terminal makes those panes slower, never broken. Bundling Microsoft's binaries is **not** approved | Built-in host vs bundled OpenConsole, below. Either way agents run headless over pipes where they document it, and Linux/macOS use ptys |
+| 6 | Console host | **Decide by measurement (experiment E2).** Founder wants the most performant option. **Measured 2026-09-22: OpenConsole is clearly better** (3× throughput, p99 under a flood 0.31–0.43 ms vs 6.2–9.9 ms, 6× less host CPU per byte). ~~Founder decision (2026-09-22): use the OpenConsole that Windows Terminal installs, through our own launcher; bundling Microsoft's binaries not approved.~~ **Superseded — founder decision (2026-09-23): two lanes.** (1) Agents run with no console, over plain pipes, wherever they document a non-interactive mode: native transport, measured 4.1–4.3 GB/s per pane. (2) Everything that needs a console runs under **Microsoft's `Microsoft.Windows.Console.ConPTY` package (MIT), shipped with foldwave** — `conpty.dll` plus the `OpenConsole.exe` beside it — falling back to the built-in `conhost.exe` whenever it is missing or fails to start (slower, never broken). Why the change: Microsoft documents only `CreatePseudoConsole` (built-in host) and this package; driving Terminal's installed copy needs undocumented console-driver calls that only Windows Terminal itself makes, while WezTerm and Microsoft's node-pty ship the package (§8.6, `prior-art.md`). A console driver of our own was ruled out: console programs reach Windows' driver whatever we install, and programs that could be changed to use ours can use a pipe instead | Measured below and in §8.6. Linux/macOS use ptys |
 | 7 | GPU compute | **Use the GPU wherever it helps**, balanced across SSD, RAM, GPU and CPU | Every GPU path gets a CPU path and a benchmark; §8.7a lists the candidates; local AI stays out of process |
 | 8 | Targets | **Confirmed**, plus **fault isolation**: a crash recovers without taking the ship down | §4 targets; §8.8a design |
 | 9 | Leveraging the whole machine | **Aim offload at work that is GPU-shaped, not at the utilization number.** The governor's first input is CPU pressure | Founder observation 2026-09-15: CPU 80–99% while the GPU idles. §8.7b places every stage and names what will never move; index construction (§8.7a) is the new GPU candidate; E3 measures it |
