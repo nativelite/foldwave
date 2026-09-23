@@ -12,6 +12,7 @@ repository.workspace = true
 [dependencies]
 pty = { package = "nativelite-pty", version = "0.4.1", path = "../../../pty-rs" }
 vterm = { package = "nativelite-vterm", version = "0.5.3", path = "../../../vterm-rs" }
+panelog = { package = "nativelite-panelog", version = "0.1.0", path = "../../../panelog-rs" }
 fwrender = { package = "nativelite-fwrender", version = "0.1.0", path = "../fwrender" }
 fwbench = { package = "nativelite-fwbench", version = "0.1.0", path = "../fwbench" }
 

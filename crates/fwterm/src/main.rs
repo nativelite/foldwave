@@ -3,8 +3,9 @@
 //! One pane, in one of two lanes, `vterm` for the screen, and the
 //! `fwrender` window and backends for drawing. It exists to be measured
 //! against other terminals with the same outside instruments, so it does the
-//! least a terminal must: keys to the shell, output to the screen, resize.
-//! No scrollback, selection, tabs or configuration yet.
+//! least a terminal must: keys to the shell, output to the screen, resize,
+//! and scrollback — recent lines in memory, older ones rebuilt from the
+//! pane's panelog (`--log`). No selection, tabs or configuration yet.
 //!
 //! The lanes (design §8.1):
 //! * **console** (default): the program runs under ConPTY — the built-in
@@ -64,6 +65,10 @@ options:
   --history N   lines of scrollback kept in memory (default 10000); scroll
                 with the mouse wheel or Shift+PageUp/PageDown, and typing
                 returns to the bottom
+  --log DIR     keep this pane's whole output in a panelog under DIR (a new
+                folder per pane), with a screen checkpoint each MiB; scrolling
+                past the in-memory history then continues from the log.
+                Off by default: nothing bounds a log's size yet
   --stats PATH  on exit, write frame statistics for the time output flowed:
                 frames, frames per second, gaps between frames
 ";
@@ -79,6 +84,7 @@ options:
         pipe: bool,
         stats: Option<String>,
         history: usize,
+        log: Option<String>,
         shell: Vec<String>,
     }
 
@@ -94,6 +100,7 @@ options:
             pipe: false,
             stats: None,
             history: 10_000,
+            log: None,
             shell: vec!["cmd.exe".into()],
         };
         let mut i = 0;
@@ -147,6 +154,7 @@ options:
                 }
                 "--title" => a.title = value(&mut i, "--title")?,
                 "--stats" => a.stats = Some(value(&mut i, "--stats")?),
+                "--log" => a.log = Some(value(&mut i, "--log")?),
                 "--history" => {
                     let v = value(&mut i, "--history")?;
                     a.history = v.parse().map_err(|_| format!("bad --history {v:?}"))?;
@@ -301,10 +309,139 @@ options:
         }
     }
 
+    /// What the reader threads hand the logger, in the order the emulator saw
+    /// it (sent while holding the pane lock).
+    enum LogMsg {
+        Data(Vec<u8>, u64),
+        Checkpoint(Vec<u8>),
+        /// Flush now and answer (on exit, so no output is lost).
+        Flush(std::sync::mpsc::Sender<()>),
+    }
+
+    /// Chunks the logger may lag behind by (64 KiB each: 4 MiB). Past this the
+    /// reader waits for the disk: memory stays bounded, output is never lost.
+    const LOG_QUEUE: usize = 64;
+
+    /// Checkpoint the screen once this much output has passed since the last.
+    const CHECKPOINT_EVERY: u64 = 1024 * 1024;
+
+    /// Start the logger thread: appends output and checkpoints to a new
+    /// panelog under `dir`, flushing whenever it has nothing waiting so the
+    /// log is readable up to the recent past. Returns the sender and the log
+    /// folder.
+    fn start_logger(
+        dir: &str,
+    ) -> io::Result<(std::sync::mpsc::SyncSender<LogMsg>, std::path::PathBuf)> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let folder = std::path::Path::new(dir).join(format!("pane-{stamp}-{}", std::process::id()));
+        std::fs::create_dir_all(&folder)?;
+        let cfg = panelog::Config {
+            pane: u64::from(std::process::id()),
+            ..panelog::Config::default()
+        };
+        let mut writer = panelog::Writer::create(&folder, cfg)?;
+        let (tx, rx) = std::sync::mpsc::sync_channel::<LogMsg>(LOG_QUEUE);
+        std::thread::spawn(move || {
+            let mut dirty = false;
+            loop {
+                match rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(LogMsg::Data(bytes, t)) => {
+                        if writer.append(&bytes, t).is_err() {
+                            return;
+                        }
+                        dirty = true;
+                    }
+                    Ok(LogMsg::Checkpoint(blob)) => {
+                        let _ = writer.checkpoint(&blob);
+                        dirty = true;
+                    }
+                    Ok(LogMsg::Flush(done)) => {
+                        let _ = writer.flush();
+                        dirty = false;
+                        let _ = done.send(());
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if dirty {
+                            let _ = writer.flush();
+                            dirty = false;
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        let _ = writer.flush();
+                        return;
+                    }
+                }
+            }
+        });
+        Ok((tx, folder))
+    }
+
+    /// A pane rebuilt from its log at some past line: the scrollback beyond
+    /// what memory holds.
+    struct Deep {
+        reader: panelog::Reader,
+        /// Lines in the log when it was opened; the view is measured from here.
+        total: u64,
+        /// The log line the rebuilt screen ends before, and the rebuilt term.
+        at: u64,
+        term: Term,
+    }
+
+    impl Deep {
+        fn open(folder: &std::path::Path) -> io::Result<Deep> {
+            let reader = panelog::Reader::open(folder)?;
+            let total = reader.line_count();
+            Ok(Deep {
+                reader,
+                total,
+                at: u64::MAX,
+                term: Term::new(1, 1),
+            })
+        }
+
+        /// Rebuild the screen as it was when the log reached line `end`:
+        /// restore the nearest checkpoint before it, replay the rest.
+        fn rebuild(&mut self, end: u64, rows: usize, cols: usize, pipe: bool) -> io::Result<()> {
+            if end == self.at {
+                return Ok(());
+            }
+            let offset = self.reader.line_start(end.min(self.total))?;
+            let (mut term, from) = match self.reader.checkpoint_before(offset)? {
+                Some((at, blob)) => match Term::restore(&blob) {
+                    Ok(t) => (t, at),
+                    Err(_) => (Term::new(rows, cols), 0),
+                },
+                None => (Term::new(rows, cols), 0),
+            };
+            if from == 0 && pipe {
+                term.feed(b"\x1b[20h");
+            }
+            let mut buf = vec![0u8; 256 * 1024];
+            let mut at = from;
+            while at < offset {
+                let want = ((offset - at) as usize).min(buf.len());
+                let n = self.reader.read_at(at, &mut buf[..want])?;
+                if n == 0 {
+                    break;
+                }
+                term.feed(&buf[..n]);
+                at += n as u64;
+            }
+            self.term = term;
+            self.at = end;
+            Ok(())
+        }
+    }
+
     struct Shared {
         term: Mutex<Term>,
         pending: AtomicBool,
         exited: AtomicBool,
+        /// Output since the last checkpoint sent to the log.
+        since_checkpoint: std::sync::atomic::AtomicU64,
         /// The renderer is waiting for `term`; readers step aside. The lock is
         /// not fair, and a reader that releases and immediately re-takes it
         /// otherwise holds the renderer off for tens of milliseconds.
@@ -430,17 +567,25 @@ options:
             }),
             pending: AtomicBool::new(true),
             exited: AtomicBool::new(false),
+            since_checkpoint: std::sync::atomic::AtomicU64::new(0),
             want: AtomicBool::new(false),
             first_output: std::sync::atomic::AtomicU64::new(u64::MAX),
             last_output: std::sync::atomic::AtomicU64::new(0),
             epoch: Instant::now(),
         });
+        let (log_tx, log_folder) = match &args.log {
+            Some(dir) => {
+                let (tx, folder) = start_logger(dir)?;
+                (Some(tx), Some(folder))
+            }
+            None => (None, None),
+        };
         let waker = surface.window().waker();
         // Move one output stream into the emulator until it ends.
         let pump = |mut source: Box<dyn FnMut(&mut [u8]) -> io::Result<usize> + Send>,
                     session: Option<Arc<Mutex<Session>>>,
                     last: bool| {
-            let (shared, waker) = (shared.clone(), waker.clone());
+            let (shared, waker, log_tx) = (shared.clone(), waker.clone(), log_tx.clone());
             std::thread::spawn(move || {
                 let mut buf = vec![0u8; 64 * 1024];
                 let mut watcher = fwbench::terminal::Watcher::new();
@@ -457,8 +602,26 @@ options:
                     while shared.want.load(Ordering::Acquire) {
                         std::thread::yield_now();
                     }
-                    shared.term.lock().unwrap().feed(&buf[..n]);
                     let now = shared.epoch.elapsed().as_nanos() as u64;
+                    {
+                        let mut term = shared.term.lock().unwrap();
+                        term.feed(&buf[..n]);
+                        // Log in the order the emulator saw it, and checkpoint
+                        // at a point the replay can resume from.
+                        if let Some(tx) = &log_tx {
+                            let _ = tx.send(LogMsg::Data(buf[..n].to_vec(), now));
+                            let since = shared
+                                .since_checkpoint
+                                .fetch_add(n as u64, Ordering::AcqRel)
+                                + n as u64;
+                            if since >= CHECKPOINT_EVERY {
+                                if let Some(blob) = term.checkpoint() {
+                                    let _ = tx.send(LogMsg::Checkpoint(blob));
+                                    shared.since_checkpoint.store(0, Ordering::Release);
+                                }
+                            }
+                        }
+                    }
                     shared.first_output.fetch_min(now, Ordering::AcqRel);
                     shared.last_output.store(now, Ordering::Release);
                     if !shared.pending.swap(true, Ordering::AcqRel) {
@@ -516,6 +679,16 @@ options:
         // line count when last drawn, so the view stays on the same text
         // while output keeps scrolling in.
         let (mut back, mut seen_scrolled) = (0usize, 0u64);
+        let mut deep: Option<Deep> = None;
+        // On exit: have the logger write out what it holds (bounded wait).
+        let flush_log = || {
+            if let Some(tx) = &log_tx {
+                let (done, wait) = std::sync::mpsc::channel();
+                if tx.send(LogMsg::Flush(done)).is_ok() {
+                    let _ = wait.recv_timeout(Duration::from_secs(2));
+                }
+            }
+        };
         let page = |h: u32| (h / m.cell_h).max(2) as usize - 1;
         let mut frames: Vec<u64> = Vec::new();
         let finish = |frames: &[u64]| {
@@ -583,6 +756,7 @@ options:
                     }
                     Event::CloseRequested => {
                         finish(&frames);
+                        flush_log();
                         // Take the shell down with the window.
                         session.lock().unwrap().kill();
                         return Ok(0);
@@ -597,6 +771,7 @@ options:
             }
             if shared.exited.load(Ordering::Acquire) {
                 finish(&frames);
+                flush_log();
                 return Ok(session.lock().unwrap().wait());
             }
             if last_draw.map_or(false, |t| t.elapsed() < min_interval) {
@@ -614,21 +789,41 @@ options:
                 let scrolled = history.scrolled_lines();
                 if term.in_alternate_screen() {
                     back = 0; // full-screen programs: always live
-                } else if back > 0 {
+                } else if back > 0 && deep.is_none() {
                     // New lines pushed the text we are looking at further up.
                     back += (scrolled - seen_scrolled) as usize;
                 }
                 seen_scrolled = scrolled;
-                back = back.min(history.history_len());
-                frame.update_view(
-                    term.screen(),
-                    history,
-                    back,
-                    true,
-                    &palette,
-                    &mut atlas,
-                    &mut raster,
-                );
+                let held = history.history_len();
+                let (rows, cols) = (term.screen().rows(), term.screen().cols());
+                if back > held && log_folder.is_some() && !term.in_alternate_screen() {
+                    // Past what memory holds: continue from the log. Its
+                    // snapshot is frozen, so the view needs no anchoring.
+                    if deep.is_none() {
+                        deep = log_folder.as_deref().and_then(|f| Deep::open(f).ok());
+                    }
+                    if let Some(d) = deep.as_mut() {
+                        back = back.min(d.total as usize);
+                        // The view's bottom is `back` lines above live, in
+                        // log lines (a wrapped line counts once here, once per
+                        // row in memory, so the hand-over is approximate).
+                        let end = d.total.saturating_sub(back as u64);
+                        let _ = d.rebuild(end.max(1), rows, cols, args.pipe);
+                        frame.update(d.term.screen(), false, &palette, &mut atlas, &mut raster);
+                    }
+                } else {
+                    deep = None;
+                    back = back.min(held);
+                    frame.update_view(
+                        term.screen(),
+                        history,
+                        back,
+                        true,
+                        &palette,
+                        &mut atlas,
+                        &mut raster,
+                    );
+                }
             }
             if frame.damaged_rows() > 0 {
                 surface.draw(&frame, &mut atlas)?;
