@@ -218,7 +218,7 @@ numbers (for example "when the focused pane's frame p99 passes X ms, cap
 inference to N requests"). Until E1 runs, the design assumes nothing about
 contention.
 
-**E1 setup (prepared 2026-09-24; not yet run).**
+**E1 setup (2026-09-24).**
 
 - **Renderer:** fwterm's own Vulkan renderer now exists, so it replaces
   Windows Terminal as the baseline. Frame gaps come from `fwterm --stats`; the
@@ -245,3 +245,54 @@ contention.
 - **Frame timing from outside:** PresentMon 2.6.0 (MIT) is in
   `E:\fwbench-e1\presentmon`. It needs administrator rights or membership in
   the "Performance Log Users" group to start a trace; not granted yet.
+
+**E1 result (measured 2026-09-24, local 164 Hz display, both monitors on the
+RTX 3070, quiet machine).** Scripts: `E:\fwbench-e1\e1.ps1`, `e1b.ps1`.
+
+- **Frames:** fwterm, Vulkan, one pane, 1600x900, pipe lane, 3 GiB of
+  `fwbench --emit`, `--no-log --governor off`, 3 runs per condition, from
+  `fwterm --stats`. PresentMon could not run (no trace permission), so these
+  are fwterm's own frame gaps, not presents seen by the compositor.
+- **Key echo:** `fwprobe latency`, 300 samples per condition, cmd under the
+  bundled OpenConsole. One screen read costs 6.0 ms, which is also the
+  resolution of every sample.
+
+| Load on the GPU | GPU busy, VRAM | Frames: fps, gap p99 / max | Flood span | Key echo p50 / p90 / p99 | The load's own rate |
+| --- | --- | --- | --- | --- | --- |
+| none | 0–3 %, 1.2 GB | 149–152, 6.99–7.42 / 7.20–8.13 ms | 11.5–12.0 s | 6.16 / 9.62 / 13.51 ms | — |
+| inference, 1 stream (Qwen2.5-7B Q4_K_M) | 96 %, 5.8 GB | 151, 7.01–7.05 / 7.26–7.68 ms | 11.8 s | — | 70.6 tok/s (77 alone) |
+| inference, 4 streams | 93 %, 6.4 GB | 151–152, 7.01–7.06 / 7.19–7.55 ms | 11.9 s | 5.40 / 8.25 / 12.03 ms | 236 tok/s |
+| inference, 4 streams, VRAM nearly full (32k context) | 92 %, 7.3 GB | 152, 7.01–7.04 / 7.19–7.48 ms | 11.9–12.0 s | 5.43 / 8.45 / 13.75 ms | 235 tok/s |
+| scan, 1 MiB per launch | 52 %, 1.2 GB | 125–129, 13.57–14.93 / 15.76–18.63 ms | 27.0–30.7 s | 8.44 / 14.29 / 25.32 ms | 21.5 GiB/s, 22,000 launches/s |
+| scan, 4 MiB per launch | — | 151, 7.12 / 7.45 ms | 15.4 s | — | 45.6 GiB/s, 11,700 launches/s |
+| scan, 32 MiB per launch | 91 %, 1.2 GB | 152–153, 6.95–7.02 / 7.13–7.54 ms | 12.5–12.7 s | — | 146 GiB/s |
+| scan, 256 MiB per launch | 97 %, 1.5 GB | 152–153, 6.95–6.98 / 7.16–7.32 ms | 11.9 s | 5.33 / 8.01 / 13.40 ms | 325 GiB/s |
+
+What it says:
+
+- **LLM inference does not cost the terminal anything measurable on this
+  machine.** With the GPU 92–96 % busy generating tokens, and even with 7.3 GB
+  of its 8 GB taken, frames stayed at one refresh (p99 7.0 ms against the
+  6.1 ms refresh) and key echo stayed at idle's numbers or better. Inference
+  kept ~92 % of its solo speed (70.6 against 77 tok/s). Local AI (§8.7a) needs
+  no throttling rule for the renderer's sake.
+- **Bulk compute is harmless in large launches and harmful in small ones.**
+  At 32 or 256 MiB per launch the GPU was 91–97 % busy and frames did not move.
+  At 1 MiB per launch, about 22,000 synchronous launches a second, frame p99
+  doubled (to 13.6–14.9 ms), key echo p99 almost doubled (25.3 ms), and the
+  flood through fwterm took 2.3× as long. At 4 MiB per launch (11,700 a second)
+  the harm was gone from frames, with the flood span only slightly longer. The
+  scanner's CPU was one busy core in every case (43.8–45.2 s over 45 s), so the
+  cost is the GPU switching between compute and graphics on every launch, not
+  CPU.
+- **The governor rule this gives:** GPU compute runs in batches of at least
+  4 MiB and at most ~10,000 launches a second. There is no rule for inference,
+  and no VRAM-pressure rule at up to 7.3 of 8 GB.
+- **Key echo:** 300 samples each, none missed. The idle p99 of 13.5 ms is
+  instrument-limited (6.0 ms per screen read, plus the shell); §4's
+  p99 < 5 ms still needs a finer instrument. The founder's bar, parity with
+  Windows Terminal, is met: on the same display, fwterm measured 7.08 / 12.48 ms
+  (p50 / p99, 30 samples) against Windows Terminal's 9.34 / 14.45 ms
+  (20 samples).
+- **Not covered:** PresentMon's view (permission), and other GPUs. This is one
+  RTX 3070 on one driver (616.92).
