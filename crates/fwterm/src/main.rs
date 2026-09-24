@@ -630,17 +630,13 @@ keys:
             let history = term.scrollback();
             let screen = term.screen();
             let scrolled = history.scrolled_lines();
-            let cell = |c: usize| -> ansi::Cell {
-                if n >= scrolled {
-                    screen.cell((n - scrolled) as usize, c)
-                } else {
-                    history.history_cell((scrolled - 1 - n) as usize, c)
-                }
-            };
+            let mut row = Vec::new();
             let held = if n >= scrolled {
-                n - scrolled < screen.rows() as u64
+                let r = (n - scrolled) as usize;
+                row.extend((0..screen.cols()).map(|c| screen.cell(r, c)));
+                r < screen.rows()
             } else {
-                scrolled - n <= history.history_len() as u64
+                history.history_row((scrolled - 1 - n) as usize, &mut row)
             };
             if !held {
                 return None;
@@ -649,7 +645,7 @@ keys:
             Some(
                 (0..screen.cols())
                     .map(|c| {
-                        let cell = cell(c);
+                        let cell = row.get(c).copied().unwrap_or_default();
                         let half = cell.width == ansi::CellWidth::Continuation;
                         if !half {
                             lead = cell.ch;

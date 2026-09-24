@@ -43,6 +43,19 @@ pub struct Palette {
     pub selection: u32,
 }
 
+/// The history lines shown at the top of a view scrolled back `back` lines
+/// with `rows` rows: row `r` is history line `back - 1 - r`. Each line is
+/// decoded once, not once per cell.
+fn history_rows(history: &Screen, back: usize, rows: usize) -> Vec<Vec<ansi::Cell>> {
+    (0..back.min(rows))
+        .map(|r| {
+            let mut row = Vec::new();
+            history.history_row(back - 1 - r, &mut row);
+            row
+        })
+        .collect()
+}
+
 /// Cells drawn as selected: every cell from `start` to `end` inclusive in
 /// reading order, as `(row, col)` of the part being drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,7 +214,7 @@ impl Frame {
     }
 
     /// Like [`Frame::update`], with the view scrolled back `back` lines into
-    /// `history`'s scrollback (`ansi::Screen::history_cell`): the top `back`
+    /// `history`'s scrollback (`ansi::Screen::history_row`): the top `back`
     /// rows show history, newest lowest, and the rest the top of `screen`. The
     /// cursor shows only if it is still in view. `back` is clamped to the
     /// history held.
@@ -220,13 +233,14 @@ impl Frame {
         let rows = screen.rows();
         let at = screen.cursor();
         let at = (cursor && at.row + back < rows).then(|| ansi::Cursor::new(at.row + back, at.col));
+        let old = history_rows(history, back, rows);
         self.update_with(
             rows,
             screen.cols(),
             at,
             |r, c| {
                 if r < back {
-                    history.history_cell(back - 1 - r, c)
+                    old[r].get(c).copied().unwrap_or_default()
                 } else {
                     screen.cell(r - back, c)
                 }
@@ -284,6 +298,7 @@ impl Frame {
         let rows = screen.rows();
         let at = screen.cursor();
         let at = (cursor && at.row + back < rows).then(|| ansi::Cursor::new(at.row + back, at.col));
+        let old = history_rows(history, back, rows);
         self.paint(
             top,
             left,
@@ -293,7 +308,7 @@ impl Frame {
             highlight,
             |r, c| {
                 if r < back {
-                    history.history_cell(back - 1 - r, c)
+                    old[r].get(c).copied().unwrap_or_default()
                 } else {
                     screen.cell(r - back, c)
                 }
