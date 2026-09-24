@@ -1384,6 +1384,33 @@ Candidates, each proven by benchmark before it ships:
   - GPU scanning stays only if an end-to-end benchmark (transfer included)
     beats a multithreaded CPU scan.
 - **Index construction is the strongest new candidate** (added 2026-09-15).
+  - **Trial result (2026-09-24): it passes.** `fwbench gpuindex`: panelog's
+    signatures (one bit per case-folded trigram per 1 MiB block) built by a
+    hand-written PTX kernel, one CTA per block, the bitmap in shared memory,
+    against a CPU build that mirrors panelog's writer. The GPU's signatures
+    equal panelog's on-disk `search.sig` bit for bit (tested). 1 GiB of
+    agent-like output, 3 runs, quiet machine:
+
+    | Build | GiB/s | CPU-s per GiB |
+    | --- | --- | --- |
+    | CPU, 1 thread | 0.75–0.76 | 1.30–1.31 |
+    | CPU, 16 threads | 6.08–6.23 | 2.34–2.42 |
+    | GPU, 4 MiB per launch | 3.26–3.35 | 0.31 |
+    | GPU, 16 MiB per launch | 6.88–6.91 | 0.14–0.16 |
+    | GPU, 64 MiB per launch | 13.66–13.82 | 0.08 |
+
+    The GPU figures include the upload and the signatures' download; CPU
+    seconds are read at Windows' 15.6 ms tick, so the GPU's are approximate.
+    With the indexer running flat out beside a 3 GiB flood through fwterm,
+    frames were unchanged at every batch size: gap p99 7.03–7.19 ms against
+    7.05–7.17 without it, and the flood took as long. At the §4 target
+    (273 MiB/s) a one-thread CPU build costs ~0.35 of a core; the GPU build
+    ~0.02.
+  - **Not yet shipped.** panelog builds signatures on its writer thread; using
+    the GPU means building them later in 64 MiB batches, off the ingest path,
+    with the CPU build kept for machines without CUDA and for the partial last
+    block. That integration is the next step. `fwcuda` is NVIDIA-only; Vulkan
+    compute remains the vendor-neutral path.
   - The indexer trigram-indexes every byte of every pane's log, continuously, at
     the §4 throughput target — a steady multi-core load landing exactly when the
     agents have already taken the CPU (§8.7b).
@@ -1424,7 +1451,7 @@ GPU compute.
 | --- | --- | --- |
 | Agent processes, compilers, test runs (`rustc`, `node`, `pytest`) | **CPU, permanently** | Not ours to move, and not data-parallel. Nothing offloads `rustc` to a GPU. Our duty is to *not add* to the load (§8.8) and to make runaway work visible (§8.7) |
 | Local AI over agent output | **GPU, out of process** | The largest genuine CPU→GPU transfer available: on the GPU it costs ~0 CPU, on the CPU it would take 8–16 threads |
-| Index construction over log segments | **GPU candidate, measure** | Bulk, batchable, latency-tolerant, embarrassingly data-parallel, and it runs continuously *while* agents already own the CPU. The best-shaped non-AI candidate (§8.7a) |
+| Index construction over log segments | **GPU, trial passed (2026-09-24); not yet wired in** | panelog's search signatures, built by a PTX kernel through `fwcuda`: 13.8 GiB/s at 64 MiB per launch, uploads and downloads included, against 6.1 GiB/s on all 16 CPU threads, at 0.08 CPU-s per GiB against 2.39, and frames unchanged. Details below and in [`compute.md`](compute.md) |
 | Bulk unindexed scans | **GPU spike, measure** | Transfer-bound below a threshold; see [`compute.md`](compute.md) |
 | Damage/diff and colour passes over large visible regions | **GPU, small win** | Data-parallel but small next to the rows above |
 | Glyph rasterization | **CPU, cached** | One cost per glyph, then it lives in the atlas. Only a large CJK font load makes it interesting |

@@ -53,6 +53,13 @@ modes:
                 (default 32) on the GPU, launch after launch, for --seconds
                 (default 10); --upload copies the data from pinned host memory
                 before each launch, as an indexer ingesting log would
+  gpuindex      the GPU indexer trial (design 8.7a): build panelog's search
+                signatures for --mib MiB (default 1024) of agent-like output on
+                one CPU thread, on every core, and on the GPU at 4, 16 and 64
+                MiB per launch (uploads and downloads included); every build
+                must equal the one-thread one
+  gpuindex-load GPU-only load: upload --mib MiB (default 64) and build its
+                signatures, again and again, for --seconds (default 10)
   read          read rate of --path DIR, unbuffered and buffered, with the CPU
                 cost per GiB; says whether the directory is NTFS-compressed.
                 --flush-mib N (default 0) writes N MiB of throwaway data first
@@ -102,6 +109,8 @@ enum Mode {
     Parse,
     Gpu,
     GpuScan,
+    GpuIndex,
+    GpuIndexLoad,
     Read,
     Compose,
     Replay,
@@ -358,6 +367,14 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                 mode = Some(Mode::GpuScan);
                 i += 1;
             }
+            "gpuindex" => {
+                mode = Some(Mode::GpuIndex);
+                i += 1;
+            }
+            "gpuindex-load" => {
+                mode = Some(Mode::GpuIndexLoad);
+                i += 1;
+            }
             "--upload" => {
                 upload = true;
                 i += 1;
@@ -481,6 +498,8 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         Mode::Replay | Mode::CrashWriter => 8192,
         Mode::History => 16384,
         Mode::Parse => 64,
+        Mode::GpuIndex => 1024,
+        Mode::GpuIndexLoad => 64,
         _ => 32,
     });
 
@@ -812,6 +831,29 @@ fn run(args: &Args) -> i32 {
         return 0;
     }
 
+    if args.mode == Mode::GpuIndexLoad {
+        let run = Duration::from_secs(args.render.seconds.max(1));
+        match gpu::index_load(args.mib as usize, run) {
+            Ok(r) => print!("{r}"),
+            Err(e) => {
+                eprintln!("fwbench: gpuindex-load failed: {e}");
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    if args.mode == Mode::GpuIndex {
+        match gpu::index_trial(args.mib as usize, &[4, 16, 64]) {
+            Ok((head, runs)) => print!("{}", gpu::render_index(&head, args.mib as usize, &runs)),
+            Err(e) => {
+                eprintln!("fwbench: gpuindex failed: {e}");
+                return 1;
+            }
+        }
+        return 0;
+    }
+
     if args.mode == Mode::Parse {
         let bytes = (args.mib * 1024 * 1024) as usize;
         let cfg = e4::Config {
@@ -861,6 +903,8 @@ fn run(args: &Args) -> i32 {
         | Mode::Parse
         | Mode::Gpu
         | Mode::GpuScan
+        | Mode::GpuIndex
+        | Mode::GpuIndexLoad
         | Mode::Read
         | Mode::Compose
         | Mode::Replay

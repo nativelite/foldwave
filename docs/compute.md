@@ -296,3 +296,11 @@ What it says:
   (20 samples).
 - **Not covered:** PresentMon's view (permission), and other GPUs. This is one
   RTX 3070 on one driver (616.92).
+
+**GPU indexer trial (2026-09-24; design §8.7a).** `fwbench gpuindex` and
+`gpuindex-load`: panelog's search signatures built on the GPU by
+`fwcuda::TrigramSigs` (PTX, JIT-compiled by the driver), equal bit for bit to
+panelog's own. At 64 MiB per launch: 13.8 GiB/s with transfers, 2.2× all 16
+CPU threads, at about 1/30 of their CPU time, and fwterm's frames unchanged
+beside it. Numbers are in design §8.7a. This follows E1's rule: whole batches
+of at least 4 MiB.

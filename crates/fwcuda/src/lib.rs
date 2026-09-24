@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 mod scan;
 mod sys;
 
-pub use scan::ByteCounter;
+pub use scan::{ByteCounter, TrigramSigs, SIG_BLOCK, SIG_BYTES};
 
 use sys::{Api, CuContext, CuDevice, CuDevicePtr, CuResult, LoadError};
 
