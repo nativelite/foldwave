@@ -226,7 +226,7 @@ contention.
   two).
 - **Inference:** llama.cpp `llama-server` build b11160, CUDA 13.4 x64 (MIT,
   https://github.com/ggml-org/llama.cpp/releases/tag/b11160), in
-  `E:wbench-e1\llama`, with Qwen2.5-7B-Instruct Q4_K_M (4.68 GB, Apache-2.0)
+  `E:\fwbench-e1\llama`, with Qwen2.5-7B-Instruct Q4_K_M (4.68 GB, Apache-2.0)
   read in place from the founder's Ollama store. Smoke test: 77 tokens/s,
   5.8 GB of 8 GB VRAM in use.
 - **Scan:** `fwbench gpuscan` runs `fwcuda::ByteCounter`, a byte-count kernel
@@ -243,5 +243,5 @@ contention.
 
   Every launch is far below the 2 s TDR limit.
 - **Frame timing from outside:** PresentMon 2.6.0 (MIT) is in
-  `E:wbench-e1\presentmon`. It needs administrator rights or membership in
+  `E:\fwbench-e1\presentmon`. It needs administrator rights or membership in
   the "Performance Log Users" group to start a trace; not granted yet.
