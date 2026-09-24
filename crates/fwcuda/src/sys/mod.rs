@@ -23,6 +23,12 @@ pub type CuDevice = i32;
 pub type CuDevicePtr = u64;
 /// `CUcontext`: `struct CUctx_st *`, opaque.
 pub type CuContext = *mut c_void;
+/// `CUmodule`: `struct CUmod_st *`, opaque.
+pub type CuModule = *mut c_void;
+/// `CUfunction`: `struct CUfunc_st *`, opaque.
+pub type CuFunction = *mut c_void;
+/// `CUstream`: `struct CUstream_st *`; null is the default stream.
+pub type CuStream = *mut c_void;
 
 // One alias per entry point: the documented C prototype, `CUDAAPI` being
 // `__stdcall` on Windows (identical to the C ABI on x64).
@@ -45,6 +51,25 @@ pub type FnMemcpyHtoD =
     unsafe extern "system" fn(dst: CuDevicePtr, src: *const c_void, bytes: usize) -> CuResult;
 pub type FnMemcpyDtoH =
     unsafe extern "system" fn(dst: *mut c_void, src: CuDevicePtr, bytes: usize) -> CuResult;
+pub type FnModuleLoadData =
+    unsafe extern "system" fn(module: *mut CuModule, image: *const c_void) -> CuResult;
+pub type FnModuleUnload = unsafe extern "system" fn(module: CuModule) -> CuResult;
+pub type FnModuleGetFunction =
+    unsafe extern "system" fn(func: *mut CuFunction, module: CuModule, name: *const u8) -> CuResult;
+#[allow(clippy::too_many_arguments)]
+pub type FnLaunchKernel = unsafe extern "system" fn(
+    f: CuFunction,
+    grid_x: u32,
+    grid_y: u32,
+    grid_z: u32,
+    block_x: u32,
+    block_y: u32,
+    block_z: u32,
+    shared_bytes: u32,
+    stream: CuStream,
+    params: *mut *mut c_void,
+    extra: *mut *mut c_void,
+) -> CuResult;
 pub type FnGetErrorName = unsafe extern "system" fn(err: CuResult, s: *mut *const u8) -> CuResult;
 
 /// The Driver API entry points this crate uses, resolved once at load.
@@ -66,6 +91,10 @@ pub struct Api {
     pub mem_free_host: FnMemFreeHost,
     pub memcpy_htod: FnMemcpyHtoD,
     pub memcpy_dtoh: FnMemcpyDtoH,
+    pub module_load_data: FnModuleLoadData,
+    pub module_unload: FnModuleUnload,
+    pub module_get_function: FnModuleGetFunction,
+    pub launch_kernel: FnLaunchKernel,
     /// Optional: only used to make errors readable.
     pub get_error_name: Option<FnGetErrorName>,
 }

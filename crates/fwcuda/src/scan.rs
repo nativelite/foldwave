@@ -1,0 +1,231 @@
+//! A text-scan kernel: count one byte value across a device buffer.
+//!
+//! Built for experiment E1 (docs/compute.md): a memory-bound bulk scan that
+//! runs beside the renderer on the display GPU, so its cost to frames can be
+//! measured at several data sizes per launch. Counting a byte is the core of
+//! line indexing and of every substring scan's first pass.
+//!
+//! The kernel is hand-written PTX, compiled by the driver on first load, so
+//! nothing from the CUDA toolkit is built against or shipped. Each thread
+//! reads 4 bytes at a time in a grid-stride loop, counts matching bytes with
+//! an exact zero-byte test, and adds its total to the result once.
+
+use crate::sys::{CuFunction, CuModule};
+use crate::{Context, DeviceBuffer, Error};
+use std::ffi::c_void;
+
+/// The kernel: `count_byte(data, n, byte, out)` adds to `*out` the number of
+/// bytes in `data[0..n]` equal to `byte`.
+///
+/// Zero-byte test on `x = word ^ (byte * 0x01010101)`: with
+/// `y = ~(((x & 0x7F7F7F7F) + 0x7F7F7F7F) | x | 0x7F7F7F7F)`, bit 7 of each
+/// byte of `y` is set exactly when that byte of `x` is zero, so `popc(y)`
+/// counts matches with no false positives.
+const PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry count_byte(
+    .param .u64 p_data,
+    .param .u64 p_n,
+    .param .u32 p_byte,
+    .param .u64 p_out
+)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<20>;
+
+    ld.param.u64 %rd1, [p_data];
+    ld.param.u64 %rd2, [p_n];
+    ld.param.u32 %r1, [p_byte];
+    ld.param.u64 %rd3, [p_out];
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.global.u64 %rd3, %rd3;
+    and.b32 %r1, %r1, 255;
+    mul.lo.u32 %r6, %r1, 16843009;
+
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mov.u32 %r5, %nctaid.x;
+    mul.wide.u32 %rd4, %r2, %r3;
+    cvt.u64.u32 %rd5, %r4;
+    add.u64 %rd4, %rd4, %rd5;
+    mov.u64 %rd11, %rd4;
+    mul.wide.u32 %rd6, %r5, %r3;
+    shr.u64 %rd7, %rd2, 2;
+    mov.u64 %rd8, 0;
+
+WORDS:
+    setp.ge.u64 %p1, %rd4, %rd7;
+    @%p1 bra TAIL_START;
+    shl.b64 %rd9, %rd4, 2;
+    add.u64 %rd9, %rd1, %rd9;
+    ld.global.u32 %r7, [%rd9];
+    xor.b32 %r8, %r7, %r6;
+    and.b32 %r9, %r8, 2139062143;
+    add.u32 %r9, %r9, 2139062143;
+    or.b32 %r9, %r9, %r8;
+    or.b32 %r9, %r9, 2139062143;
+    not.b32 %r9, %r9;
+    popc.b32 %r10, %r9;
+    cvt.u64.u32 %rd10, %r10;
+    add.u64 %rd8, %rd8, %rd10;
+    add.u64 %rd4, %rd4, %rd6;
+    bra WORDS;
+
+TAIL_START:
+    setp.ne.u64 %p2, %rd11, 0;
+    @%p2 bra ADD;
+    shl.b64 %rd12, %rd7, 2;
+TAIL:
+    setp.ge.u64 %p3, %rd12, %rd2;
+    @%p3 bra ADD;
+    add.u64 %rd13, %rd1, %rd12;
+    ld.global.u8 %r11, [%rd13];
+    setp.eq.u32 %p1, %r11, %r1;
+    selp.u64 %rd14, 1, 0, %p1;
+    add.u64 %rd8, %rd8, %rd14;
+    add.u64 %rd12, %rd12, 1;
+    bra TAIL;
+
+ADD:
+    setp.eq.u64 %p1, %rd8, 0;
+    @%p1 bra END;
+    atom.global.add.u64 %rd15, [%rd3], %rd8;
+END:
+    ret;
+}
+";
+
+/// Threads per block, and blocks per launch: enough to cover every SM on
+/// current GPUs several times over; the grid-stride loop does the rest.
+const BLOCK: u32 = 256;
+const GRID: u32 = 1024;
+
+/// The byte-count kernel, loaded into one context.
+pub struct ByteCounter<'c> {
+    ctx: &'c Context<'c>,
+    module: CuModule,
+    func: CuFunction,
+    out: DeviceBuffer<'c>,
+}
+
+impl<'c> ByteCounter<'c> {
+    /// Load (JIT-compile) the kernel into `ctx`.
+    pub fn new(ctx: &'c Context<'c>) -> Result<ByteCounter<'c>, Error> {
+        let ptx = format!("{PTX}\0");
+        ctx.make_current()?;
+        let mut module: CuModule = std::ptr::null_mut();
+        // SAFETY: `ptx` is a NUL-terminated PTX image, as cuModuleLoadData
+        // requires; `module` is a valid out-pointer.
+        let r = unsafe { (ctx.api().module_load_data)(&mut module, ptx.as_ptr().cast()) };
+        ctx.cuda.check("cuModuleLoadData", r)?;
+        let mut func: CuFunction = std::ptr::null_mut();
+        // SAFETY: `module` was just loaded; the name is NUL-terminated.
+        let r =
+            unsafe { (ctx.api().module_get_function)(&mut func, module, b"count_byte\0".as_ptr()) };
+        if let Err(e) = ctx.cuda.check("cuModuleGetFunction", r) {
+            // SAFETY: unload the module loaded above, once.
+            unsafe { (ctx.api().module_unload)(module) };
+            return Err(e);
+        }
+        let out = DeviceBuffer::new(ctx, 8)?;
+        Ok(ByteCounter {
+            ctx,
+            module,
+            func,
+            out,
+        })
+    }
+
+    /// Count `byte` in `data`. Launches once and waits for the result.
+    pub fn count(&self, data: &DeviceBuffer<'_>, byte: u8) -> Result<u64, Error> {
+        self.ctx.check_owner(data.owner.raw)?;
+        self.ctx.copy_h2d(&self.out, &[0u8; 8])?;
+        self.ctx.make_current()?;
+        let (mut p_data, mut p_n, mut p_byte, mut p_out) =
+            (data.ptr, data.len as u64, u32::from(byte), self.out.ptr);
+        let mut params: [*mut c_void; 4] = [
+            (&mut p_data as *mut u64).cast(),
+            (&mut p_n as *mut u64).cast(),
+            (&mut p_byte as *mut u32).cast(),
+            (&mut p_out as *mut u64).cast(),
+        ];
+        // SAFETY: `func` is `count_byte`, whose four parameters are exactly
+        // the four values `params` points at, alive across the call (it copies
+        // them); `data` and `out` are live allocations in this context, and
+        // the kernel reads `data[0..len]` and writes 8 bytes of `out`.
+        let r = unsafe {
+            (self.ctx.api().launch_kernel)(
+                self.func,
+                GRID,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                params.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        self.ctx.cuda.check("cuLaunchKernel", r)?;
+        self.ctx.sync_current()?;
+        let mut result = [0u8; 8];
+        self.ctx.copy_d2h(&mut result, &self.out)?;
+        Ok(u64::from_le_bytes(result))
+    }
+}
+
+impl Drop for ByteCounter<'_> {
+    fn drop(&mut self) {
+        let _ = self.ctx.make_current();
+        // SAFETY: the module was loaded in `new` and is unloaded once.
+        let _ = unsafe { (self.ctx.api().module_unload)(self.module) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Cuda, DeviceBuffer};
+
+    #[test]
+    fn the_gpu_count_matches_the_cpu_count() {
+        // Machines without an NVIDIA driver have nothing to test.
+        let Ok(cuda) = Cuda::load() else { return };
+        let Ok(dev) = cuda.device(0) else { return };
+        let ctx = Context::new(&cuda, &dev).unwrap();
+        let counter = ByteCounter::new(&ctx).unwrap();
+        // Odd lengths exercise the tail; a pseudo-random fill with planted
+        // newlines, including in the last bytes.
+        for len in [1usize, 3, 4, 5, 1023, 4096, 1 << 20, (1 << 22) + 7] {
+            let mut host = vec![0u8; len];
+            let mut x: u32 = 0x1234_5678 ^ len as u32;
+            for (i, b) in host.iter_mut().enumerate() {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                *b = if i % 37 == 0 || i + 1 == len {
+                    b'\n'
+                } else {
+                    x as u8
+                };
+            }
+            let buf = DeviceBuffer::new(&ctx, len).unwrap();
+            ctx.copy_h2d(&buf, &host).unwrap();
+            for byte in [b'\n', 0u8, 0xFF, b'a'] {
+                let want = host.iter().filter(|&&b| b == byte).count() as u64;
+                assert_eq!(
+                    counter.count(&buf, byte).unwrap(),
+                    want,
+                    "len {len} byte {byte}"
+                );
+            }
+        }
+    }
+}

@@ -100,6 +100,10 @@ pub fn load() -> Result<Api, LoadError> {
         mem_free_host: sym!("cuMemFreeHost", FnMemFreeHost),
         memcpy_htod: sym!("cuMemcpyHtoD_v2", FnMemcpyHtoD),
         memcpy_dtoh: sym!("cuMemcpyDtoH_v2", FnMemcpyDtoH),
+        module_load_data: sym!("cuModuleLoadData", FnModuleLoadData),
+        module_unload: sym!("cuModuleUnload", FnModuleUnload),
+        module_get_function: sym!("cuModuleGetFunction", FnModuleGetFunction),
+        launch_kernel: sym!("cuLaunchKernel", FnLaunchKernel),
         get_error_name,
     })
 }

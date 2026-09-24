@@ -217,3 +217,31 @@ Output: a table on the reference machine, and a governor rule backed by those
 numbers (for example "when the focused pane's frame p99 passes X ms, cap
 inference to N requests"). Until E1 runs, the design assumes nothing about
 contention.
+
+**E1 setup (prepared 2026-09-24; not yet run).**
+
+- **Renderer:** fwterm's own Vulkan renderer now exists, so it replaces
+  Windows Terminal as the baseline. Frame gaps come from `fwterm --stats`; the
+  window must sit on the monitor the RTX 3070 drives (the reference machine has
+  two).
+- **Inference:** llama.cpp `llama-server` build b11160, CUDA 13.4 x64 (MIT,
+  https://github.com/ggml-org/llama.cpp/releases/tag/b11160), in
+  `E:wbench-e1\llama`, with Qwen2.5-7B-Instruct Q4_K_M (4.68 GB, Apache-2.0)
+  read in place from the founder's Ollama store. Smoke test: 77 tokens/s,
+  5.8 GB of 8 GB VRAM in use.
+- **Scan:** `fwbench gpuscan` runs `fwcuda::ByteCounter`, a byte-count kernel
+  written in PTX and JIT-compiled by the driver (nothing from the CUDA toolkit
+  is built against or shipped). Every result is checked against the CPU's
+  count. Alone on the RTX 3070:
+
+  | Data per launch | Scanned | Launch p50 / p99 |
+  | --- | --- | --- |
+  | 1 MiB | 20.7 GiB/s | 0.04 / 0.09 ms |
+  | 32 MiB | 150.2 GiB/s | 0.20 / 0.38 ms |
+  | 256 MiB | 332.1 GiB/s (~80 % of the card's memory bandwidth) | 0.74 / 1.20 ms |
+  | 32 MiB, uploaded from pinned memory each launch | 19.4 GiB/s (PCIe-bound) | 1.59 / 1.82 ms |
+
+  Every launch is far below the 2 s TDR limit.
+- **Frame timing from outside:** PresentMon 2.6.0 (MIT) is in
+  `E:wbench-e1\presentmon`. It needs administrator rights or membership in
+  the "Performance Log Users" group to start a trace; not granted yet.

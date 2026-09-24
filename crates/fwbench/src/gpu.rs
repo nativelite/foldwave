@@ -134,3 +134,58 @@ mod tests {
         }
     }
 }
+
+/// `gpuscan`: load for experiment E1. Counts newlines in `bytes` of text on
+/// the GPU, launch after launch, for `run` (each launch timed, uploads
+/// included when `upload`), and checks every result against the CPU's count.
+pub fn scan(bytes: usize, run: Duration, upload: bool) -> Result<String, fwcuda::Error> {
+    let cuda = fwcuda::Cuda::load()?;
+    let dev = cuda.device(0)?;
+    let ctx = fwcuda::Context::new(&cuda, &dev)?;
+    let counter = fwcuda::ByteCounter::new(&ctx)?;
+    // Text with a line break every 40-ish bytes, like agent output.
+    let mut host = fwcuda::PinnedBuffer::new(&ctx, bytes)?;
+    let mut x: u32 = 0x2545_F491;
+    for (i, b) in host.as_mut_slice().iter_mut().enumerate() {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *b = if x % 41 == 0 || i % 160 == 159 {
+            b'\n'
+        } else {
+            b' ' + (x % 94) as u8
+        };
+    }
+    let want = host.as_slice().iter().filter(|&&b| b == b'\n').count() as u64;
+    let data = fwcuda::DeviceBuffer::new(&ctx, bytes)?;
+    ctx.copy_h2d(&data, host.as_slice())?;
+    let mut times = Vec::new();
+    let started = Instant::now();
+    while started.elapsed() < run {
+        let t = Instant::now();
+        if upload {
+            ctx.copy_h2d(&data, host.as_slice())?;
+        }
+        let got = counter.count(&data, b'\n')?;
+        times.push(t.elapsed());
+        if got != want {
+            return Err(fwcuda::Error::Corrupted {
+                offset: got as usize,
+            });
+        }
+    }
+    let secs = started.elapsed().as_secs_f64();
+    let s = Summary::of(&times);
+    let gib = (bytes as f64 * times.len() as f64) / (1u64 << 30) as f64;
+    Ok(format!(
+        "gpuscan  {} | {} MiB per launch{} | {} launches in {:.1} s | {:.1} GiB/s scanned\n\
+         launch   {}\n",
+        dev.name(),
+        bytes >> 20,
+        if upload { " + upload" } else { "" },
+        times.len(),
+        secs,
+        gib / secs,
+        s.line(),
+    ))
+}

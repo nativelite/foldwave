@@ -39,7 +39,10 @@ use std::ffi::c_void;
 use std::fmt;
 use std::time::{Duration, Instant};
 
+mod scan;
 mod sys;
+
+pub use scan::ByteCounter;
 
 use sys::{Api, CuContext, CuDevice, CuDevicePtr, CuResult, LoadError};
 

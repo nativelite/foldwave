@@ -49,6 +49,10 @@ modes:
                 and the mean coverage difference
   gpu           host<->GPU copy cost via the CUDA driver (pinned and pageable,
                 64 KiB..64 MiB); --samples copies per cell (default 200)
+  gpuscan       GPU load for experiment E1: count a byte across --mib MiB
+                (default 32) on the GPU, launch after launch, for --seconds
+                (default 10); --upload copies the data from pinned host memory
+                before each launch, as an indexer ingesting log would
   read          read rate of --path DIR, unbuffered and buffered, with the CPU
                 cost per GiB; says whether the directory is NTFS-compressed.
                 --flush-mib N (default 0) writes N MiB of throwaway data first
@@ -97,6 +101,7 @@ enum Mode {
     Disk,
     Parse,
     Gpu,
+    GpuScan,
     Read,
     Compose,
     Replay,
@@ -112,6 +117,8 @@ struct Args {
     mode: Mode,
     panes: usize,
     mib: u64,
+    /// `gpuscan`: copy the data up before each launch.
+    upload: bool,
     samples: usize,
     gap: Duration,
     shell: Option<String>,
@@ -171,6 +178,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut mode: Option<Mode> = None;
     let mut panes = 8usize;
     let mut mib: Option<u64> = None;
+    let mut upload = false;
     let mut samples = 200usize;
     let mut gap_ms = 25u64;
     let mut shell = None;
@@ -346,6 +354,14 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                 mode = Some(Mode::Gpu);
                 i += 1;
             }
+            "gpuscan" => {
+                mode = Some(Mode::GpuScan);
+                i += 1;
+            }
+            "--upload" => {
+                upload = true;
+                i += 1;
+            }
             "parse" => {
                 mode = Some(Mode::Parse);
                 i += 1;
@@ -472,6 +488,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         mode,
         panes,
         mib,
+        upload,
         samples,
         gap: Duration::from_millis(gap_ms),
         shell,
@@ -782,6 +799,19 @@ fn run(args: &Args) -> i32 {
         return 0;
     }
 
+    if args.mode == Mode::GpuScan {
+        let bytes = (args.mib * 1024 * 1024) as usize;
+        let seconds = Duration::from_secs(args.render.seconds.max(1));
+        match gpu::scan(bytes, seconds, args.upload) {
+            Ok(report) => print!("{report}"),
+            Err(e) => {
+                eprintln!("fwbench: gpuscan failed: {e}");
+                return 1;
+            }
+        }
+        return 0;
+    }
+
     if args.mode == Mode::Parse {
         let bytes = (args.mib * 1024 * 1024) as usize;
         let cfg = e4::Config {
@@ -830,6 +860,7 @@ fn run(args: &Args) -> i32 {
         | Mode::Disk
         | Mode::Parse
         | Mode::Gpu
+        | Mode::GpuScan
         | Mode::Read
         | Mode::Compose
         | Mode::Replay
