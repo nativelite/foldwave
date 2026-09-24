@@ -99,9 +99,10 @@ pub fn frame_interval(base: Duration, level: Level, since_input: Duration) -> Du
 /// When a hidden pane (another is zoomed) stops parsing and only logs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hidden {
-    /// While the machine is busy: the first thing §8.8 sheds.
-    Busy,
+    /// Whenever hidden (the default, design §11 row 10).
     Always,
+    /// Only while the machine is busy: the first thing §8.8 sheds.
+    Busy,
     Never,
 }
 

@@ -23,8 +23,7 @@
 //! same frame, so the renderer sees one grid whatever the layout. The keys
 //! are Windows Terminal's defaults: Alt+Shift+Plus / Minus / D split, Alt+Arrow
 //! and a click move the focus, Ctrl+Shift+W closes a pane, Ctrl+Shift+Z
-//! zooms one (the others hidden, and shed while the machine is busy:
-//! `governor`). Dragging selects
+//! zooms one (the others hidden: they only log until shown, `governor`). Dragging selects
 //! (double-click: a word), Ctrl+Shift+C or Ctrl+C with a selection copies,
 //! Ctrl+V or Ctrl+Shift+V pastes.
 //!
@@ -140,9 +139,9 @@ options:
                 CPU 0 left out; measured no better on an i5-12600K)
   --zoom        start with the first pane zoomed (Ctrl+Shift+Z toggles)
   --hidden H    when a pane hidden behind a zoomed one stops parsing and only
-                logs, catching up from its log when shown again: busy
-                (default: while other programs keep the CPU nearly full),
-                always, or never. Without a log it always keeps parsing
+                logs, catching up from its log when shown again: always
+                (default), busy (only while other programs keep the CPU
+                nearly full), or never. Without a log it keeps parsing
   --governor G  on (default): while other programs keep the CPU nearly
                 full, draw at most 30 frames a second except just after
                 input; off: always draw at the display's rate
@@ -206,7 +205,7 @@ keys:
             choose_log_drive: false,
             place: Place::Off,
             governor: true,
-            hidden: Hidden::Busy,
+            hidden: Hidden::Always,
             zoom: false,
             panes: 1,
             shell: vec!["cmd.exe".into()],
