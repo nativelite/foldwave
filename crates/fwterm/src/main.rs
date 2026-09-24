@@ -22,7 +22,9 @@
 //! Panes split the window's cell grid (`layout`); every pane draws into the
 //! same frame, so the renderer sees one grid whatever the layout. The keys
 //! are Windows Terminal's defaults: Alt+Shift+Plus / Minus / D split, Alt+Arrow
-//! and a click move the focus, Ctrl+Shift+W closes a pane. Dragging selects
+//! and a click move the focus, Ctrl+Shift+W closes a pane, Ctrl+Shift+Z
+//! zooms one (the others hidden, and shed while the machine is busy:
+//! `governor`). Dragging selects
 //! (double-click: a word), Ctrl+Shift+C or Ctrl+C with a selection copies,
 //! Ctrl+V or Ctrl+Shift+V pastes.
 //!
@@ -58,7 +60,7 @@ fn main() {
 
 #[cfg(windows)]
 mod app {
-    use crate::governor::{self, Level, Place};
+    use crate::governor::{self, Hidden, Level, Place};
     use crate::layout::{neighbor, pane_at, Dir, Layout, PaneId, Placement, Rect, Toward};
     use crate::logstore;
     use crate::select::{self, Point, Selection};
@@ -136,6 +138,11 @@ options:
   --place P     where pane readers and the UI thread run: off (default: where
                 the OS puts them) or fast (the fast cores of a hybrid CPU,
                 CPU 0 left out; measured no better on an i5-12600K)
+  --zoom        start with the first pane zoomed (Ctrl+Shift+Z toggles)
+  --hidden H    when a pane hidden behind a zoomed one stops parsing and only
+                logs, catching up from its log when shown again: busy
+                (default: while other programs keep the CPU nearly full),
+                always, or never. Without a log it always keeps parsing
   --governor G  on (default): while other programs keep the CPU nearly
                 full, draw at most 30 frames a second except just after
                 input; off: always draw at the display's rate
@@ -148,6 +155,7 @@ keys:
   Alt+Shift+D       split it along its longer side
   Alt+Arrow, click  focus the pane in that direction / under the pointer
   Ctrl+Shift+W      close the focused pane (the last one closes the window)
+  Ctrl+Shift+Z      zoom the focused pane to the whole window, or back
   drag, double-click   select text in a pane / select a word
   Ctrl+Shift+C      copy the selection (Ctrl+C too while there is one;
                     otherwise Ctrl+C goes to the program)
@@ -173,6 +181,8 @@ keys:
         choose_log_drive: bool,
         place: Place,
         governor: bool,
+        hidden: Hidden,
+        zoom: bool,
         panes: usize,
         shell: Vec<String>,
     }
@@ -196,6 +206,8 @@ keys:
             choose_log_drive: false,
             place: Place::Off,
             governor: true,
+            hidden: Hidden::Busy,
+            zoom: false,
             panes: 1,
             shell: vec!["cmd.exe".into()],
         };
@@ -267,6 +279,19 @@ keys:
                         "fast" => Place::Fast,
                         "off" => Place::Off,
                         _ => return Err(format!("bad --place {v:?}")),
+                    };
+                }
+                "--zoom" => {
+                    a.zoom = true;
+                    i += 1;
+                }
+                "--hidden" => {
+                    let v = value(&mut i, "--hidden")?;
+                    a.hidden = match v.as_str() {
+                        "busy" => Hidden::Busy,
+                        "always" => Hidden::Always,
+                        "never" => Hidden::Never,
+                        _ => return Err(format!("bad --hidden {v:?}")),
                     };
                 }
                 "--governor" => {
@@ -908,6 +933,13 @@ keys:
         since_checkpoint: AtomicU64,
         /// Output in the log's current generation.
         gen_bytes: AtomicU64,
+        /// The emulator is fed as output arrives. False while the pane is
+        /// hidden and shed: output then only reaches the log, and the
+        /// emulator waits at `paused_at` (an offset in the current
+        /// generation) until it catches up from there.
+        parsing: AtomicBool,
+        paused_at: AtomicU64,
+        catching_up: AtomicBool,
         /// The renderer is waiting for `term`; readers step aside. The lock is
         /// not fair, and a reader that releases and immediately re-takes it
         /// otherwise holds the renderer off for tens of milliseconds.
@@ -971,6 +1003,8 @@ keys:
         back: usize,
         seen_scrolled: u64,
         deep: Option<Deep>,
+        /// Behind a zoomed pane: kept, not drawn.
+        hidden: bool,
     }
 
     impl Pane {
@@ -1087,7 +1121,39 @@ keys:
 
         /// Whether the pane has any cells to draw.
         fn visible(&self) -> bool {
-            self.rect.rows > 0 && self.rect.cols > 0
+            !self.hidden && self.rect.rows > 0 && self.rect.cols > 0
+        }
+
+        /// Stop feeding the emulator; output goes only to the log.
+        fn pause(&self) {
+            let _term = self.shared.term.lock().unwrap();
+            let at = self.shared.gen_bytes.load(Ordering::Acquire);
+            self.shared.paused_at.store(at, Ordering::Release);
+            self.shared.parsing.store(false, Ordering::Release);
+        }
+
+        /// Catch the emulator up from the log, on its own thread, and feed
+        /// it live again once it has.
+        fn resume(&self, waker: Waker) {
+            let (Some(log), Some(dir)) = (&self.log, &self.pane_dir) else {
+                self.shared.parsing.store(true, Ordering::Release);
+                return;
+            };
+            if self.shared.catching_up.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            let (shared, tx, dir) = (self.shared.clone(), log.tx.clone(), dir.clone());
+            std::thread::spawn(move || {
+                if let Err(e) = catch_up(&shared, &tx, &dir, &waker) {
+                    // Live again regardless, with the gap said out loud.
+                    let mut term = shared.term.lock().unwrap();
+                    term.feed(format!("\r\n{RED}[fwterm: output while hidden could not be replayed: {e}]{RESET}\r\n").as_bytes());
+                    shared.parsing.store(true, Ordering::Release);
+                }
+                shared.catching_up.store(false, Ordering::Release);
+                shared.pending.store(true, Ordering::Release);
+                waker.wake();
+            });
         }
 
         /// Bring this pane's part of `frame` up to date. The caller has set
@@ -1255,7 +1321,11 @@ keys:
                     if let Some(log) = &log {
                         let _ = log.tx.send(LogMsg::Data(buf[..n].to_vec(), now));
                     }
-                    term.feed(&buf[..n]);
+                    // A shed pane's emulator waits; the log has the bytes.
+                    let parse = log.is_none() || shared.parsing.load(Ordering::Acquire);
+                    if parse {
+                        term.feed(&buf[..n]);
+                    }
                     // Checkpoint at a point the replay can resume from; roll
                     // over to a new generation at one.
                     if let Some(log) = &log {
@@ -1265,7 +1335,10 @@ keys:
                             + n as u64;
                         let generation =
                             shared.gen_bytes.fetch_add(n as u64, Ordering::AcqRel) + n as u64;
-                        if since >= CHECKPOINT_EVERY {
+                        // Checkpoints need the live screen; a generation does
+                        // not roll over while it is paused either, so a shed
+                        // pane catches up within one generation.
+                        if parse && since >= CHECKPOINT_EVERY {
                             if let Some(blob) = term.checkpoint() {
                                 if generation >= log.gen_limit.load(Ordering::Acquire) {
                                     let _ = log.tx.send(LogMsg::Roll(blob));
@@ -1347,6 +1420,9 @@ keys:
                 exited: AtomicBool::new(false),
                 since_checkpoint: AtomicU64::new(0),
                 gen_bytes: AtomicU64::new(0),
+                parsing: AtomicBool::new(true),
+                paused_at: AtomicU64::new(0),
+                catching_up: AtomicBool::new(false),
                 want: AtomicBool::new(false),
             });
             let (log, pane_dir) = match &self.logs.store {
@@ -1425,6 +1501,7 @@ keys:
                 back: 0,
                 seen_scrolled: 0,
                 deep: None,
+                hidden: false,
             })
         }
     }
@@ -1478,10 +1555,91 @@ keys:
 
     /// Give every pane its cells for `placement`.
     fn place_all(panes: &mut [Pane], placement: &Placement) {
-        for &(id, rect) in &placement.panes {
-            if let Some(p) = panes.iter_mut().find(|p| p.id == id) {
-                p.place(rect);
+        for p in panes.iter_mut() {
+            match placement.panes.iter().find(|(id, _)| *id == p.id) {
+                Some(&(_, rect)) => {
+                    p.hidden = false;
+                    p.place(rect);
+                }
+                // Its emulator and program keep their size while hidden.
+                None => p.hidden = true,
             }
+        }
+    }
+
+    /// Replay chunk size while catching up, and the tail small enough to
+    /// finish under the pane lock.
+    const CATCH_UP_CHUNK: usize = 1024 * 1024;
+    const CATCH_UP_FINISH: u64 = 1024 * 1024;
+
+    /// Have the logger write out everything sent so far (waits).
+    fn flush_logger(tx: &SyncSender<LogMsg>) -> io::Result<()> {
+        let (done, wait) = std::sync::mpsc::channel();
+        tx.send(LogMsg::Flush(done))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "the logger stopped"))?;
+        wait.recv_timeout(Duration::from_secs(30))
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the log did not flush"))
+    }
+
+    /// Feed a paused emulator the log from `paused_at` on: in chunks with the
+    /// pane lock taken per chunk while output keeps arriving, then the last
+    /// small tail under the lock, where it turns live again.
+    fn catch_up(
+        shared: &Shared,
+        tx: &SyncSender<LogMsg>,
+        pane_dir: &Path,
+        waker: &Waker,
+    ) -> io::Result<()> {
+        let current = || {
+            logstore::generations(pane_dir)
+                .pop()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no log generation"))
+        };
+        let mut buf = vec![0u8; CATCH_UP_CHUNK];
+        loop {
+            flush_logger(tx)?;
+            let reader = panelog::Reader::open(&current()?)?;
+            let mut at = shared.paused_at.load(Ordering::Acquire);
+            let end = reader.len();
+            while at < end {
+                let want = ((end - at) as usize).min(buf.len());
+                let n = reader.read_at(at, &mut buf[..want])?;
+                if n == 0 {
+                    break;
+                }
+                shared.term.lock().unwrap().feed(&buf[..n]);
+                at += n as u64;
+                shared.paused_at.store(at, Ordering::Release);
+                shared.pending.store(true, Ordering::Release);
+                waker.wake();
+            }
+            let mut term = shared.term.lock().unwrap();
+            let logged = shared.gen_bytes.load(Ordering::Acquire);
+            if logged.saturating_sub(at) > CATCH_UP_FINISH {
+                continue; // more arrived meanwhile: another round unlocked
+            }
+            // Readers wait on the lock now; what they sent is all there is.
+            flush_logger(tx)?;
+            let reader = panelog::Reader::open(&current()?)?;
+            let end = reader.len();
+            while at < end {
+                let want = ((end - at) as usize).min(buf.len());
+                let n = reader.read_at(at, &mut buf[..want])?;
+                if n == 0 {
+                    break;
+                }
+                term.feed(&buf[..n]);
+                at += n as u64;
+            }
+            shared.paused_at.store(at, Ordering::Release);
+            shared.parsing.store(true, Ordering::Release);
+            if at < logged {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("{} bytes never reached the log", logged - at),
+                ));
+            }
+            return Ok(());
         }
     }
 
@@ -1582,8 +1740,15 @@ keys:
             .iter()
             .map(|&(id, rect)| spawner.spawn(id, rect))
             .collect::<io::Result<Vec<Pane>>>()?;
+        let waker = surface.window().waker();
         let mut next_id = args.panes;
         let mut focus: PaneId = 0;
+        let mut zoom: Option<PaneId> = (args.zoom && args.panes > 1).then_some(0);
+        // Every pane starts at its real size; a zoom then hides the rest.
+        if zoom.is_some() {
+            placement = layout.place_zoomed(zoom, grid_rows, grid_cols);
+            place_all(&mut panes, &placement);
+        }
 
         // This thread draws: it must win a core when a frame is due, even with
         // every core busy moving output.
@@ -1697,6 +1862,18 @@ keys:
                             drop_char = true;
                             continue;
                         }
+                        // Ctrl+Shift+Z: zoom the pane, or unzoom.
+                        if vk == 0x5A && ctrl && shift {
+                            zoom = match zoom {
+                                Some(_) => None,
+                                None if panes.len() > 1 => Some(focus),
+                                None => None,
+                            };
+                            clear(&mut selection, &panes);
+                            layout_dirty = true;
+                            drop_char = true;
+                            continue;
+                        }
                         let pane = &mut panes[fi];
                         match vk {
                             // Ctrl+Shift+W: close the pane.
@@ -1738,6 +1915,13 @@ keys:
                             0x28 if !shift => Some(Toward::Down),
                             _ => None,
                         };
+                        // Splitting or moving the focus shows every pane again.
+                        if (dir.is_some() || toward.is_some()) && zoom.take().is_some() {
+                            placement = layout.place_zoomed(zoom, grid_rows, grid_cols);
+                            place_all(&mut panes, &placement);
+                            layout_dirty = true;
+                        }
+                        let r = panes.iter().find(|p| p.id == focus).map_or(r, |p| p.rect);
                         if let Some(dir) = dir {
                             // Both halves need a cell, with a divider between.
                             let room = match dir {
@@ -1747,7 +1931,7 @@ keys:
                             let id = next_id;
                             if room >= 3 && layout.split(focus, dir, id) {
                                 next_id += 1;
-                                placement = layout.place(grid_rows, grid_cols);
+                                placement = layout.place_zoomed(zoom, grid_rows, grid_cols);
                                 let rect = placement
                                     .panes
                                     .iter()
@@ -1762,7 +1946,7 @@ keys:
                                     Err(e) => {
                                         say!("fwterm: new pane: {e}");
                                         layout.remove(id);
-                                        placement = layout.place(grid_rows, grid_cols);
+                                        placement = layout.place_zoomed(zoom, grid_rows, grid_cols);
                                     }
                                 }
                                 place_all(&mut panes, &placement);
@@ -1831,7 +2015,7 @@ keys:
                     Event::Resized(w, h) if w > 0 && h > 0 => {
                         surface.resize(w, h)?;
                         (grid_rows, grid_cols) = grid(w, h);
-                        placement = layout.place(grid_rows, grid_cols);
+                        placement = layout.place_zoomed(zoom, grid_rows, grid_cols);
                         place_all(&mut panes, &placement);
                         frame.damage_all();
                         layout_dirty = true;
@@ -1886,6 +2070,9 @@ keys:
                 if focus == id {
                     focus = next.unwrap_or(0);
                 }
+                if zoom == Some(id) {
+                    zoom = None;
+                }
                 layout_dirty = true;
                 selection = None;
                 press = None;
@@ -1896,8 +2083,19 @@ keys:
                 return Ok(code);
             }
             if layout_dirty {
-                placement = layout.place(grid_rows, grid_cols);
+                placement = layout.place_zoomed(zoom, grid_rows, grid_cols);
                 place_all(&mut panes, &placement);
+            }
+            // Hidden panes stop parsing when the governor says so, and catch
+            // up from their logs when shown or when it no longer does.
+            for p in &panes {
+                let keep = governor::keep_parsing(p.hidden, p.log.is_some(), args.hidden, level);
+                let parsing = p.shared.parsing.load(Ordering::Acquire);
+                if !keep && parsing && !p.shared.catching_up.load(Ordering::Acquire) {
+                    p.pause();
+                } else if keep && !parsing {
+                    p.resume(waker.clone());
+                }
             }
             if last_draw.map_or(false, |t| t.elapsed() < interval) {
                 continue;

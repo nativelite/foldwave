@@ -269,6 +269,28 @@ impl Layout {
         }
     }
 
+    /// Lay the tree out, or with `zoom` naming one of its panes, that pane
+    /// alone over the whole grid: the others keep their places in the tree
+    /// but get no cells.
+    pub fn place_zoomed(&self, zoom: Option<PaneId>, rows: usize, cols: usize) -> Placement {
+        let full = self.place(rows, cols);
+        match zoom {
+            Some(z) if full.panes.iter().any(|(id, _)| *id == z) => Placement {
+                panes: vec![(
+                    z,
+                    Rect {
+                        top: 0,
+                        left: 0,
+                        rows,
+                        cols,
+                    },
+                )],
+                dividers: Vec::new(),
+            },
+            _ => full,
+        }
+    }
+
     /// Lay the tree out over a `rows x cols` grid.
     pub fn place(&self, rows: usize, cols: usize) -> Placement {
         let mut panes = Vec::new();
@@ -500,5 +522,27 @@ mod tests {
         assert_eq!(neighbor(&p, 2, Toward::Right), None);
         assert_eq!(pane_at(&p, 7, 15), Some(2));
         assert_eq!(pane_at(&p, 5, 15), None, "a divider");
+    }
+
+    #[test]
+    fn a_zoomed_pane_takes_the_whole_grid_and_the_rest_wait() {
+        let l = Layout::grid(&[0, 1, 2, 3]);
+        let z = l.place_zoomed(Some(2), 30, 100);
+        assert_eq!(
+            z.panes,
+            vec![(
+                2,
+                Rect {
+                    top: 0,
+                    left: 0,
+                    rows: 30,
+                    cols: 100
+                }
+            )]
+        );
+        assert!(z.dividers.is_empty());
+        assert_eq!(l.place_zoomed(None, 30, 100), l.place(30, 100));
+        // A pane no longer in the layout zooms nothing.
+        assert_eq!(l.place_zoomed(Some(9), 30, 100), l.place(30, 100));
     }
 }

@@ -96,6 +96,28 @@ pub fn frame_interval(base: Duration, level: Level, since_input: Duration) -> Du
     }
 }
 
+/// When a hidden pane (another is zoomed) stops parsing and only logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hidden {
+    /// While the machine is busy: the first thing §8.8 sheds.
+    Busy,
+    Always,
+    Never,
+}
+
+/// Whether a pane keeps its screen live. Only a hidden pane with a log may
+/// stop: the log is how it catches up when shown.
+pub fn keep_parsing(hidden: bool, logged: bool, policy: Hidden, level: Level) -> bool {
+    if !hidden || !logged {
+        return true;
+    }
+    match policy {
+        Hidden::Never => true,
+        Hidden::Always => false,
+        Hidden::Busy => level == Level::Calm,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +175,17 @@ mod tests {
             Level::Calm,
             "fwterm's own"
         );
+    }
+
+    #[test]
+    fn only_hidden_logged_panes_stop_parsing_and_by_policy() {
+        use Level::*;
+        assert!(keep_parsing(false, true, Hidden::Always, Busy), "shown");
+        assert!(keep_parsing(true, false, Hidden::Always, Busy), "no log");
+        assert!(!keep_parsing(true, true, Hidden::Always, Calm));
+        assert!(keep_parsing(true, true, Hidden::Never, Busy));
+        assert!(keep_parsing(true, true, Hidden::Busy, Calm));
+        assert!(!keep_parsing(true, true, Hidden::Busy, Busy));
     }
 
     #[test]
