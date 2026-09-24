@@ -463,6 +463,12 @@ impl Drop for Window {
     }
 }
 
+/// `WM_SYSCOMMAND` for the menu that Alt alone opens: `SC_KEYMENU` with no
+/// character (Alt+Space carries `' '` and still opens the window menu).
+pub(crate) fn alt_alone_menu(wparam: usize, lparam: isize) -> bool {
+    wparam & 0xFFF0 == SC_KEYMENU && lparam == 0
+}
+
 unsafe extern "system" fn wnd_proc(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> isize {
     if msg == WM_NCCREATE {
         // SAFETY: for WM_NCCREATE, lparam is a CREATESTRUCTW whose first
@@ -530,6 +536,10 @@ unsafe extern "system" fn wnd_proc(hwnd: Hwnd, msg: u32, wparam: usize, lparam: 
         // Alt+Space opens the window menu; any other Alt+character would
         // only beep.
         WM_SYSCHAR if wparam != usize::from(b' ') => 0,
+        // Alt pressed and released on its own would enter menu mode, where
+        // the next key selects from an invisible menu instead of reaching the
+        // terminal. A terminal wants that key.
+        WM_SYSCOMMAND if alt_alone_menu(wparam, lparam) => 0,
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_MOUSEMOVE | WM_LBUTTONUP => {
             // Client coordinates, signed 16-bit words of lparam.
             let x = (lparam & 0xFFFF) as u16 as i16 as i32;

@@ -163,3 +163,16 @@ fn the_display_reports_a_plausible_refresh_rate() {
         assert!((24..=1000).contains(&hz), "{hz} Hz");
     }
 }
+
+#[test]
+fn alt_alone_does_not_open_the_menu_but_alt_space_does() {
+    use super::window::alt_alone_menu;
+    // SC_KEYMENU from Alt alone: no character.
+    assert!(alt_alone_menu(0xF100, 0));
+    // The low four bits of wparam are the system's; they do not change it.
+    assert!(alt_alone_menu(0xF100 | 0x3, 0));
+    // Alt+Space: the window menu, as always.
+    assert!(!alt_alone_menu(0xF100, b' ' as isize));
+    // Other system commands pass through.
+    assert!(!alt_alone_menu(0xF060, 0)); // SC_CLOSE
+}

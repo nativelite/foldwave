@@ -1305,6 +1305,16 @@ keys:
                 };
                 if let Some(session) = session.as_ref().and_then(Weak::upgrade) {
                     for reply in watcher.replies(&buf[..n]) {
+                        // Where the cursor really is (the banner moved it),
+                        // as of the bytes before this chunk.
+                        let cpr;
+                        let reply = if reply == fwbench::terminal::CPR_REPLY {
+                            let c = shared.term.lock().unwrap().screen().cursor();
+                            cpr = format!("\x1b[{};{}R", c.row + 1, c.col + 1);
+                            cpr.as_bytes()
+                        } else {
+                            reply
+                        };
                         let _ = session.lock().unwrap().write(reply);
                     }
                 }
@@ -1661,6 +1671,11 @@ keys:
                     );
                 }
             }
+        }
+        // The banner is on screen before the console starts: the console
+        // must start below it, at our cursor, or its output lands offset.
+        if !args.pipe {
+            pty::inherit_cursor(true);
         }
         let mut raster = match &args.font {
             // Consolas by its known files: no need to scan the font folders.
