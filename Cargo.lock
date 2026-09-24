@@ -42,6 +42,7 @@ dependencies = [
 name = "nativelite-fwterm"
 version = "0.1.0"
 dependencies = [
+ "nativelite-ansi",
  "nativelite-fwbench",
  "nativelite-fwrender",
  "nativelite-panelog",

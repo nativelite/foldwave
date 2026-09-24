@@ -39,6 +39,24 @@ pub struct Palette {
     pub bg: u32,
     /// Indexed colours 0–255.
     pub indexed: [u32; 256],
+    /// Background of selected cells ([`Highlight`]).
+    pub selection: u32,
+}
+
+/// Cells drawn as selected: every cell from `start` to `end` inclusive in
+/// reading order, as `(row, col)` of the part being drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Highlight {
+    /// First selected cell.
+    pub start: (usize, usize),
+    /// Last selected cell; not before `start`.
+    pub end: (usize, usize),
+}
+
+impl Highlight {
+    fn covers(&self, row: usize, col: usize) -> bool {
+        self.start <= (row, col) && (row, col) <= self.end
+    }
 }
 
 impl Default for Palette {
@@ -64,6 +82,7 @@ impl Default for Palette {
             fg: 0xFFCC_CCCC,
             bg: 0xFF0C_0C0C,
             indexed,
+            selection: 0xFF26_4F78,
         }
     }
 }
@@ -245,6 +264,8 @@ impl Frame {
     /// cell is `(top, left)` and whose size is `screen`'s, clipped to the
     /// frame. The frame keeps its size ([`Frame::set_grid`]); cells outside
     /// that part are left as they are. For several panes in one frame.
+    /// Cells in `highlight` (in the part's view rows) get the palette's
+    /// selection background.
     #[allow(clippy::too_many_arguments)]
     pub fn update_view_at(
         &mut self,
@@ -254,6 +275,7 @@ impl Frame {
         history: &Screen,
         back: usize,
         cursor: bool,
+        highlight: Option<Highlight>,
         palette: &Palette,
         atlas: &mut Atlas,
         raster: &mut dyn Rasterizer,
@@ -268,6 +290,7 @@ impl Frame {
             rows,
             screen.cols(),
             at,
+            highlight,
             |r, c| {
                 if r < back {
                     history.history_cell(back - 1 - r, c)
@@ -308,7 +331,7 @@ impl Frame {
         raster: &mut dyn Rasterizer,
     ) -> usize {
         let newly = self.set_grid(rows, cols, palette);
-        newly + self.paint(0, 0, rows, cols, at, cell_at, palette, atlas, raster)
+        newly + self.paint(0, 0, rows, cols, at, None, cell_at, palette, atlas, raster)
     }
 
     /// Resolve `rows x cols` cells from `cell_at` into the frame at
@@ -321,6 +344,7 @@ impl Frame {
         rows: usize,
         cols: usize,
         at: Option<ansi::Cursor>,
+        highlight: Option<Highlight>,
         cell_at: impl Fn(usize, usize) -> ansi::Cell,
         palette: &Palette,
         atlas: &mut Atlas,
@@ -342,6 +366,9 @@ impl Frame {
                 }
                 if s.dim {
                     fg = halfway(fg, bg);
+                }
+                if highlight.map_or(false, |h| h.covers(r, c)) {
+                    bg = palette.selection;
                 }
                 if at.map_or(false, |a| a.row == r && a.col == c) {
                     std::mem::swap(&mut fg, &mut bg);
@@ -525,8 +552,8 @@ mod tests {
         assert_eq!(f.set_grid(3, 8, &p), 3, "a new size damages every row");
         f.clear_damage();
         assert_eq!(f.set_grid(3, 8, &p), 0, "the same size does not");
-        f.update_view_at(0, 0, &left, &left, 0, false, &p, &mut a, &mut r);
-        f.update_view_at(0, 4, &right, &right, 0, true, &p, &mut a, &mut r);
+        f.update_view_at(0, 0, &left, &left, 0, false, None, &p, &mut a, &mut r);
+        f.update_view_at(0, 4, &right, &right, 0, true, None, &p, &mut a, &mut r);
         let mut alone = Frame::new();
         alone.update(&right, true, &p, &mut a, &mut r);
         assert_eq!(&f.row(1)[4..8], alone.row(1), "right pane at column 4");
@@ -537,16 +564,16 @@ mod tests {
         assert_eq!(f.damage(), [true, true, false]);
         f.clear_damage();
         // Drawing the same again damages nothing; a changed pane only its rows.
-        f.update_view_at(0, 4, &right, &right, 0, true, &p, &mut a, &mut r);
+        f.update_view_at(0, 4, &right, &right, 0, true, None, &p, &mut a, &mut r);
         assert_eq!(f.damaged_rows(), 0);
         right.write_str(1, 0, "q", Style::default());
         assert_eq!(
-            f.update_view_at(0, 4, &right, &right, 0, true, &p, &mut a, &mut r),
+            f.update_view_at(0, 4, &right, &right, 0, true, None, &p, &mut a, &mut r),
             1
         );
         assert_eq!(f.damage(), [false, true, false]);
         // A part that runs past the frame is clipped, not a panic.
-        f.update_view_at(2, 6, &right, &right, 0, false, &p, &mut a, &mut r);
+        f.update_view_at(2, 6, &right, &right, 0, false, None, &p, &mut a, &mut r);
         let divider = CellInstance {
             glyph: 7,
             fg: 1,
@@ -560,6 +587,31 @@ mod tests {
         assert_eq!(
             (f.row(2)[3], f.damage()),
             (divider, &[false, false, true][..])
+        );
+    }
+
+    #[test]
+    fn a_highlight_paints_the_selection_background_in_reading_order() {
+        let (p, mut a, mut r) = setup();
+        let s = Screen::new(3, 4);
+        let mut f = Frame::new();
+        f.set_grid(3, 4, &p);
+        let h = Highlight {
+            start: (0, 2),
+            end: (1, 1),
+        };
+        f.update_view_at(0, 0, &s, &s, 0, false, Some(h), &p, &mut a, &mut r);
+        let selected: Vec<(usize, usize)> = (0..3)
+            .flat_map(|row| (0..4).map(move |col| (row, col)))
+            .filter(|&(row, col)| f.row(row)[col].bg == p.selection)
+            .collect();
+        assert_eq!(selected, [(0, 2), (0, 3), (1, 0), (1, 1)]);
+        f.clear_damage();
+        f.update_view_at(0, 0, &s, &s, 0, false, None, &p, &mut a, &mut r);
+        assert_eq!(
+            f.damage(),
+            [true, true, false],
+            "clearing it redraws its rows"
         );
     }
 

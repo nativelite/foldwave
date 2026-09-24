@@ -161,6 +161,7 @@ impl BitmapInfo {
 pub const CS_VREDRAW: u32 = 0x0001;
 pub const CS_HREDRAW: u32 = 0x0002;
 pub const CS_OWNDC: u32 = 0x0020;
+pub const CS_DBLCLKS: u32 = 0x0008;
 
 pub const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
 /// `CW_USEDEFAULT` is `((int)0x80000000)`.
@@ -188,7 +189,15 @@ pub const WM_CHAR: u32 = 0x0102;
 pub const WM_SYSKEYDOWN: u32 = 0x0104;
 pub const WM_SYSKEYUP: u32 = 0x0105;
 pub const WM_SYSCHAR: u32 = 0x0106;
+pub const WM_MOUSEMOVE: u32 = 0x0200;
 pub const WM_LBUTTONDOWN: u32 = 0x0201;
+pub const WM_LBUTTONUP: u32 = 0x0202;
+pub const WM_LBUTTONDBLCLK: u32 = 0x0203;
+/// `wparam` of mouse messages: the left button is down.
+pub const MK_LBUTTON: usize = 0x0001;
+/// Clipboard format: UTF-16 text, NUL-terminated (winuser.h).
+pub const CF_UNICODETEXT: u32 = 13;
+pub const GMEM_MOVEABLE: u32 = 0x0002;
 /// winuser.h.
 pub const WM_MOUSEWHEEL: u32 = 0x020A;
 pub const WM_APP: u32 = 0x8000;
@@ -275,6 +284,14 @@ extern "system" {
     pub fn PostMessageW(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> Bool;
     /// High bit set (negative) while the key is down.
     pub fn GetKeyState(vk: i32) -> i16;
+    pub fn SetCapture(hwnd: Hwnd) -> Hwnd;
+    pub fn ReleaseCapture() -> Bool;
+    pub fn OpenClipboard(owner: Hwnd) -> Bool;
+    pub fn CloseClipboard() -> Bool;
+    pub fn EmptyClipboard() -> Bool;
+    /// On success the system owns `data`; on failure the caller still does.
+    pub fn SetClipboardData(format: u32, data: Handle) -> Handle;
+    pub fn GetClipboardData(format: u32) -> Handle;
     pub fn MsgWaitForMultipleObjectsEx(
         count: u32,
         handles: *const Handle,
@@ -386,6 +403,11 @@ extern "system" {
         resume: i32,
     ) -> i32;
     pub fn CloseHandle(handle: Handle) -> i32;
+    pub fn GlobalAlloc(flags: u32, bytes: usize) -> Handle;
+    pub fn GlobalLock(mem: Handle) -> *mut c_void;
+    pub fn GlobalUnlock(mem: Handle) -> Bool;
+    pub fn GlobalSize(mem: Handle) -> usize;
+    pub fn GlobalFree(mem: Handle) -> Handle;
 }
 
 /// `s` as NUL-terminated UTF-16.

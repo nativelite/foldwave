@@ -4,9 +4,9 @@
 //! and the `fwrender` window and backends for drawing. It exists to be
 //! measured against other terminals with the same outside instruments, so it
 //! does the least a terminal must: keys to the shell, output to the screen,
-//! resize, split panes, and scrollback — recent lines in memory, older ones
-//! rebuilt from the pane's panelog (`--log`). No selection, tabs or
-//! configuration yet.
+//! resize, split panes, select, copy and paste, and scrollback — recent
+//! lines in memory, older ones rebuilt from the pane's panelog (`--log`). No
+//! tabs or configuration yet.
 //!
 //! The lanes (design §8.1):
 //! * **console** (default): the program runs under ConPTY — the built-in
@@ -21,7 +21,9 @@
 //! Panes split the window's cell grid (`layout`); every pane draws into the
 //! same frame, so the renderer sees one grid whatever the layout. The keys
 //! are Windows Terminal's defaults: Alt+Shift+Plus / Minus / D split, Alt+Arrow
-//! and a click move the focus, Ctrl+Shift+W closes a pane.
+//! and a click move the focus, Ctrl+Shift+W closes a pane. Dragging selects
+//! (double-click: a word), Ctrl+Shift+C or Ctrl+C with a selection copies,
+//! Ctrl+V or Ctrl+Shift+V pastes.
 //!
 //! Threads: per pane, a reader moves program output into its emulator
 //! (answering the console host's startup queries on the way) and wakes the
@@ -32,6 +34,8 @@
 
 #[cfg_attr(not(windows), allow(dead_code))]
 mod layout;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod select;
 
 #[cfg(windows)]
 fn main() {
@@ -47,10 +51,11 @@ fn main() {
 #[cfg(windows)]
 mod app {
     use crate::layout::{neighbor, pane_at, Dir, Layout, PaneId, Placement, Rect, Toward};
+    use crate::select::{self, Point, Selection};
     use fwrender::win::{display_refresh_hz, CpuPresenter, Event, Waker, Window};
     use fwrender::{
-        Atlas, CellInstance, CpuRenderer, FontRasterizer, Frame, GlyphKey, GlyphPart, Palette,
-        Rasterizer, Sharpening,
+        Atlas, CellInstance, CpuRenderer, FontRasterizer, Frame, GlyphKey, GlyphPart, Highlight,
+        Metrics, Palette, Rasterizer, Sharpening,
     };
     use std::io;
     use std::path::PathBuf;
@@ -95,6 +100,10 @@ keys:
   Alt+Shift+D       split it along its longer side
   Alt+Arrow, click  focus the pane in that direction / under the pointer
   Ctrl+Shift+W      close the focused pane (the last one closes the window)
+  drag, double-click   select text in a pane / select a word
+  Ctrl+Shift+C      copy the selection (Ctrl+C too while there is one;
+                    otherwise Ctrl+C goes to the program)
+  Ctrl+V, Ctrl+Shift+V   paste
   Shift+PgUp/PgDn, wheel   scroll the focused pane back / forward
 ";
 
@@ -569,6 +578,96 @@ keys:
             }
         }
 
+        /// The output line and column under client pixel `(x, y)`, clamped
+        /// into the pane (a drag can leave it). `None` while the view shows
+        /// the log, whose lines are not the emulator's.
+        fn point(&self, x: i32, y: i32, m: Metrics) -> Option<Point> {
+            if self.deep.is_some() || !self.visible() {
+                return None;
+            }
+            let r = self.rect;
+            let row = (y.div_euclid(m.cell_h as i32) - r.top as i32).clamp(0, r.rows as i32 - 1);
+            let col = (x.div_euclid(m.cell_w as i32) - r.left as i32).clamp(0, r.cols as i32 - 1);
+            // The view as last drawn: its top row is `seen_scrolled - back`.
+            let top = self.seen_scrolled.saturating_sub(self.back as u64);
+            Some(Point {
+                line: top + row as u64,
+                col: col as usize,
+            })
+        }
+
+        /// The characters of output line `n`, one per column (a wide
+        /// character's second half repeats it), if the pane still holds it.
+        fn line_chars(term: &Term, n: u64) -> Option<Vec<(char, bool)>> {
+            let history = term.scrollback();
+            let screen = term.screen();
+            let scrolled = history.scrolled_lines();
+            let cell = |c: usize| -> ansi::Cell {
+                if n >= scrolled {
+                    screen.cell((n - scrolled) as usize, c)
+                } else {
+                    history.history_cell((scrolled - 1 - n) as usize, c)
+                }
+            };
+            let held = if n >= scrolled {
+                n - scrolled < screen.rows() as u64
+            } else {
+                scrolled - n <= history.history_len() as u64
+            };
+            if !held {
+                return None;
+            }
+            let mut lead = ' ';
+            Some(
+                (0..screen.cols())
+                    .map(|c| {
+                        let cell = cell(c);
+                        let half = cell.width == ansi::CellWidth::Continuation;
+                        if !half {
+                            lead = cell.ch;
+                        }
+                        (if half { lead } else { cell.ch }, half)
+                    })
+                    .collect(),
+            )
+        }
+
+        /// The selected text.
+        fn selection_text(&self, sel: &Selection) -> String {
+            let term = self.shared.term.lock().unwrap();
+            let (start, end) = sel.ordered();
+            select::text(start, end, term.screen().cols(), |n, from, to| {
+                let chars = Self::line_chars(&term, n)?;
+                Some(
+                    chars[from.min(chars.len())..to.min(chars.len())]
+                        .iter()
+                        .filter(|(_, half)| !half)
+                        .map(|(c, _)| c)
+                        .collect(),
+                )
+            })
+        }
+
+        /// The word under `at`, as a selection.
+        fn word_at(&self, at: Point) -> Option<Selection> {
+            let term = self.shared.term.lock().unwrap();
+            let chars: Vec<char> = Self::line_chars(&term, at.line)?
+                .into_iter()
+                .map(|(c, _)| c)
+                .collect();
+            let (first, last) = select::word_at(&chars, at.col);
+            Some(Selection {
+                anchor: Point {
+                    line: at.line,
+                    col: first,
+                },
+                head: Point {
+                    line: at.line,
+                    col: last,
+                },
+            })
+        }
+
         /// Whether the pane has any cells to draw.
         fn visible(&self) -> bool {
             self.rect.rows > 0 && self.rect.cols > 0
@@ -576,7 +675,14 @@ keys:
 
         /// Bring this pane's part of `frame` up to date. The caller has set
         /// `want` (see the draw loop); it is cleared once the lock is held.
-        fn draw(&mut self, focused: bool, pipe: bool, frame: &mut Frame, pen: &mut Pen) {
+        fn draw(
+            &mut self,
+            focused: bool,
+            selection: Option<&Selection>,
+            pipe: bool,
+            frame: &mut Frame,
+            pen: &mut Pen,
+        ) {
             let r = self.rect;
             let shared = self.shared.clone();
             let mut term = shared.term.lock().unwrap();
@@ -614,6 +720,7 @@ keys:
                         s,
                         0,
                         false,
+                        None,
                         pen.palette,
                         pen.atlas,
                         pen.raster,
@@ -622,6 +729,10 @@ keys:
             } else {
                 self.deep = None;
                 self.back = self.back.min(held);
+                let top = scrolled.saturating_sub(self.back as u64);
+                let highlight = selection
+                    .and_then(|sel| sel.in_view(top, rows, cols))
+                    .map(|(start, end)| Highlight { start, end });
                 frame.update_view_at(
                     r.top,
                     r.left,
@@ -629,6 +740,7 @@ keys:
                     history,
                     self.back,
                     focused,
+                    highlight,
                     pen.palette,
                     pen.atlas,
                     pen.raster,
@@ -978,6 +1090,18 @@ keys:
         let mut layout_dirty = true;
         // A key taken as a command still sends its character; drop it.
         let mut drop_char = false;
+        // The selection (one at a time, in one pane), and where a press that
+        // may become a drag started.
+        let mut selection: Option<(PaneId, Selection)> = None;
+        let mut press: Option<(PaneId, Point)> = None;
+        // Mark the pane holding the selection for redraw, and drop it.
+        let clear = |selection: &mut Option<(PaneId, Selection)>, panes: &[Pane]| {
+            if let Some((id, _)) = selection.take() {
+                if let Some(p) = panes.iter().find(|p| p.id == id) {
+                    p.shared.pending.store(true, Ordering::Release);
+                }
+            }
+        };
         let mut frames: Vec<u64> = Vec::new();
         let finish = |frames: &[u64]| {
             if let Some(path) = &args.stats {
@@ -1008,14 +1132,49 @@ keys:
                 match *e {
                     Event::Char(_) if drop_char => drop_char = false,
                     Event::Char(c) => {
-                        // Typing returns the view to live output.
+                        // Typing returns the view to live output and ends a
+                        // selection.
                         panes[fi].back = 0;
+                        clear(&mut selection, &panes);
                         char_bytes(c, &mut input);
                     }
                     Event::Key { vk, down: true } => {
                         let (ctrl, shift) =
                             (fwrender::win::ctrl_down(), fwrender::win::shift_down());
+                        // AltGr is Ctrl+Alt: leave its characters alone.
+                        let ctrl = ctrl && !fwrender::win::alt_down();
                         let page = panes[fi].rect.rows.max(2) - 1;
+                        // Ctrl+Shift+C, or Ctrl+C while something is selected:
+                        // copy. Plain Ctrl+C otherwise reaches the program.
+                        if vk == 0x43 && ctrl && (shift || selection.is_some()) {
+                            if let Some((id, sel)) = selection {
+                                if let Some(p) = panes.iter().find(|p| p.id == id) {
+                                    let text = p.selection_text(&sel);
+                                    if let Err(e) = surface.window().set_clipboard(&text) {
+                                        eprintln!("fwterm: copy: {e}");
+                                    }
+                                }
+                                if !shift {
+                                    clear(&mut selection, &panes);
+                                }
+                            }
+                            drop_char = true;
+                            continue;
+                        }
+                        // Ctrl+V / Ctrl+Shift+V: paste.
+                        if vk == 0x56 && ctrl {
+                            match surface.window().clipboard() {
+                                Ok(Some(text)) => {
+                                    input.extend_from_slice(&select::paste_bytes(&text));
+                                    panes[fi].back = 0;
+                                    clear(&mut selection, &panes);
+                                }
+                                Ok(None) => {}
+                                Err(e) => eprintln!("fwterm: paste: {e}"),
+                            }
+                            drop_char = true;
+                            continue;
+                        }
                         let pane = &mut panes[fi];
                         match vk {
                             // Ctrl+Shift+W: close the pane.
@@ -1086,6 +1245,8 @@ keys:
                                 }
                                 place_all(&mut panes, &placement);
                                 layout_dirty = true;
+                                selection = None;
+                                press = None;
                             }
                         } else if let Some(to) = toward {
                             if let Some(next) = neighbor(&placement.panes, focus, to) {
@@ -1094,18 +1255,46 @@ keys:
                             }
                         }
                     }
-                    Event::Click(x, y) if x >= 0 && y >= 0 => {
+                    Event::Click(x, y) | Event::DoubleClick(x, y) if x >= 0 && y >= 0 => {
                         let (row, col) = (
                             y as usize / m.cell_h as usize,
                             x as usize / m.cell_w as usize,
                         );
+                        clear(&mut selection, &panes);
+                        press = None;
                         if let Some(id) = pane_at(&placement.panes, row, col) {
                             if id != focus {
                                 focus = id;
                                 layout_dirty = true;
                             }
+                            let pane = panes.iter().find(|p| p.id == id);
+                            if let Some((pane, at)) =
+                                pane.and_then(|p| Some((p, p.point(x, y, m)?)))
+                            {
+                                if matches!(*e, Event::DoubleClick(..)) {
+                                    selection = pane.word_at(at).map(|s| (id, s));
+                                    pane.shared.pending.store(true, Ordering::Release);
+                                } else {
+                                    // A selection starts once the drag leaves
+                                    // this cell.
+                                    press = Some((id, at));
+                                }
+                            }
                         }
                     }
+                    Event::Drag(x, y) => {
+                        if let Some((id, anchor)) = press {
+                            if let Some(pane) = panes.iter().find(|p| p.id == id) {
+                                if let Some(head) = pane.point(x, y, m) {
+                                    if head != anchor || selection.is_some() {
+                                        selection = Some((id, Selection { anchor, head }));
+                                        pane.shared.pending.store(true, Ordering::Release);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Event::Release(..) => press = None,
                     Event::Wheel(delta) => {
                         // Three lines a notch, away from the user = back.
                         let lines = (delta.unsigned_abs() as usize * 3).div_euclid(120).max(1);
@@ -1124,6 +1313,10 @@ keys:
                         place_all(&mut panes, &placement);
                         frame.damage_all();
                         layout_dirty = true;
+                        // Rows rewrap at a new width; the selection would
+                        // point at other text.
+                        selection = None;
+                        press = None;
                     }
                     Event::CloseRequested => {
                         finish(&frames);
@@ -1172,6 +1365,8 @@ keys:
                     focus = next.unwrap_or(0);
                 }
                 layout_dirty = true;
+                selection = None;
+                press = None;
             }
             if layout.is_empty() {
                 // The last pane closed: so does the window, with its code.
@@ -1208,7 +1403,11 @@ keys:
             let mut drew = false;
             for (p, due) in panes.iter_mut().zip(due) {
                 if due {
-                    p.draw(p.id == focus, args.pipe, &mut frame, &mut pen);
+                    let sel = selection
+                        .as_ref()
+                        .filter(|(id, _)| *id == p.id)
+                        .map(|(_, s)| s);
+                    p.draw(p.id == focus, sel, args.pipe, &mut frame, &mut pen);
                     drew = true;
                 }
             }

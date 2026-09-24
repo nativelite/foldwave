@@ -40,8 +40,17 @@ pub enum Event {
         down: bool,
     },
     /// The left mouse button went down at client pixel `(x, y)`
-    /// (`WM_LBUTTONDOWN`).
+    /// (`WM_LBUTTONDOWN`). The window captures the mouse until it is
+    /// released, so a drag keeps reporting outside the window.
     Click(i32, i32),
+    /// The left button went down again quickly at the same place
+    /// (`WM_LBUTTONDBLCLK`); it comes instead of the second [`Event::Click`].
+    DoubleClick(i32, i32),
+    /// The mouse moved to `(x, y)` with the left button down
+    /// (`WM_MOUSEMOVE`); coordinates can be outside the client area.
+    Drag(i32, i32),
+    /// The left button came up at `(x, y)` (`WM_LBUTTONUP`).
+    Release(i32, i32),
     /// The user asked to close the window (`WM_CLOSE`). The window stays
     /// open; drop the [`Window`] to close it.
     CloseRequested,
@@ -147,7 +156,8 @@ fn register_class(hinstance: Hinstance) -> io::Result<()> {
         cb_size: std::mem::size_of::<WndClassExW>() as u32,
         // CS_OWNDC: the window keeps one DC for its lifetime, so the
         // presenter's GetDC/ReleaseDC per present is cheap.
-        style: CS_HREDRAW | CS_VREDRAW | CS_OWNDC,
+        // CS_DBLCLKS: double-clicks arrive as WM_LBUTTONDBLCLK.
+        style: CS_HREDRAW | CS_VREDRAW | CS_OWNDC | CS_DBLCLKS,
         wnd_proc: Some(wnd_proc),
         cls_extra: 0,
         wnd_extra: 0,
@@ -290,6 +300,62 @@ impl Window {
     }
 
     /// A handle that wakes [`Window::wait`] from another thread.
+    /// Put `text` on the clipboard as Unicode text.
+    pub fn set_clipboard(&self, text: &str) -> io::Result<()> {
+        let units: Vec<u16> = text.encode_utf16().chain([0]).collect();
+        let _open = Clipboard::open(self.hwnd)?;
+        // SAFETY: the clipboard is open (and owned by this window) for the
+        // guard's lifetime. The block is `units.len()` u16s; it is written
+        // only between GlobalLock and GlobalUnlock, and freed only if the
+        // system did not take it.
+        unsafe {
+            if EmptyClipboard() == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mem = GlobalAlloc(GMEM_MOVEABLE, units.len() * 2);
+            if mem.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let dst = GlobalLock(mem) as *mut u16;
+            if dst.is_null() {
+                let e = io::Error::last_os_error();
+                GlobalFree(mem);
+                return Err(e);
+            }
+            std::ptr::copy_nonoverlapping(units.as_ptr(), dst, units.len());
+            GlobalUnlock(mem);
+            if SetClipboardData(CF_UNICODETEXT, mem).is_null() {
+                let e = io::Error::last_os_error();
+                GlobalFree(mem);
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// The clipboard's text, if it holds any.
+    pub fn clipboard(&self) -> io::Result<Option<String>> {
+        let _open = Clipboard::open(self.hwnd)?;
+        // SAFETY: the clipboard is open; the handle stays valid until it
+        // closes. The locked block is read within GlobalSize bytes, up to
+        // its terminating NUL, then unlocked.
+        unsafe {
+            let mem = GetClipboardData(CF_UNICODETEXT);
+            if mem.is_null() {
+                return Ok(None);
+            }
+            let src = GlobalLock(mem) as *const u16;
+            if src.is_null() {
+                return Ok(None);
+            }
+            let units = std::slice::from_raw_parts(src, GlobalSize(mem) / 2);
+            let len = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+            let text = String::from_utf16_lossy(&units[..len]);
+            GlobalUnlock(mem);
+            Ok(Some(text))
+        }
+    }
+
     pub fn waker(&self) -> Waker {
         Waker {
             target: Arc::clone(&self.wake_target),
@@ -464,11 +530,28 @@ unsafe extern "system" fn wnd_proc(hwnd: Hwnd, msg: u32, wparam: usize, lparam: 
         // Alt+Space opens the window menu; any other Alt+character would
         // only beep.
         WM_SYSCHAR if wparam != usize::from(b' ') => 0,
-        WM_LBUTTONDOWN => {
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_MOUSEMOVE | WM_LBUTTONUP => {
             // Client coordinates, signed 16-bit words of lparam.
             let x = (lparam & 0xFFFF) as u16 as i16 as i32;
             let y = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
-            push(Event::Click(x, y));
+            match msg {
+                WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+                    // SAFETY: `hwnd` is our live window, on its own thread.
+                    unsafe { SetCapture(hwnd) };
+                    push(if msg == WM_LBUTTONDOWN {
+                        Event::Click(x, y)
+                    } else {
+                        Event::DoubleClick(x, y)
+                    });
+                }
+                WM_MOUSEMOVE if wparam & MK_LBUTTON != 0 => push(Event::Drag(x, y)),
+                WM_MOUSEMOVE => {}
+                _ => {
+                    // SAFETY: no preconditions; a no-op without capture.
+                    unsafe { ReleaseCapture() };
+                    push(Event::Release(x, y));
+                }
+            }
             0
         }
         WM_CLOSE => {
@@ -610,9 +693,39 @@ pub fn shift_down() -> bool {
     unsafe { GetKeyState(0x10) < 0 }
 }
 
+/// Whether an Alt key is down now (`GetKeyState`, as [`shift_down`]).
+pub fn alt_down() -> bool {
+    // SAFETY: as in `shift_down`.
+    unsafe { GetKeyState(0x12) < 0 }
+}
+
 /// Whether a Ctrl key is down now (`GetKeyState`, as [`shift_down`]). Note
 /// that AltGr reports as Ctrl+Alt.
 pub fn ctrl_down() -> bool {
     // SAFETY: as in `shift_down`.
     unsafe { GetKeyState(0x11) < 0 }
+}
+
+/// The clipboard, open for this window until dropped. Another program may
+/// hold it for a moment, so opening retries briefly.
+struct Clipboard;
+
+impl Clipboard {
+    fn open(hwnd: Hwnd) -> io::Result<Clipboard> {
+        for _ in 0..10 {
+            // SAFETY: `hwnd` is a live window; closed again in `drop`.
+            if unsafe { OpenClipboard(hwnd) } != 0 {
+                return Ok(Clipboard);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Err(io::Error::last_os_error())
+    }
+}
+
+impl Drop for Clipboard {
+    fn drop(&mut self) {
+        // SAFETY: this guard exists only while the clipboard is open.
+        unsafe { CloseClipboard() };
+    }
 }
