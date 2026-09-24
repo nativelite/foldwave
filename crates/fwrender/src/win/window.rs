@@ -693,6 +693,27 @@ pub fn shift_down() -> bool {
     unsafe { GetKeyState(0x10) < 0 }
 }
 
+/// Write `text` to the console of the process that started this one, for a
+/// GUI program (no console of its own) run from a terminal: attach to it,
+/// write, and detach again at once, so the terminal's Ctrl+C or closing
+/// never reaches this process. Returns false if the parent has no console
+/// (started from Explorer, say) or the write failed.
+pub fn write_parent_console(text: &str) -> bool {
+    // SAFETY: no preconditions; fails harmlessly if already attached or if
+    // the parent has no console.
+    if unsafe { AttachConsole(u32::MAX) } == 0 {
+        return false;
+    }
+    let ok = std::fs::OpenOptions::new()
+        .write(true)
+        .open("CONOUT$")
+        .and_then(|mut out| io::Write::write_all(&mut out, text.as_bytes()))
+        .is_ok();
+    // SAFETY: attached just above; the CONOUT$ handle is already closed.
+    unsafe { FreeConsole() };
+    ok
+}
+
 /// Whether an Alt key is down now (`GetKeyState`, as [`shift_down`]).
 pub fn alt_down() -> bool {
     // SAFETY: as in `shift_down`.

@@ -408,6 +408,9 @@ extern "system" {
     pub fn GlobalUnlock(mem: Handle) -> Bool;
     pub fn GlobalSize(mem: Handle) -> usize;
     pub fn GlobalFree(mem: Handle) -> Handle;
+    /// `ATTACH_PARENT_PROCESS` (u32::MAX) attaches to the parent's console.
+    pub fn AttachConsole(process: u32) -> Bool;
+    pub fn FreeConsole() -> Bool;
 }
 
 /// `s` as NUL-terminated UTF-16.

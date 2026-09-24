@@ -31,6 +31,9 @@
 //! the panes that changed, at most once per display refresh.
 
 #![forbid(unsafe_code)]
+// A GUI program: Windows gives it no console window of its own. Messages
+// still reach a terminal it was run from (`app::say`).
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
 #[cfg_attr(not(windows), allow(dead_code))]
 mod layout;
@@ -64,6 +67,26 @@ mod app {
     use std::sync::{Arc, Mutex, Weak};
     use std::time::{Duration, Instant};
     use vterm::Term;
+
+    /// Print a message for whoever started fwterm: to stderr when it goes
+    /// somewhere (redirected to a file or pipe), else to the terminal fwterm
+    /// was run from, if any.
+    macro_rules! say {
+        ($($t:tt)*) => {
+            say(&format!($($t)*))
+        };
+    }
+
+    fn say(msg: &str) {
+        use std::os::windows::io::AsRawHandle;
+        if !io::stderr().as_raw_handle().is_null() {
+            eprintln!("{msg}");
+        } else {
+            // A console wants CR LF.
+            let text = format!("{}\r\n", msg.replace('\n', "\r\n"));
+            fwrender::win::write_parent_console(&text);
+        }
+    }
 
     const USAGE: &str = "\
 fwterm - foldwave's minimal terminal prototype
@@ -978,14 +1001,14 @@ keys:
         let args = match parse(&argv) {
             Ok(a) => a,
             Err(msg) => {
-                eprintln!("{msg}");
+                say!("{msg}");
                 return 2;
             }
         };
         match start(&args) {
             Ok(code) => code,
             Err(e) => {
-                eprintln!("fwterm: {e}");
+                say!("fwterm: {e}");
                 1
             }
         }
@@ -1013,7 +1036,7 @@ keys:
                 .filter(|p| p.exists());
             if let Some(dll) = beside {
                 if let Err(e) = pty::use_conpty_library(&dll) {
-                    eprintln!(
+                    say!(
                         "fwterm: {} would not load ({e}); using the built-in console host",
                         dll.display()
                     );
@@ -1032,7 +1055,7 @@ keys:
             match fwrender::vk::VkWindow::new(window, &atlas, fwrender::vk::PresentMode::Mailbox) {
                 Ok(v) => Surface::Vulkan(v),
                 Err(e) => {
-                    eprintln!("fwterm: Vulkan unavailable ({e}); drawing on the CPU");
+                    say!("fwterm: Vulkan unavailable ({e}); drawing on the CPU");
                     Surface::Cpu {
                         window: Window::new(&args.title, args.size.0, args.size.1)?,
                         cpu: CpuRenderer::new(w, h),
@@ -1106,7 +1129,7 @@ keys:
         let finish = |frames: &[u64]| {
             if let Some(path) = &args.stats {
                 if let Err(e) = write_stats(path, &activity, frames) {
-                    eprintln!("fwterm: --stats {path}: {e}");
+                    say!("fwterm: --stats {path}: {e}");
                 }
             }
         };
@@ -1151,7 +1174,7 @@ keys:
                                 if let Some(p) = panes.iter().find(|p| p.id == id) {
                                     let text = p.selection_text(&sel);
                                     if let Err(e) = surface.window().set_clipboard(&text) {
-                                        eprintln!("fwterm: copy: {e}");
+                                        say!("fwterm: copy: {e}");
                                     }
                                 }
                                 if !shift {
@@ -1170,7 +1193,7 @@ keys:
                                     clear(&mut selection, &panes);
                                 }
                                 Ok(None) => {}
-                                Err(e) => eprintln!("fwterm: paste: {e}"),
+                                Err(e) => say!("fwterm: paste: {e}"),
                             }
                             drop_char = true;
                             continue;
@@ -1238,7 +1261,7 @@ keys:
                                         focus = id;
                                     }
                                     Err(e) => {
-                                        eprintln!("fwterm: new pane: {e}");
+                                        say!("fwterm: new pane: {e}");
                                         layout.remove(id);
                                         placement = layout.place(grid_rows, grid_cols);
                                     }

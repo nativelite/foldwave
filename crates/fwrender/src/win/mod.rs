@@ -18,8 +18,8 @@ mod window;
 
 pub use font::GdiRasterizer;
 pub use window::{
-    alt_down, ctrl_down, display_refresh_hz, raise_thread_priority, shift_down, CpuPresenter,
-    Event, Waker, Window,
+    alt_down, ctrl_down, display_refresh_hz, raise_thread_priority, shift_down,
+    write_parent_console, CpuPresenter, Event, Waker, Window,
 };
 
 #[cfg(test)]
