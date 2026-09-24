@@ -37,6 +37,8 @@
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
 #[cfg_attr(not(windows), allow(dead_code))]
+mod governor;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod layout;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod logstore;
@@ -56,6 +58,7 @@ fn main() {
 
 #[cfg(windows)]
 mod app {
+    use crate::governor::{self, Level, Place};
     use crate::layout::{neighbor, pane_at, Dir, Layout, PaneId, Placement, Rect, Toward};
     use crate::logstore;
     use crate::select::{self, Point, Selection};
@@ -130,6 +133,12 @@ options:
   --choose-log-drive   measure how fast each fixed drive takes durable writes,
                 save the fastest with room as log_dir in the settings file,
                 and exit
+  --place P     where pane readers and the UI thread run: off (default: where
+                the OS puts them) or fast (the fast cores of a hybrid CPU,
+                CPU 0 left out; measured no better on an i5-12600K)
+  --governor G  on (default): while other programs keep the CPU nearly
+                full, draw at most 30 frames a second except just after
+                input; off: always draw at the display's rate
   --stats PATH  on exit, write frame statistics for the time output flowed:
                 frames, frames per second, gaps between frames
 
@@ -162,6 +171,8 @@ keys:
         log_cap: Option<u64>,
         no_log: bool,
         choose_log_drive: bool,
+        place: Place,
+        governor: bool,
         panes: usize,
         shell: Vec<String>,
     }
@@ -183,6 +194,8 @@ keys:
             log_cap: None,
             no_log: false,
             choose_log_drive: false,
+            place: Place::Off,
+            governor: true,
             panes: 1,
             shell: vec!["cmd.exe".into()],
         };
@@ -247,6 +260,22 @@ keys:
                 "--no-log" => {
                     a.no_log = true;
                     i += 1;
+                }
+                "--place" => {
+                    let v = value(&mut i, "--place")?;
+                    a.place = match v.as_str() {
+                        "fast" => Place::Fast,
+                        "off" => Place::Off,
+                        _ => return Err(format!("bad --place {v:?}")),
+                    };
+                }
+                "--governor" => {
+                    let v = value(&mut i, "--governor")?;
+                    a.governor = match v.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        _ => return Err(format!("bad --governor {v:?}")),
+                    };
                 }
                 "--choose-log-drive" => {
                     a.choose_log_drive = true;
@@ -1196,8 +1225,12 @@ keys:
         activity: Arc<Activity>,
         waker: Waker,
         log: Option<LogLink>,
+        place: Arc<Vec<u32>>,
     ) {
         std::thread::spawn(move || {
+            if !place.is_empty() {
+                let _ = resmon::cpu::place_current_thread(&place);
+            }
             let mut buf = vec![0u8; 64 * 1024];
             let mut watcher = fwbench::terminal::Watcher::new();
             loop {
@@ -1288,6 +1321,8 @@ keys:
     struct Spawner<'a> {
         args: &'a Args,
         logs: &'a Logs,
+        /// CPU sets for pane readers (empty: anywhere).
+        place: Arc<Vec<u32>>,
         waker: Waker,
         activity: Arc<Activity>,
     }
@@ -1346,6 +1381,7 @@ keys:
                     self.activity.clone(),
                     self.waker.clone(),
                     log.clone(),
+                    self.place.clone(),
                 )
             };
             let session = if args.pipe {
@@ -1391,6 +1427,32 @@ keys:
                 deep: None,
             })
         }
+    }
+
+    /// How often the governor reads the CPU counters.
+    const PRESSURE_EVERY: Duration = Duration::from_millis(500);
+
+    /// Watch how busy other programs keep the machine; the flag is true while
+    /// it is [`Level::Busy`].
+    fn start_pressure_watch() -> Arc<AtomicBool> {
+        let busy = Arc::new(AtomicBool::new(false));
+        let flag = busy.clone();
+        std::thread::spawn(move || {
+            let Ok(mut before) = resmon::cpu::times() else {
+                return;
+            };
+            let mut level = Level::Calm;
+            loop {
+                std::thread::sleep(PRESSURE_EVERY);
+                let Ok(now) = resmon::cpu::times() else {
+                    return;
+                };
+                level = governor::next(level, resmon::cpu::load(&before, &now));
+                flag.store(level == Level::Busy, Ordering::Release);
+                before = now;
+            }
+        });
+        busy
     }
 
     pub fn run() -> i32 {
@@ -1495,9 +1557,20 @@ keys:
             last_output: AtomicU64::new(0),
         });
         let logs = Logs::open(args);
+        let cpus = resmon::cpu::topology().unwrap_or_default();
+        let place = Arc::new(governor::placement(&cpus, args.place));
+        if !place.is_empty() {
+            let _ = resmon::cpu::place_current_thread(&place);
+        }
+        let busy = if args.governor {
+            start_pressure_watch()
+        } else {
+            Arc::new(AtomicBool::new(false))
+        };
         let spawner = Spawner {
             args,
             logs: &logs,
+            place: place.clone(),
             waker: surface.window().waker(),
             activity: activity.clone(),
         };
@@ -1522,6 +1595,7 @@ keys:
         let mut events = Vec::new();
         let mut input = Vec::new();
         let mut last_draw: Option<Instant> = None;
+        let mut last_input = Instant::now();
         // The panes moved, or the focus did: redraw every pane and divider.
         let mut layout_dirty = true;
         // A key taken as a command still sends its character; drop it.
@@ -1552,12 +1626,24 @@ keys:
                 || panes
                     .iter()
                     .any(|p| p.shared.pending.load(Ordering::Acquire));
+            let level = if busy.load(Ordering::Acquire) {
+                Level::Busy
+            } else {
+                Level::Calm
+            };
+            let interval = governor::frame_interval(min_interval, level, last_input.elapsed());
             let timeout = match last_draw {
-                Some(t) if due => Some(min_interval.saturating_sub(t.elapsed())),
+                Some(t) if due => Some(interval.saturating_sub(t.elapsed())),
                 _ => None,
             };
             events.clear();
             surface.window().wait(timeout, &mut events);
+            if events
+                .iter()
+                .any(|e| !matches!(e, Event::Woken | Event::Paint))
+            {
+                last_input = Instant::now();
+            }
             input.clear();
             // Panes to take out after the events: (pane, kill it).
             let mut closing: Vec<(PaneId, bool)> = Vec::new();
@@ -1813,7 +1899,7 @@ keys:
                 placement = layout.place(grid_rows, grid_cols);
                 place_all(&mut panes, &placement);
             }
-            if last_draw.map_or(false, |t| t.elapsed() < min_interval) {
+            if last_draw.map_or(false, |t| t.elapsed() < interval) {
                 continue;
             }
             let mut pen = Pen {

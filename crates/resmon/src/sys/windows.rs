@@ -143,6 +143,74 @@ extern "system" {
     ) -> Bool;
     fn GetLogicalDrives() -> u32;
     fn GetDriveTypeW(root: *const u16) -> u32;
+    fn GetSystemCpuSetInformation(
+        info: *mut u8,
+        len: u32,
+        returned: *mut u32,
+        process: Handle,
+        flags: u32,
+    ) -> Bool;
+    fn GetSystemTimes(idle: *mut FileTime, kernel: *mut FileTime, user: *mut FileTime) -> Bool;
+    fn GetCurrentProcess() -> Handle;
+    fn GetCurrentThread() -> Handle;
+    fn SetThreadSelectedCpuSets(thread: Handle, ids: *const u32, count: u32) -> Bool;
+}
+
+/// The raw `SYSTEM_CPU_SET_INFORMATION` records for every logical processor.
+pub fn cpu_sets() -> io::Result<Vec<u8>> {
+    let mut len = 0u32;
+    // SAFETY: a null buffer of length 0 asks only for the size needed.
+    unsafe {
+        GetSystemCpuSetInformation(std::ptr::null_mut(), 0, &mut len, std::ptr::null_mut(), 0)
+    };
+    let mut buf = vec![0u8; len as usize];
+    // SAFETY: `buf` holds `len` bytes, as passed.
+    if unsafe {
+        GetSystemCpuSetInformation(buf.as_mut_ptr(), len, &mut len, std::ptr::null_mut(), 0)
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    buf.truncate(len as usize);
+    Ok(buf)
+}
+
+/// Machine-wide busy and total CPU time, and this process's.
+pub fn cpu_times() -> io::Result<crate::cpu::Times> {
+    let (mut idle, mut kernel, mut user) = Default::default();
+    // SAFETY: three valid out-pointers.
+    if unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let (mut c, mut e, mut pk, mut pu) = Default::default();
+    // SAFETY: the current-process pseudo-handle is always valid; valid
+    // out-pointers.
+    if unsafe { GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut pk, &mut pu) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let _: (FileTime, FileTime) = (c, e);
+    // Kernel time includes idle time.
+    let total = kernel.nanos() + user.nanos();
+    Ok(crate::cpu::Times {
+        machine_busy: total.saturating_sub(idle.nanos()),
+        machine_total: total,
+        process: pk.nanos() + pu.nanos(),
+    })
+}
+
+/// Restrict the calling thread to the CPU sets `ids`; empty clears it.
+pub fn place_current_thread(ids: &[u32]) -> io::Result<()> {
+    let ptr = if ids.is_empty() {
+        std::ptr::null()
+    } else {
+        ids.as_ptr()
+    };
+    // SAFETY: the current-thread pseudo-handle is always valid; `ptr` points
+    // at `ids.len()` ids, or is null with a count of 0, which clears.
+    if unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), ptr, ids.len() as u32) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// `GetDriveTypeW`: a fixed disk (not removable, network, optical or RAM).

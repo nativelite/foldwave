@@ -37,6 +37,21 @@ pub fn volume(_path: &std::path::Path) -> io::Result<crate::volume::Volume> {
     unsupported()
 }
 
+/// Always fails on an unsupported platform.
+pub fn cpu_sets() -> io::Result<Vec<u8>> {
+    unsupported()
+}
+
+/// Always fails on an unsupported platform.
+pub fn cpu_times() -> io::Result<crate::cpu::Times> {
+    unsupported()
+}
+
+/// Always fails on an unsupported platform.
+pub fn place_current_thread(_ids: &[u32]) -> io::Result<()> {
+    unsupported()
+}
+
 /// None known on an unsupported platform.
 pub fn fixed_volumes() -> Vec<std::path::PathBuf> {
     Vec::new()

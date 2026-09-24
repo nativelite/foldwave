@@ -10,9 +10,15 @@
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::{fixed_volumes, processes, snapshot, system_info, volume};
+pub use windows::{
+    cpu_sets, cpu_times, fixed_volumes, place_current_thread, processes, snapshot, system_info,
+    volume,
+};
 
 #[cfg(not(windows))]
 mod unsupported;
 #[cfg(not(windows))]
-pub use unsupported::{fixed_volumes, processes, snapshot, system_info, volume};
+pub use unsupported::{
+    cpu_sets, cpu_times, fixed_volumes, place_current_thread, processes, snapshot, system_info,
+    volume,
+};

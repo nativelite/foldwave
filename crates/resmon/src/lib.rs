@@ -36,6 +36,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+pub mod cpu;
 pub mod delta;
 pub mod gpu;
 pub mod proc;
