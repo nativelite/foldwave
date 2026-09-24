@@ -268,6 +268,20 @@ impl<'a> Context<'a> {
         Ok(Context { cuda, raw })
     }
 
+    /// Create a context whose waits sleep rather than spin
+    /// (`CU_CTX_SCHED_BLOCKING_SYNC`): slower to notice finished work by a
+    /// few microseconds, but no CPU burned while the GPU runs. For background
+    /// work on a machine whose CPU belongs to other programs.
+    pub fn new_blocking(cuda: &'a Cuda, device: &Device) -> Result<Context<'a>, Error> {
+        const CU_CTX_SCHED_BLOCKING_SYNC: u32 = 0x04;
+        let mut raw: CuContext = std::ptr::null_mut();
+        // SAFETY: `raw` is a valid out-pointer; the flag is a documented
+        // scheduling mode; `device.raw` came from cuDeviceGet.
+        let r = unsafe { (cuda.api.ctx_create)(&mut raw, CU_CTX_SCHED_BLOCKING_SYNC, device.raw) };
+        cuda.check("cuCtxCreate_v2", r)?;
+        Ok(Context { cuda, raw })
+    }
+
     fn api(&self) -> &Api {
         &self.cuda.api
     }
@@ -304,6 +318,44 @@ impl<'a> Context<'a> {
         check_len(src.len, dst.len())?;
         self.make_current()?;
         self.d2h_current(dst, src)
+    }
+
+    /// Copy `src` into the start of `dst`, which may be longer. Synchronous.
+    pub fn copy_h2d_prefix(&self, dst: &DeviceBuffer<'_>, src: &[u8]) -> Result<(), Error> {
+        self.check_owner(dst.owner.raw)?;
+        if src.len() > dst.len {
+            return Err(Error::SizeMismatch {
+                device: dst.len,
+                host: src.len(),
+            });
+        }
+        if src.is_empty() {
+            return Ok(());
+        }
+        self.make_current()?;
+        // SAFETY: `src` is readable for `src.len()` bytes, and `dst.ptr` is a
+        // device allocation of at least that many (checked above).
+        let r = unsafe { (self.api().memcpy_htod)(dst.ptr, src.as_ptr().cast(), src.len()) };
+        self.cuda.check("cuMemcpyHtoD_v2", r)
+    }
+
+    /// Copy the start of `src`, `dst.len()` bytes, into `dst`. Synchronous.
+    pub fn copy_d2h_prefix(&self, dst: &mut [u8], src: &DeviceBuffer<'_>) -> Result<(), Error> {
+        self.check_owner(src.owner.raw)?;
+        if dst.len() > src.len {
+            return Err(Error::SizeMismatch {
+                device: src.len,
+                host: dst.len(),
+            });
+        }
+        if dst.is_empty() {
+            return Ok(());
+        }
+        self.make_current()?;
+        // SAFETY: `dst` is writable for `dst.len()` bytes, and `src.ptr` is a
+        // device allocation of at least that many (checked above).
+        let r = unsafe { (self.api().memcpy_dtoh)(dst.as_mut_ptr().cast(), src.ptr, dst.len()) };
+        self.cuda.check("cuMemcpyDtoH_v2", r)
     }
 
     fn check_owner(&self, owner: CuContext) -> Result<(), Error> {

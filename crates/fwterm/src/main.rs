@@ -40,6 +40,8 @@
 #[cfg_attr(not(windows), allow(dead_code))]
 mod governor;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod indexer;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod layout;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod logstore;
@@ -60,6 +62,7 @@ fn main() {
 #[cfg(windows)]
 mod app {
     use crate::governor::{self, Hidden, Level, Place};
+    use crate::indexer;
     use crate::layout::{neighbor, pane_at, Dir, Layout, PaneId, Placement, Rect, Toward};
     use crate::logstore;
     use crate::select::{self, Point, Selection};
@@ -142,6 +145,9 @@ options:
                 logs, catching up from its log when shown again: always
                 (default), busy (only while other programs keep the CPU
                 nearly full), or never. Without a log it keeps parsing
+  --gpu-index G on (default): build the logs' search signatures on the GPU
+                (NVIDIA, through its driver), off the loggers' threads; off:
+                on each pane's logger thread. Without CUDA it is off
   --governor G  on (default): while other programs keep the CPU nearly
                 full, draw at most 30 frames a second except just after
                 input; off: always draw at the display's rate
@@ -180,6 +186,7 @@ keys:
         choose_log_drive: bool,
         place: Place,
         governor: bool,
+        gpu_index: bool,
         hidden: Hidden,
         zoom: bool,
         panes: usize,
@@ -205,6 +212,7 @@ keys:
             choose_log_drive: false,
             place: Place::Off,
             governor: true,
+            gpu_index: true,
             hidden: Hidden::Always,
             zoom: false,
             panes: 1,
@@ -291,6 +299,14 @@ keys:
                         "always" => Hidden::Always,
                         "never" => Hidden::Never,
                         _ => return Err(format!("bad --hidden {v:?}")),
+                    };
+                }
+                "--gpu-index" => {
+                    let v = value(&mut i, "--gpu-index")?;
+                    a.gpu_index = match v.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        _ => return Err(format!("bad --gpu-index {v:?}")),
                     };
                 }
                 "--governor" => {
@@ -490,25 +506,113 @@ keys:
     /// to the pane's current generation under `pane_dir`, starting the next
     /// one when told, and flushing whenever it has nothing waiting so the log
     /// is readable up to the recent past.
-    fn start_logger(pane_dir: PathBuf, id: PaneId) -> io::Result<SyncSender<LogMsg>> {
+    /// A finished search signature on its way back to a logger:
+    /// (generation, block, signature).
+    type SigReply = std::sync::mpsc::Sender<(u32, u64, Vec<u8>)>;
+    type GpuIndexer = indexer::Indexer<SigReply>;
+
+    /// A logger's search signatures when the GPU builds them: the blocks it
+    /// has cut, and signatures back early, waiting for their turn.
+    struct Signing {
+        indexer: GpuIndexer,
+        reply: SigReply,
+        stager: indexer::BlockStager,
+        ready: std::collections::BTreeMap<u64, Vec<u8>>,
+    }
+
+    impl Signing {
+        /// Hand every block `bytes` completes to the GPU, or build it here
+        /// when the GPU cannot take it now; then store what is in order.
+        fn appended(&mut self, bytes: &[u8], generation: u32, w: &mut panelog::Writer) {
+            for st in self.stager.push(bytes) {
+                let local = match st.lead {
+                    // A generation's first block: nothing before it to send.
+                    None => Some(panelog::signature(None, &st.bytes)),
+                    Some(lead) => {
+                        let job = indexer::Job {
+                            reply: self.reply.clone(),
+                            generation,
+                            block: st.block,
+                            lead,
+                            bytes: st.bytes,
+                        };
+                        self.indexer
+                            .submit(job)
+                            .err()
+                            .map(|j| panelog::signature(Some(j.lead), &j.bytes))
+                    }
+                };
+                if let Some(sig) = local {
+                    self.indexer.counts.cpu.fetch_add(1, Ordering::Relaxed);
+                    self.ready.insert(st.block, sig);
+                }
+            }
+            self.store(w);
+        }
+
+        fn arrived(&mut self, block: u64, sig: Vec<u8>, w: &mut panelog::Writer) {
+            self.ready.insert(block, sig);
+            self.store(w);
+        }
+
+        fn store(&mut self, w: &mut panelog::Writer) {
+            while let Some(sig) = self.ready.remove(&w.signature_count()) {
+                if w.add_signature(w.signature_count(), &sig).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn start_logger(
+        pane_dir: PathBuf,
+        id: PaneId,
+        gpu: Option<GpuIndexer>,
+    ) -> io::Result<SyncSender<LogMsg>> {
         let cfg = panelog::Config {
             pane: u64::from(std::process::id()) << 16 | id as u64,
             ..panelog::Config::default()
         };
+        let deferred = gpu.is_some();
         let open = move |n: u32| {
             let dir = pane_dir.join(logstore::gen_name(logstore::now_ms(), n));
-            panelog::Writer::create(&dir, cfg)
+            let mut w = panelog::Writer::create(&dir, cfg)?;
+            if deferred {
+                w.defer_signatures()?;
+            }
+            Ok::<_, io::Error>(w)
         };
-        let mut generation = 0;
+        let mut generation = 0u32;
         let mut writer = open(generation)?;
         let (tx, rx) = std::sync::mpsc::sync_channel::<LogMsg>(LOG_QUEUE);
+        let (sig_tx, sig_rx) = std::sync::mpsc::channel();
+        let mut signing = gpu.map(|indexer| Signing {
+            indexer,
+            reply: sig_tx,
+            stager: indexer::BlockStager::default(),
+            ready: Default::default(),
+        });
         std::thread::spawn(move || {
             let mut dirty = false;
             loop {
-                match rx.recv_timeout(Duration::from_millis(50)) {
+                let msg = rx.recv_timeout(Duration::from_millis(50));
+                // Signatures back from the GPU, for this generation only: an
+                // older one's are rebuilt by panelog when it is opened.
+                if let Some(s) = signing.as_mut() {
+                    while let Ok((g, block, sig)) = sig_rx.try_recv() {
+                        if g == generation {
+                            s.arrived(block, sig, &mut writer);
+                            dirty = true;
+                        }
+                    }
+                }
+                match msg {
                     Ok(LogMsg::Data(bytes, t)) => {
                         if writer.append(&bytes, t).is_err() {
                             return;
+                        }
+                        if let Some(s) = signing.as_mut() {
+                            s.appended(&bytes, generation, &mut writer);
                         }
                         dirty = true;
                     }
@@ -523,6 +627,10 @@ keys:
                             Ok(w) => w,
                             Err(_) => return,
                         };
+                        if let Some(s) = signing.as_mut() {
+                            s.stager = indexer::BlockStager::default();
+                            s.ready.clear();
+                        }
                         let _ = writer.checkpoint(&blob);
                         dirty = true;
                     }
@@ -954,7 +1062,12 @@ keys:
     }
 
     /// Frame statistics over the time output was arriving, for `--stats`.
-    fn write_stats(path: &str, activity: &Activity, frames: &[u64]) -> io::Result<()> {
+    fn write_stats(
+        path: &str,
+        activity: &Activity,
+        frames: &[u64],
+        index: Option<&indexer::Counts>,
+    ) -> io::Result<()> {
         let (first, last) = (
             activity.first_output.load(Ordering::Acquire),
             activity.last_output.load(Ordering::Acquire),
@@ -984,6 +1097,16 @@ keys:
             pct(0.99),
             gaps.last().map_or(0.0, |&g| g as f64 / 1e6),
         );
+        // Search signatures: how many the GPU built, how many the loggers did.
+        let text = match index {
+            Some(c) => format!(
+                "{text}index_gpu_blocks {}\nindex_cpu_blocks {}\nindex_launches {}\n",
+                c.gpu.load(Ordering::Relaxed),
+                c.cpu.load(Ordering::Relaxed),
+                c.launches.load(Ordering::Relaxed)
+            ),
+            None => text,
+        };
         std::fs::write(path, text)
     }
 
@@ -1405,6 +1528,8 @@ keys:
         logs: &'a Logs,
         /// CPU sets for pane readers (empty: anywhere).
         place: Arc<Vec<u32>>,
+        /// Builds the logs' search signatures on the GPU, if it can.
+        gpu: Option<GpuIndexer>,
         waker: Waker,
         activity: Arc<Activity>,
     }
@@ -1437,7 +1562,7 @@ keys:
             let (log, pane_dir) = match &self.logs.store {
                 Some(store) => {
                     let dir = store.session.pane_dir(id);
-                    match start_logger(dir.clone(), id) {
+                    match start_logger(dir.clone(), id, self.gpu.clone()) {
                         Ok(tx) => (
                             Some(LogLink {
                                 tx,
@@ -1739,10 +1864,19 @@ keys:
         } else {
             Arc::new(AtomicBool::new(false))
         };
+        let gpu = (args.gpu_index && logs.store.is_some())
+            .then(|| {
+                indexer::Indexer::start(|r: &SigReply, g, b, sig| {
+                    let _ = r.send((g, b, sig));
+                })
+            })
+            .flatten();
+        let index_counts = gpu.as_ref().map(|g| g.counts.clone());
         let spawner = Spawner {
             args,
             logs: &logs,
             place: place.clone(),
+            gpu,
             waker: surface.window().waker(),
             activity: activity.clone(),
         };
@@ -1794,7 +1928,7 @@ keys:
         let mut frames: Vec<u64> = Vec::new();
         let finish = |frames: &[u64]| {
             if let Some(path) = &args.stats {
-                if let Err(e) = write_stats(path, &activity, frames) {
+                if let Err(e) = write_stats(path, &activity, frames, index_counts.as_deref()) {
                     say!("fwterm: --stats {path}: {e}");
                 }
             }

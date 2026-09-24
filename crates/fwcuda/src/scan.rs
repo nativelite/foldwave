@@ -193,8 +193,8 @@ impl Drop for ByteCounter<'_> {
 pub const SIG_BLOCK: usize = 1 << 20;
 pub const SIG_BYTES: usize = 1 << 13;
 
-/// The kernel: `trigram_sigs(data, lead, out)`. CTA `k` builds the signature
-/// of the 1 MiB block at `data[lead + k MiB ..]`: one bit for every trigram
+/// The kernel: `trigram_sigs(data, lead, stride, out)`. CTA `k` builds the
+/// signature of the 1 MiB block at `data[lead + k * stride ..]`: one bit for every trigram
 /// (ASCII case-folded) that ends in the block, at
 /// `((a | b << 8 | c << 16) * 0x9E3779B1) >> 16`, the index panelog's search
 /// signatures use. `lead` bytes before the first block (0 or 2) supply the
@@ -209,6 +209,7 @@ const SIGS_PTX: &str = "\
 .visible .entry trigram_sigs(
     .param .u64 p_data,
     .param .u32 p_lead,
+    .param .u64 p_stride,
     .param .u64 p_out
 )
 {
@@ -220,6 +221,7 @@ const SIGS_PTX: &str = "\
     ld.param.u64 %rd1, [p_data];
     ld.param.u32 %r1, [p_lead];
     ld.param.u64 %rd2, [p_out];
+    ld.param.u64 %rd11, [p_stride];
     cvta.to.global.u64 %rd1, %rd1;
     cvta.to.global.u64 %rd2, %rd2;
     mov.u32 %r2, %tid.x;
@@ -240,7 +242,7 @@ ZEROED:
     bar.sync 0;
 
     cvt.u64.u32 %rd3, %r4;
-    shl.b64 %rd3, %rd3, 20;
+    mul.lo.u64 %rd3, %rd3, %rd11;
     cvt.u64.u32 %rd4, %r1;
     add.u64 %rd3, %rd3, %rd4;
     add.u64 %rd5, %rd3, 1048576;
@@ -338,18 +340,24 @@ impl<'c> TrigramSigs<'c> {
         Ok(TrigramSigs { ctx, module, func })
     }
 
-    /// Build the signatures of `blocks` whole 1 MiB blocks that start `lead`
-    /// bytes (0 or 2) into `data`, into `out` ([`SIG_BYTES`] each), and wait.
+    /// Build the signatures of `blocks` whole 1 MiB blocks into `out`
+    /// ([`SIG_BYTES`] each), and wait. Block `k` starts at
+    /// `lead + k * stride` in `data`, with the two bytes before it the
+    /// trigram lead-in (`lead` 0: the first block has none). A contiguous log
+    /// has `stride` [`SIG_BLOCK`]; blocks gathered from several logs, each
+    /// behind its own two lead bytes, have `SIG_BLOCK + 2` and `lead` 2.
     pub fn build(
         &self,
         data: &DeviceBuffer<'_>,
         lead: u32,
+        stride: usize,
         blocks: usize,
         out: &DeviceBuffer<'_>,
     ) -> Result<(), Error> {
         self.ctx.check_owner(data.owner.raw)?;
         self.ctx.check_owner(out.owner.raw)?;
-        if lead > 2 || data.len < lead as usize + blocks * SIG_BLOCK {
+        let need = lead as usize + blocks.saturating_sub(1) * stride + SIG_BLOCK;
+        if lead > 2 || stride < SIG_BLOCK || (blocks > 0 && data.len < need) {
             return Err(Error::InvalidArgument("data shorter than lead + blocks"));
         }
         if out.len < blocks * SIG_BYTES {
@@ -361,16 +369,18 @@ impl<'c> TrigramSigs<'c> {
             return Ok(());
         }
         self.ctx.make_current()?;
-        let (mut p_data, mut p_lead, mut p_out) = (data.ptr, lead, out.ptr);
-        let mut params: [*mut c_void; 3] = [
+        let (mut p_data, mut p_lead, mut p_stride, mut p_out) =
+            (data.ptr, lead, stride as u64, out.ptr);
+        let mut params: [*mut c_void; 4] = [
             (&mut p_data as *mut u64).cast(),
             (&mut p_lead as *mut u32).cast(),
+            (&mut p_stride as *mut u64).cast(),
             (&mut p_out as *mut u64).cast(),
         ];
-        // SAFETY: `func` is `trigram_sigs`, whose three parameters are the
-        // values `params` points at, alive across the call; one CTA per block
-        // reads `data[lead + k MiB - 2 .. lead + (k + 1) MiB]` (bytes below
-        // index 2 are never read) and writes `out[k * 8 KiB ..][..8 KiB]`,
+        // SAFETY: `func` is `trigram_sigs`, whose four parameters are the
+        // values `params` points at, alive across the call; CTA `k` reads
+        // `data[lead + k * stride - 2 .. lead + k * stride + 1 MiB]` (bytes
+        // below index 2 are never read) and writes `out[k * 8 KiB ..][..8 KiB]`,
         // all inside the checked lengths.
         let r = unsafe {
             (self.ctx.api().launch_kernel)(

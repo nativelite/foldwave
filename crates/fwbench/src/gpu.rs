@@ -313,7 +313,7 @@ pub fn index_trial(
         let out = fwcuda::DeviceBuffer::new(&ctx, batch * SIG_BYTES)?;
         // Warm the kernel and the copies once, unrecorded.
         ctx.copy_h2d(&first, &data[..batch * SIG_BLOCK])?;
-        kernel.build(&first, 0, batch, &out)?;
+        kernel.build(&first, 0, SIG_BLOCK, batch, &out)?;
         let (run, got) = timed(format!("GPU, {batch} MiB per launch"), || {
             let mut all = vec![0u8; mib * SIG_BYTES];
             let mut part = vec![0u8; batch * SIG_BYTES];
@@ -328,10 +328,10 @@ pub fn index_trial(
                 } else {
                     if k == 0 {
                         ctx.copy_h2d(&first, &data[..n * SIG_BLOCK])?;
-                        kernel.build(&first, 0, n, &out)?;
+                        kernel.build(&first, 0, SIG_BLOCK, n, &out)?;
                     } else {
                         ctx.copy_h2d(&rest, &data[start - 2..start + n * SIG_BLOCK])?;
-                        kernel.build(&rest, 2, n, &out)?;
+                        kernel.build(&rest, 2, SIG_BLOCK, n, &out)?;
                     }
                     ctx.copy_d2h(&mut part, &out)?;
                     all[k * SIG_BYTES..(k + n) * SIG_BYTES].copy_from_slice(&part);
@@ -411,11 +411,11 @@ mod index_tests {
         let out = fwcuda::DeviceBuffer::new(&ctx, 4 * SIG_BYTES).unwrap();
         let mut got = vec![0u8; 8 * SIG_BYTES];
         ctx.copy_h2d(&first, &data[..4 * SIG_BLOCK]).unwrap();
-        k.build(&first, 0, 4, &out).unwrap();
+        k.build(&first, 0, SIG_BLOCK, 4, &out).unwrap();
         ctx.copy_d2h(&mut got[..4 * SIG_BYTES], &out).unwrap();
         ctx.copy_h2d(&rest, &data[4 * SIG_BLOCK - 2..8 * SIG_BLOCK])
             .unwrap();
-        k.build(&rest, 2, 4, &out).unwrap();
+        k.build(&rest, 2, SIG_BLOCK, 4, &out).unwrap();
         ctx.copy_d2h(&mut got[4 * SIG_BYTES..], &out).unwrap();
         assert_eq!(got, want, "GPU");
     }
@@ -439,7 +439,7 @@ pub fn index_load(batch_mib: usize, run: Duration) -> Result<String, fwcuda::Err
     let (started, mut launches) = (Instant::now(), 0u64);
     while started.elapsed() < run {
         ctx.copy_h2d(&data, host.as_slice())?;
-        kernel.build(&data, 2, batch_mib, &out)?;
+        kernel.build(&data, 2, SIG_BLOCK, batch_mib, &out)?;
         ctx.copy_d2h(&mut sigs, &out)?;
         launches += 1;
     }
