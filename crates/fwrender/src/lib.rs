@@ -29,6 +29,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 mod atlas;
+mod catalog;
 mod cpu;
 mod font;
 mod frame;
@@ -39,6 +40,7 @@ pub mod vk;
 pub mod win;
 
 pub use atlas::{Atlas, GlyphKey, GlyphPart, Metrics, Rasterizer, TestRasterizer, BOLD, ITALIC};
+pub use catalog::{font_dirs, Family, FontCatalog};
 pub use cpu::{blend, CpuRenderer};
-pub use font::{system_font_dir, FontFile, FontRasterizer, Sharpening};
+pub use font::{default_fallbacks, system_font_dir, FontFile, FontRasterizer, Sharpening};
 pub use frame::{CellInstance, Frame, Highlight, Palette, STRIKE, UNDERLINE};

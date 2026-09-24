@@ -100,6 +100,8 @@ options:
                 fwterm.exe is used if present, else the built-in console host
   --pipe        run the program with no console: output over plain pipes
                 (native speed), keys to its stdin
+  --font NAME   font family, as installed (default Consolas); an unknown
+                name lists the monospaced families found
   --px N        font size in pixels per em (default 16)
   --size WxH    client area in pixels (default 1200x720)
   --no-sharpen  draw the raw glyph outlines (no fitting or stem snapping)
@@ -133,6 +135,7 @@ keys:
     struct Args {
         backend: String,
         conpty: Option<String>,
+        font: Option<String>,
         px: f32,
         size: (u32, u32),
         sharpen: bool,
@@ -150,6 +153,7 @@ keys:
         let mut a = Args {
             backend: "vulkan".into(),
             conpty: None,
+            font: None,
             px: 16.0,
             size: (1200, 720),
             sharpen: true,
@@ -178,6 +182,7 @@ keys:
                     }
                 }
                 "--conpty" => a.conpty = Some(value(&mut i, "--conpty")?),
+                "--font" => a.font = Some(value(&mut i, "--font")?),
                 "--px" => {
                     let v = value(&mut i, "--px")?;
                     a.px = v
@@ -1043,7 +1048,18 @@ keys:
                 }
             }
         }
-        let mut raster = FontRasterizer::consolas(args.px)?;
+        let mut raster = match &args.font {
+            // Consolas by its known files: no need to scan the font folders.
+            None => FontRasterizer::consolas(args.px)?,
+            Some(name) => {
+                let catalog = fwrender::FontCatalog::system();
+                let family = catalog.family(name).map_err(|e| {
+                    let known = catalog.monospace_families().join(", ");
+                    io::Error::new(e.kind(), format!("{e}; monospaced fonts found: {known}"))
+                })?;
+                FontRasterizer::from_family(&family, args.px)?
+            }
+        };
         if !args.sharpen {
             raster.set_sharpening(Sharpening::OFF);
         }
@@ -1476,6 +1492,9 @@ keys:
             assert!(parse(&argv(&["--backend", "gl"])).is_err());
             assert!(parse(&argv(&["--size", "10x10"])).is_err());
             assert_eq!(parse(&argv(&[])).unwrap().shell, ["cmd.exe"]);
+            let f = parse(&argv(&["--font", "Cascadia Mono"])).unwrap();
+            assert_eq!(f.font.as_deref(), Some("Cascadia Mono"));
+            assert!(parse(&argv(&[])).unwrap().font.is_none());
         }
 
         #[test]

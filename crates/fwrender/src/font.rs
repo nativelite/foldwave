@@ -93,6 +93,17 @@ pub fn system_font_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/usr/share/fonts"))
 }
 
+/// Fonts tried, in order, for characters the main font lacks: MS Gothic
+/// (Japanese), Malgun Gothic (Korean) and Segoe UI Symbol, from the system
+/// font directory.
+pub fn default_fallbacks() -> Vec<FontFile> {
+    let dir = system_font_dir();
+    ["msgothic.ttc", "malgun.ttf", "seguisym.ttf"]
+        .iter()
+        .map(|n| FontFile::new(dir.join(n)))
+        .collect()
+}
+
 /// How much work goes into crisp small text. Each step is cheap and
 /// independent; [`Sharpening::OFF`] is the raw, exact outline.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -222,8 +233,8 @@ impl FontRasterizer {
         })
     }
 
-    /// Consolas with its bold and italic faces, plus MS Gothic, Malgun Gothic
-    /// and Segoe UI Symbol as fallbacks, from the system font directory.
+    /// Consolas with its bold and italic faces and the [`default_fallbacks`],
+    /// from the system font directory.
     pub fn consolas(px_per_em: f32) -> io::Result<FontRasterizer> {
         let dir = system_font_dir();
         let file = |n: &str| FontFile::new(dir.join(n));
@@ -239,11 +250,22 @@ impl FontRasterizer {
                 i.path.exists().then_some(&i),
                 z.path.exists().then_some(&z),
             ],
-            &[
-                file("msgothic.ttc"),
-                file("malgun.ttf"),
-                file("seguisym.ttf"),
+            &default_fallbacks(),
+            px_per_em,
+        )
+    }
+
+    /// An installed family ([`crate::FontCatalog::family`]) with the
+    /// [`default_fallbacks`].
+    pub fn from_family(family: &crate::Family, px_per_em: f32) -> io::Result<FontRasterizer> {
+        FontRasterizer::new(
+            &family.regular,
+            [
+                family.bold.as_ref(),
+                family.italic.as_ref(),
+                family.bold_italic.as_ref(),
             ],
+            &default_fallbacks(),
             px_per_em,
         )
     }
