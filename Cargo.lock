@@ -47,6 +47,7 @@ dependencies = [
  "nativelite-fwrender",
  "nativelite-panelog",
  "nativelite-pty",
+ "nativelite-resmon",
  "nativelite-vterm",
 ]
 

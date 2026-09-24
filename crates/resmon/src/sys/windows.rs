@@ -8,7 +8,9 @@
 use crate::delta::{Snapshot, SystemInfo};
 use crate::gpu;
 use crate::proc::RawProc;
+use crate::volume::Volume;
 use std::io;
+use std::path::{Path, PathBuf};
 
 type Handle = *mut std::ffi::c_void;
 type Bool = i32;
@@ -132,6 +134,67 @@ extern "system" {
         cb: u32,
     ) -> Bool;
     fn GlobalMemoryStatusEx(status: *mut MemoryStatusEx) -> Bool;
+    fn GetVolumePathNameW(path: *const u16, root: *mut u16, len: u32) -> Bool;
+    fn GetDiskFreeSpaceExW(
+        root: *const u16,
+        free_to_caller: *mut u64,
+        total: *mut u64,
+        total_free: *mut u64,
+    ) -> Bool;
+    fn GetLogicalDrives() -> u32;
+    fn GetDriveTypeW(root: *const u16) -> u32;
+}
+
+/// `GetDriveTypeW`: a fixed disk (not removable, network, optical or RAM).
+const DRIVE_FIXED: u32 = 3;
+
+fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    s.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+fn from_wide(raw: &[u16]) -> PathBuf {
+    use std::os::windows::ffi::OsStringExt;
+    let len = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+    PathBuf::from(std::ffi::OsString::from_wide(&raw[..len]))
+}
+
+/// The volume holding `path` (which need not exist yet), and its space.
+pub fn volume(path: &Path) -> io::Result<Volume> {
+    let mut root = [0u16; MAX_PATH + 1];
+    let p = wide(path.as_os_str());
+    // SAFETY: `p` is NUL-terminated and `root` holds the length we pass.
+    if unsafe { GetVolumePathNameW(p.as_ptr(), root.as_mut_ptr(), root.len() as u32) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let (mut free, mut total, mut total_free) = (0u64, 0u64, 0u64);
+    // SAFETY: `root` was NUL-terminated by the call above; the out-pointers
+    // are valid locals.
+    if unsafe { GetDiskFreeSpaceExW(root.as_ptr(), &mut free, &mut total, &mut total_free) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Volume {
+        root: from_wide(&root),
+        total,
+        free,
+    })
+}
+
+/// The roots of the machine's fixed drives (`C:\`, `E:\`, ...), in letter
+/// order: where a log could live.
+pub fn fixed_volumes() -> Vec<PathBuf> {
+    // SAFETY: no arguments; returns a bitmask of drive letters.
+    let mask = unsafe { GetLogicalDrives() };
+    (0..26u8)
+        .filter(|i| mask & (1 << i) != 0)
+        .map(|i| PathBuf::from(format!("{}:\\", (b'A' + i) as char)))
+        .filter(|root| {
+            let w = wide(root.as_os_str());
+            // SAFETY: `w` is a NUL-terminated root path.
+            let kind = unsafe { GetDriveTypeW(w.as_ptr()) };
+            kind == DRIVE_FIXED
+        })
+        .collect()
 }
 
 /// An owned process handle, closed on drop.

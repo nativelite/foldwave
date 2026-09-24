@@ -10,9 +10,9 @@
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::{processes, snapshot, system_info};
+pub use windows::{fixed_volumes, processes, snapshot, system_info, volume};
 
 #[cfg(not(windows))]
 mod unsupported;
 #[cfg(not(windows))]
-pub use unsupported::{processes, snapshot, system_info};
+pub use unsupported::{fixed_volumes, processes, snapshot, system_info, volume};

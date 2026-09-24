@@ -41,10 +41,12 @@ pub mod gpu;
 pub mod proc;
 pub mod report;
 pub mod sys;
+pub mod volume;
 
 pub use delta::{attribute, Attribution, GroupUsage, Snapshot, SystemInfo};
 pub use gpu::{GpuDevice, GpuSample};
 pub use proc::{Class, RawProc};
+pub use volume::Volume;
 
 use std::io;
 use std::time::{Duration, Instant};

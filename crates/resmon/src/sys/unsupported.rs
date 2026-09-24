@@ -32,6 +32,16 @@ pub fn snapshot() -> io::Result<Snapshot> {
     unsupported()
 }
 
+/// Always fails on an unsupported platform.
+pub fn volume(_path: &std::path::Path) -> io::Result<crate::volume::Volume> {
+    unsupported()
+}
+
+/// None known on an unsupported platform.
+pub fn fixed_volumes() -> Vec<std::path::PathBuf> {
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

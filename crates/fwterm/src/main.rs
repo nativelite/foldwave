@@ -5,8 +5,9 @@
 //! measured against other terminals with the same outside instruments, so it
 //! does the least a terminal must: keys to the shell, output to the screen,
 //! resize, split panes, select, copy and paste, and scrollback — recent
-//! lines in memory, older ones rebuilt from the pane's panelog (`--log`). No
-//! tabs or configuration yet.
+//! lines in memory, older ones rebuilt from the pane's log. Every pane is
+//! logged by default, within a size budget that never fills the drive
+//! (`logstore`). No tabs yet.
 //!
 //! The lanes (design §8.1):
 //! * **console** (default): the program runs under ConPTY — the built-in
@@ -38,6 +39,8 @@
 #[cfg_attr(not(windows), allow(dead_code))]
 mod layout;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod logstore;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod select;
 
 #[cfg(windows)]
@@ -54,6 +57,7 @@ fn main() {
 #[cfg(windows)]
 mod app {
     use crate::layout::{neighbor, pane_at, Dir, Layout, PaneId, Placement, Rect, Toward};
+    use crate::logstore;
     use crate::select::{self, Point, Selection};
     use fwrender::win::{display_refresh_hz, CpuPresenter, Event, Waker, Window};
     use fwrender::{
@@ -61,7 +65,7 @@ mod app {
         Metrics, Palette, Rasterizer, Sharpening,
     };
     use std::io;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc::SyncSender;
     use std::sync::{Arc, Mutex, Weak};
@@ -112,10 +116,20 @@ options:
   --history N   lines of scrollback kept in memory (default 10000); scroll
                 with the mouse wheel or Shift+PageUp/PageDown, and typing
                 returns to the bottom
-  --log DIR     keep this pane's whole output in a panelog under DIR (a new
-                folder per pane), with a screen checkpoint each MiB; scrolling
-                past the in-memory history then continues from the log.
-                Off by default: nothing bounds a log's size yet
+  --log DIR     keep pane logs under DIR. Every pane's whole output is logged
+                (with a screen checkpoint each MiB), and scrolling past the
+                in-memory history continues from the log. Default: the
+                FOLDWAVE_LOG_DIR variable, else log_dir in
+                %LOCALAPPDATA%\\foldwave\\fwterm.conf, else
+                %LOCALAPPDATA%\\foldwave\\logs
+  --log-cap N   keep at most N GiB of logs across every run (default 10, or
+                log_cap_gib in the settings file). Oldest go first, and less is
+                kept when the drive is nearly full: a tenth of it (2-20 GiB)
+                always stays free
+  --no-log      log nothing; scrollback is the in-memory history only
+  --choose-log-drive   measure how fast each fixed drive takes durable writes,
+                save the fastest with room as log_dir in the settings file,
+                and exit
   --stats PATH  on exit, write frame statistics for the time output flowed:
                 frames, frames per second, gaps between frames
 
@@ -145,6 +159,9 @@ keys:
         stats: Option<String>,
         history: usize,
         log: Option<String>,
+        log_cap: Option<u64>,
+        no_log: bool,
+        choose_log_drive: bool,
         panes: usize,
         shell: Vec<String>,
     }
@@ -163,6 +180,9 @@ keys:
             stats: None,
             history: 10_000,
             log: None,
+            log_cap: None,
+            no_log: false,
+            choose_log_drive: false,
             panes: 1,
             shell: vec!["cmd.exe".into()],
         };
@@ -219,6 +239,19 @@ keys:
                 "--title" => a.title = value(&mut i, "--title")?,
                 "--stats" => a.stats = Some(value(&mut i, "--stats")?),
                 "--log" => a.log = Some(value(&mut i, "--log")?),
+                "--log-cap" => {
+                    let v = value(&mut i, "--log-cap")?;
+                    let gib: u64 = v.parse().map_err(|_| format!("bad --log-cap {v:?}"))?;
+                    a.log_cap = Some(gib << 30);
+                }
+                "--no-log" => {
+                    a.no_log = true;
+                    i += 1;
+                }
+                "--choose-log-drive" => {
+                    a.choose_log_drive = true;
+                    i += 1;
+                }
                 "--panes" => {
                     let v = value(&mut i, "--panes")?;
                     a.panes = v
@@ -386,6 +419,9 @@ keys:
     enum LogMsg {
         Data(Vec<u8>, u64),
         Checkpoint(Vec<u8>),
+        /// Start the pane's next generation with this checkpoint at its
+        /// offset 0 (`logstore`).
+        Roll(Vec<u8>),
         /// Flush now and answer (on exit, so no output is lost).
         Flush(std::sync::mpsc::Sender<()>),
     }
@@ -398,22 +434,20 @@ keys:
     const CHECKPOINT_EVERY: u64 = 1024 * 1024;
 
     /// Start the logger thread for pane `id`: appends output and checkpoints
-    /// to a new panelog under `dir`, flushing whenever it has nothing waiting
-    /// so the log is readable up to the recent past. Returns the sender and
-    /// the log folder.
-    fn start_logger(dir: &str, id: PaneId) -> io::Result<(SyncSender<LogMsg>, PathBuf)> {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let folder =
-            std::path::Path::new(dir).join(format!("pane-{stamp}-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(&folder)?;
+    /// to the pane's current generation under `pane_dir`, starting the next
+    /// one when told, and flushing whenever it has nothing waiting so the log
+    /// is readable up to the recent past.
+    fn start_logger(pane_dir: PathBuf, id: PaneId) -> io::Result<SyncSender<LogMsg>> {
         let cfg = panelog::Config {
             pane: u64::from(std::process::id()) << 16 | id as u64,
             ..panelog::Config::default()
         };
-        let mut writer = panelog::Writer::create(&folder, cfg)?;
+        let open = move |n: u32| {
+            let dir = pane_dir.join(logstore::gen_name(logstore::now_ms(), n));
+            panelog::Writer::create(&dir, cfg)
+        };
+        let mut generation = 0;
+        let mut writer = open(generation)?;
         let (tx, rx) = std::sync::mpsc::sync_channel::<LogMsg>(LOG_QUEUE);
         std::thread::spawn(move || {
             let mut dirty = false;
@@ -426,6 +460,16 @@ keys:
                         dirty = true;
                     }
                     Ok(LogMsg::Checkpoint(blob)) => {
+                        let _ = writer.checkpoint(&blob);
+                        dirty = true;
+                    }
+                    Ok(LogMsg::Roll(blob)) => {
+                        let _ = writer.flush();
+                        generation += 1;
+                        writer = match open(generation) {
+                            Ok(w) => w,
+                            Err(_) => return,
+                        };
                         let _ = writer.checkpoint(&blob);
                         dirty = true;
                     }
@@ -447,40 +491,358 @@ keys:
                 }
             }
         });
-        Ok((tx, folder))
+        Ok(tx)
+    }
+
+    const RED: &str = "\x1b[1;31m";
+    const YELLOW: &str = "\x1b[1;33m";
+    const CYAN: &str = "\x1b[36m";
+    const DIM: &str = "\x1b[90m";
+    const RESET: &str = "\x1b[0m";
+
+    /// How often retention re-measures the volume and trims the logs.
+    const RETENTION_EVERY: Duration = Duration::from_secs(2);
+
+    /// A pane's way into its log: the logger, and the size at which retention
+    /// wants generations rolled over.
+    #[derive(Clone)]
+    struct LogLink {
+        tx: SyncSender<LogMsg>,
+        gen_limit: Arc<AtomicU64>,
+        /// Wakes retention: a generation just filled.
+        nudge: SyncSender<()>,
+    }
+
+    /// The volume and the budget, as retention last measured them.
+    type LogStatus = (Option<resmon::Volume>, logstore::Budget);
+
+    /// Where this run logs, and the budget retention holds it to.
+    struct LogStore {
+        root: PathBuf,
+        source: logstore::Source,
+        session: logstore::Session,
+        gen_limit: Arc<AtomicU64>,
+        nudge: SyncSender<()>,
+        status: Arc<Mutex<LogStatus>>,
+    }
+
+    /// This run's pane logs: on, or off and why.
+    struct Logs {
+        store: Option<LogStore>,
+        /// Why logging is off when it was meant to be on.
+        problem: Option<String>,
+    }
+
+    /// Measure the volume, set the budget and generation size, and delete the
+    /// oldest generations over budget.
+    fn enforce(
+        root: &Path,
+        own: &Path,
+        cap: u64,
+        gen_limit: &AtomicU64,
+        status: &Mutex<LogStatus>,
+    ) {
+        let gens = logstore::scan(root, own);
+        let logs: u64 = gens.iter().map(|g| g.bytes).sum();
+        let volume = resmon::volume::of(root).ok();
+        let budget = match &volume {
+            Some(v) => logstore::budget(cap, logs, v.free, v.total),
+            None => logstore::Budget {
+                bytes: cap,
+                squeezed: false,
+            },
+        };
+        gen_limit.store(logstore::generation_bytes(budget.bytes), Ordering::Release);
+        for gen in logstore::plan(&gens, budget.bytes) {
+            logstore::delete(&gen);
+        }
+        *status.lock().unwrap() = (volume, budget);
+    }
+
+    /// The settings file, if there is one.
+    fn settings() -> (Option<PathBuf>, logstore::Settings) {
+        let app = logstore::app_dir(std::env::var_os("LOCALAPPDATA"));
+        let settings = app
+            .as_deref()
+            .and_then(|a| std::fs::read_to_string(logstore::settings_path(a)).ok())
+            .map(|t| logstore::parse_settings(&t))
+            .unwrap_or_default();
+        (app, settings)
+    }
+
+    impl Logs {
+        fn open(args: &Args) -> Logs {
+            let off = |problem: String| Logs {
+                store: None,
+                problem: Some(problem),
+            };
+            if args.no_log {
+                return Logs {
+                    store: None,
+                    problem: None,
+                };
+            }
+            let (app, settings) = settings();
+            let Some((root, source)) = logstore::resolve(
+                args.log.as_deref(),
+                std::env::var_os("FOLDWAVE_LOG_DIR"),
+                &settings,
+                app.as_deref(),
+            ) else {
+                return off("no log folder (LOCALAPPDATA is not set); use --log DIR".into());
+            };
+            let cap = args
+                .log_cap
+                .or(settings.log_cap)
+                .unwrap_or(logstore::DEFAULT_CAP);
+            let session = match logstore::Session::create(&root) {
+                Ok(s) => s,
+                Err(e) => return off(format!("{}: {e}", root.display())),
+            };
+            let gen_limit = Arc::new(AtomicU64::new(logstore::generation_bytes(cap)));
+            let status = Arc::new(Mutex::new((
+                None,
+                logstore::Budget {
+                    bytes: cap,
+                    squeezed: false,
+                },
+            )));
+            // Once now, so the first panes' banners are right; then in the
+            // background for as long as fwterm runs.
+            enforce(&root, &session.dir, cap, &gen_limit, &status);
+            // Every few seconds, and at once when a generation fills, so the
+            // logs overshoot the budget by about one generation per pane.
+            let (nudge, woken) = std::sync::mpsc::sync_channel::<()>(1);
+            {
+                let (root, own) = (root.clone(), session.dir.clone());
+                let (gen_limit, status) = (gen_limit.clone(), status.clone());
+                std::thread::spawn(move || loop {
+                    if let Err(std::sync::mpsc::RecvTimeoutError::Disconnected) =
+                        woken.recv_timeout(RETENTION_EVERY)
+                    {
+                        return;
+                    }
+                    enforce(&root, &own, cap, &gen_limit, &status);
+                });
+            }
+            Logs {
+                store: Some(LogStore {
+                    root,
+                    source,
+                    session,
+                    gen_limit,
+                    nudge,
+                    status,
+                }),
+                problem: None,
+            }
+        }
+
+        /// The lines a new pane opens with: the version and where its log
+        /// goes, and in colour anything to act on.
+        fn banner(&self) -> String {
+            let version = env!("CARGO_PKG_VERSION");
+            match (&self.store, &self.problem) {
+                (Some(store), _) => {
+                    let (volume, budget) = store.status.lock().unwrap().clone();
+                    // Below one generation per pane, each pane's newest
+                    // generation is all that stays.
+                    let keeping = if budget.bytes < logstore::generation_bytes(0) {
+                        format!(
+                            "only each pane's latest {}",
+                            logstore::human(logstore::generation_bytes(budget.bytes))
+                        )
+                    } else {
+                        format!("up to {}", logstore::human(budget.bytes))
+                    };
+                    let mut s = format!(
+                        "{DIM}fwterm {version} · pane logs in {}, keeping {keeping}{RESET}\r\n",
+                        store.root.display(),
+                    );
+                    if let (true, Some(v)) = (budget.squeezed, volume) {
+                        s += &format!(
+                            "{YELLOW}{} is almost full ({} free). Old logs will be overwritten \
+                             to protect system integrity.{RESET}\r\n",
+                            v.root.display(),
+                            logstore::human(v.free)
+                        );
+                    }
+                    if store.source == logstore::Source::Default {
+                        s += &format!(
+                            "{CYAN}Tip: fwterm --choose-log-drive measures your drives and \
+                             keeps logs on the fastest.{RESET}\r\n"
+                        );
+                    }
+                    s
+                }
+                (None, Some(problem)) => {
+                    format!(
+                        "{DIM}fwterm {version}{RESET}\r\n{RED}Logging is off: {problem}{RESET}\r\n"
+                    )
+                }
+                (None, None) => format!("{DIM}fwterm {version} · logging off{RESET}\r\n"),
+            }
+        }
+    }
+
+    /// Durable appends to a scratch log at `root`: MiB/s and the p99 of one
+    /// 1 MiB write, in ms.
+    fn probe_drive(root: &Path) -> io::Result<(f64, f64)> {
+        const WRITES: usize = 128;
+        let dir = root.join(format!(
+            "foldwave-drive-probe-{}-{}",
+            logstore::now_ms(),
+            std::process::id()
+        ));
+        // Made here or not at all: only a folder this call created is removed.
+        std::fs::create_dir(&dir)?;
+        let result = (|| {
+            let mut w = panelog::Writer::create(&dir, panelog::Config::default())?;
+            // One full record each: the payload a 1 MiB record carries.
+            let chunk: Vec<u8> = (0..(1usize << 20) - 64)
+                .map(|i| b"0123456789abcdef\n"[i % 17])
+                .collect();
+            let mut times = Vec::with_capacity(WRITES);
+            let start = Instant::now();
+            for _ in 0..WRITES {
+                let t = Instant::now();
+                w.append(&chunk, 0)?;
+                w.flush()?;
+                times.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            let secs = start.elapsed().as_secs_f64();
+            times.sort_by(f64::total_cmp);
+            let mib = (chunk.len() * WRITES) as f64 / (1 << 20) as f64;
+            Ok((mib / secs, times[times.len() * 99 / 100]))
+        })();
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    }
+
+    /// `--choose-log-drive`: measure every fixed drive, save the fastest with
+    /// room for the cap above its reserve.
+    fn choose_log_drive(args: &Args) -> i32 {
+        let (app, settings) = settings();
+        let cap = args
+            .log_cap
+            .or(settings.log_cap)
+            .unwrap_or(logstore::DEFAULT_CAP);
+        say!("Measuring durable writes on each fixed drive (128 MiB each)...");
+        let mut best: Option<(f64, PathBuf)> = None;
+        for root in resmon::volume::fixed() {
+            let Ok(v) = resmon::volume::of(&root) else {
+                continue;
+            };
+            let budget = logstore::budget(cap, 0, v.free, v.total);
+            match probe_drive(&root) {
+                Ok((rate, p99)) => {
+                    let room = if budget.squeezed {
+                        format!(
+                            "too full: room for {} of logs",
+                            logstore::human(budget.bytes)
+                        )
+                    } else {
+                        "room for the cap".into()
+                    };
+                    say!(
+                        "  {}  {rate:7.0} MiB/s  p99 {p99:6.2} ms  {} free  {room}",
+                        root.display(),
+                        logstore::human(v.free)
+                    );
+                    if !budget.squeezed && best.as_ref().map_or(true, |(r, _)| rate > *r) {
+                        best = Some((rate, root));
+                    }
+                }
+                Err(e) => say!("  {}  cannot write here: {e}", root.display()),
+            }
+        }
+        let Some((_, root)) = best else {
+            say!(
+                "No drive has room for {} of logs above its reserve; nothing saved.",
+                logstore::human(cap)
+            );
+            return 1;
+        };
+        let Some(app) = app else {
+            say!("LOCALAPPDATA is not set: nowhere to save the choice.");
+            return 1;
+        };
+        let dir = root.join("foldwave").join("logs");
+        let path = logstore::settings_path(&app);
+        let old = std::fs::read_to_string(&path).unwrap_or_default();
+        let saved = std::fs::create_dir_all(&app)
+            .and_then(|_| std::fs::write(&path, logstore::with_log_dir(&old, &dir)));
+        match saved {
+            Ok(()) => {
+                say!(
+                    "Logs will go to {} (saved in {}).",
+                    dir.display(),
+                    path.display()
+                );
+                0
+            }
+            Err(e) => {
+                say!("Could not save {}: {e}", path.display());
+                1
+            }
+        }
     }
 
     /// A pane rebuilt from its log at some past line: the scrollback beyond
     /// what memory holds.
     struct Deep {
-        reader: panelog::Reader,
-        /// Lines in the log when it was opened; the view is measured from here.
+        /// The pane's surviving generations, oldest first, each with the line
+        /// it begins on, counted across them all: a generation begins on the
+        /// line the one before it ended in.
+        gens: Vec<(panelog::Reader, u64)>,
+        /// Lines in the logs when they were opened; the view is measured from
+        /// here.
         total: u64,
-        /// The log line the rebuilt screen ends before, and the rebuilt term.
+        /// The line the rebuilt screen ends before, and the rebuilt term.
         at: u64,
         term: Term,
     }
 
     impl Deep {
-        fn open(folder: &std::path::Path) -> io::Result<Deep> {
-            let reader = panelog::Reader::open(folder)?;
-            let total = reader.line_count();
+        fn open(pane_dir: &std::path::Path) -> io::Result<Deep> {
+            let mut gens = Vec::new();
+            let (mut start, mut total) = (0u64, 0u64);
+            for g in logstore::generations(pane_dir) {
+                // One retention is deleting cannot be opened; skip it.
+                let Ok(reader) = panelog::Reader::open(&g) else {
+                    continue;
+                };
+                let lines = reader.line_count();
+                gens.push((reader, start));
+                total = start + lines;
+                start = total - 1;
+            }
+            if gens.is_empty() {
+                return Err(io::ErrorKind::NotFound.into());
+            }
             Ok(Deep {
-                reader,
+                gens,
                 total,
                 at: u64::MAX,
                 term: Term::new(1, 1),
             })
         }
 
-        /// Rebuild the screen as it was when the log reached line `end`:
-        /// restore the nearest checkpoint before it, replay the rest.
+        /// Rebuild the screen as it was when the logs reached line `end`:
+        /// restore the nearest checkpoint before it in its generation, replay
+        /// the rest.
         fn rebuild(&mut self, end: u64, rows: usize, cols: usize, pipe: bool) -> io::Result<()> {
             if end == self.at {
                 return Ok(());
             }
-            let offset = self.reader.line_start(end.min(self.total))?;
-            let (mut term, from) = match self.reader.checkpoint_before(offset)? {
+            let k = self
+                .gens
+                .partition_point(|(_, start)| *start <= end)
+                .saturating_sub(1);
+            let (reader, start) = &self.gens[k];
+            let local = (end.saturating_sub(*start)).min(reader.line_count() - 1);
+            let offset = reader.line_start(local)?;
+            let (mut term, from) = match reader.checkpoint_before(offset)? {
                 Some((at, blob)) => match Term::restore(&blob) {
                     Ok(t) => (t, at),
                     Err(_) => (Term::new(rows, cols), 0),
@@ -494,7 +856,7 @@ keys:
             let mut at = from;
             while at < offset {
                 let want = ((offset - at) as usize).min(buf.len());
-                let n = self.reader.read_at(at, &mut buf[..want])?;
+                let n = reader.read_at(at, &mut buf[..want])?;
                 if n == 0 {
                     break;
                 }
@@ -515,6 +877,8 @@ keys:
         exited: AtomicBool,
         /// Output since the last checkpoint sent to the log.
         since_checkpoint: AtomicU64,
+        /// Output in the log's current generation.
+        gen_bytes: AtomicU64,
         /// The renderer is waiting for `term`; readers step aside. The lock is
         /// not fair, and a reader that releases and immediately re-takes it
         /// otherwise holds the renderer off for tens of milliseconds.
@@ -569,8 +933,8 @@ keys:
         id: PaneId,
         shared: Arc<Shared>,
         session: Arc<Mutex<Session>>,
-        log_tx: Option<SyncSender<LogMsg>>,
-        log_folder: Option<PathBuf>,
+        log: Option<LogLink>,
+        pane_dir: Option<PathBuf>,
         rect: Rect,
         /// Scrollback view: how many lines back from live, and the history's
         /// line count when last drawn, so the view stays on the same text
@@ -598,7 +962,7 @@ keys:
 
         /// Have the logger write out what it holds (bounded wait).
         fn flush_log(&self) {
-            if let Some(tx) = &self.log_tx {
+            if let Some(tx) = self.log.as_ref().map(|l| &l.tx) {
                 let (done, wait) = std::sync::mpsc::channel();
                 if tx.send(LogMsg::Flush(done)).is_ok() {
                     let _ = wait.recv_timeout(Duration::from_secs(2));
@@ -723,11 +1087,11 @@ keys:
             self.seen_scrolled = scrolled;
             let held = history.history_len();
             let (rows, cols) = (term.screen().rows(), term.screen().cols());
-            if self.back > held && self.log_folder.is_some() && !term.in_alternate_screen() {
+            if self.back > held && self.pane_dir.is_some() && !term.in_alternate_screen() {
                 // Past what memory holds: continue from the log. Its snapshot
                 // is frozen, so the view needs no anchoring.
                 if self.deep.is_none() {
-                    self.deep = self.log_folder.as_deref().and_then(|f| Deep::open(f).ok());
+                    self.deep = self.pane_dir.as_deref().and_then(|f| Deep::open(f).ok());
                 }
                 if let Some(d) = self.deep.as_mut() {
                     self.back = self.back.min(d.total as usize);
@@ -831,7 +1195,7 @@ keys:
         shared: Arc<Shared>,
         activity: Arc<Activity>,
         waker: Waker,
-        log_tx: Option<SyncSender<LogMsg>>,
+        log: Option<LogLink>,
     ) {
         std::thread::spawn(move || {
             let mut buf = vec![0u8; 64 * 1024];
@@ -852,18 +1216,31 @@ keys:
                 let now = activity.epoch.elapsed().as_nanos() as u64;
                 {
                     let mut term = shared.term.lock().unwrap();
+                    // The log gets the bytes before the emulator does (design
+                    // §8.1), so a parser failure cannot lose them; both see
+                    // the same order, under the pane lock.
+                    if let Some(log) = &log {
+                        let _ = log.tx.send(LogMsg::Data(buf[..n].to_vec(), now));
+                    }
                     term.feed(&buf[..n]);
-                    // Log in the order the emulator saw it, and checkpoint at
-                    // a point the replay can resume from.
-                    if let Some(tx) = &log_tx {
-                        let _ = tx.send(LogMsg::Data(buf[..n].to_vec(), now));
+                    // Checkpoint at a point the replay can resume from; roll
+                    // over to a new generation at one.
+                    if let Some(log) = &log {
                         let since = shared
                             .since_checkpoint
                             .fetch_add(n as u64, Ordering::AcqRel)
                             + n as u64;
+                        let generation =
+                            shared.gen_bytes.fetch_add(n as u64, Ordering::AcqRel) + n as u64;
                         if since >= CHECKPOINT_EVERY {
                             if let Some(blob) = term.checkpoint() {
-                                let _ = tx.send(LogMsg::Checkpoint(blob));
+                                if generation >= log.gen_limit.load(Ordering::Acquire) {
+                                    let _ = log.tx.send(LogMsg::Roll(blob));
+                                    let _ = log.nudge.try_send(());
+                                    shared.gen_bytes.store(0, Ordering::Release);
+                                } else {
+                                    let _ = log.tx.send(LogMsg::Checkpoint(blob));
+                                }
                                 shared.since_checkpoint.store(0, Ordering::Release);
                             }
                         }
@@ -910,6 +1287,7 @@ keys:
     /// Starts panes: the program from the command line, in the chosen lane.
     struct Spawner<'a> {
         args: &'a Args,
+        logs: &'a Logs,
         waker: Waker,
         activity: Arc<Activity>,
     }
@@ -927,17 +1305,35 @@ keys:
                         // (LNM) makes the emulator do it, with no copy.
                         t.feed(b"\x1b[20h");
                     }
+                    t.feed(self.logs.banner().as_bytes());
                     t
                 }),
                 pending: AtomicBool::new(true),
                 exited: AtomicBool::new(false),
                 since_checkpoint: AtomicU64::new(0),
+                gen_bytes: AtomicU64::new(0),
                 want: AtomicBool::new(false),
             });
-            let (log_tx, log_folder) = match &args.log {
-                Some(dir) => {
-                    let (tx, folder) = start_logger(dir, id)?;
-                    (Some(tx), Some(folder))
+            let (log, pane_dir) = match &self.logs.store {
+                Some(store) => {
+                    let dir = store.session.pane_dir(id);
+                    match start_logger(dir.clone(), id) {
+                        Ok(tx) => (
+                            Some(LogLink {
+                                tx,
+                                gen_limit: store.gen_limit.clone(),
+                                nudge: store.nudge.clone(),
+                            }),
+                            Some(dir),
+                        ),
+                        Err(e) => {
+                            let mut t = shared.term.lock().unwrap();
+                            t.feed(
+                                format!("{RED}This pane is not logged: {e}{RESET}\r\n").as_bytes(),
+                            );
+                            (None, None)
+                        }
+                    }
                 }
                 None => (None, None),
             };
@@ -949,7 +1345,7 @@ keys:
                     shared.clone(),
                     self.activity.clone(),
                     self.waker.clone(),
-                    log_tx.clone(),
+                    log.clone(),
                 )
             };
             let session = if args.pipe {
@@ -987,8 +1383,8 @@ keys:
                 id,
                 shared,
                 session,
-                log_tx,
-                log_folder,
+                log,
+                pane_dir,
                 rect,
                 back: 0,
                 seen_scrolled: 0,
@@ -1006,6 +1402,9 @@ keys:
                 return 2;
             }
         };
+        if args.choose_log_drive {
+            return choose_log_drive(&args);
+        }
         match start(&args) {
             Ok(code) => code,
             Err(e) => {
@@ -1095,8 +1494,10 @@ keys:
             first_output: AtomicU64::new(u64::MAX),
             last_output: AtomicU64::new(0),
         });
+        let logs = Logs::open(args);
         let spawner = Spawner {
             args,
+            logs: &logs,
             waker: surface.window().waker(),
             activity: activity.clone(),
         };
@@ -1467,6 +1868,65 @@ keys:
 
         fn argv(a: &[&str]) -> Vec<String> {
             a.iter().map(|s| s.to_string()).collect()
+        }
+
+        fn lines(range: std::ops::Range<u32>) -> Vec<u8> {
+            range
+                .map(|i| format!("L{i}\r\n"))
+                .collect::<String>()
+                .into_bytes()
+        }
+
+        fn row(term: &Term, r: usize) -> String {
+            let s = term.screen();
+            (0..s.cols())
+                .map(|c| s.cell(r, c).ch)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        }
+
+        #[test]
+        fn scrollback_continues_across_log_generations() {
+            let pane = std::env::temp_dir().join(format!("fwterm-deep-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&pane);
+            let cfg = panelog::Config::default();
+            // Generation 0 holds L0..L9; the pane rolls over at a checkpoint,
+            // and generation 1 holds L10..L19.
+            let mut term = Term::new(4, 10);
+            {
+                let mut w =
+                    panelog::Writer::create(&pane.join(logstore::gen_name(1, 0)), cfg).unwrap();
+                w.append(&lines(0..10), 0).unwrap();
+                term.feed(&lines(0..10));
+            }
+            {
+                let mut w =
+                    panelog::Writer::create(&pane.join(logstore::gen_name(2, 1)), cfg).unwrap();
+                w.checkpoint(&term.checkpoint().unwrap()).unwrap();
+                w.append(&lines(10..20), 0).unwrap();
+            }
+            let mut d = Deep::open(&pane).unwrap();
+            // 11 line starts in each; they share the line the roll fell on.
+            assert_eq!(d.total, 21);
+            let at = |d: &mut Deep, end: u64| {
+                d.rebuild(end, 4, 10, false).unwrap();
+                row(&d.term, 2)
+            };
+            assert_eq!(at(&mut d, 5), "L4", "inside the first generation");
+            assert_eq!(at(&mut d, 10), "L9", "at the roll: the checkpoint alone");
+            assert_eq!(
+                at(&mut d, 15),
+                "L14",
+                "inside the second, from its checkpoint"
+            );
+
+            // Retention deleted the first: the second still rebuilds alone.
+            logstore::delete(&pane.join(logstore::gen_name(1, 0)));
+            let mut d = Deep::open(&pane).unwrap();
+            assert_eq!(d.total, 11);
+            assert_eq!(at(&mut d, 5), "L14");
+            let _ = std::fs::remove_dir_all(&pane);
         }
 
         #[test]
