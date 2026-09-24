@@ -29,6 +29,19 @@ pub enum Event {
     /// The mouse wheel turned (`WM_MOUSEWHEEL`): `delta` in Windows units,
     /// 120 per notch, positive away from the user.
     Wheel(i32),
+    /// A key went down or up with Alt held (`WM_SYSKEYDOWN` / `WM_SYSKEYUP`),
+    /// or F10. Windows still acts on these (Alt+F4 closes the window); the
+    /// characters they would type (`WM_SYSCHAR`) are dropped, except Alt+Space
+    /// for the window menu, so they do not beep.
+    SysKey {
+        /// Virtual-key code.
+        vk: u32,
+        /// `true` for down (including auto-repeat), `false` for up.
+        down: bool,
+    },
+    /// The left mouse button went down at client pixel `(x, y)`
+    /// (`WM_LBUTTONDOWN`).
+    Click(i32, i32),
     /// The user asked to close the window (`WM_CLOSE`). The window stays
     /// open; drop the [`Window`] to close it.
     CloseRequested,
@@ -440,6 +453,24 @@ unsafe extern "system" fn wnd_proc(hwnd: Hwnd, msg: u32, wparam: usize, lparam: 
             });
             0
         }
+        WM_SYSKEYDOWN | WM_SYSKEYUP => {
+            push(Event::SysKey {
+                vk: wparam as u32,
+                down: msg == WM_SYSKEYDOWN,
+            });
+            // SAFETY: forwarding the message unchanged (Alt+F4, menu keys).
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        // Alt+Space opens the window menu; any other Alt+character would
+        // only beep.
+        WM_SYSCHAR if wparam != usize::from(b' ') => 0,
+        WM_LBUTTONDOWN => {
+            // Client coordinates, signed 16-bit words of lparam.
+            let x = (lparam & 0xFFFF) as u16 as i16 as i32;
+            let y = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
+            push(Event::Click(x, y));
+            0
+        }
         WM_CLOSE => {
             push(Event::CloseRequested);
             0
@@ -577,4 +608,11 @@ pub fn raise_thread_priority() -> bool {
 pub fn shift_down() -> bool {
     // SAFETY: GetKeyState takes a virtual-key code and has no preconditions.
     unsafe { GetKeyState(0x10) < 0 }
+}
+
+/// Whether a Ctrl key is down now (`GetKeyState`, as [`shift_down`]). Note
+/// that AltGr reports as Ctrl+Alt.
+pub fn ctrl_down() -> bool {
+    // SAFETY: as in `shift_down`.
+    unsafe { GetKeyState(0x11) < 0 }
 }

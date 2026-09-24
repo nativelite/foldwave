@@ -1,11 +1,12 @@
 //! `fwterm` — foldwave's minimal terminal prototype.
 //!
-//! One pane, in one of two lanes, `vterm` for the screen, and the
-//! `fwrender` window and backends for drawing. It exists to be measured
-//! against other terminals with the same outside instruments, so it does the
-//! least a terminal must: keys to the shell, output to the screen, resize,
-//! and scrollback — recent lines in memory, older ones rebuilt from the
-//! pane's panelog (`--log`). No selection, tabs or configuration yet.
+//! Panes in one window, each in one of two lanes, `vterm` for the screen,
+//! and the `fwrender` window and backends for drawing. It exists to be
+//! measured against other terminals with the same outside instruments, so it
+//! does the least a terminal must: keys to the shell, output to the screen,
+//! resize, split panes, and scrollback — recent lines in memory, older ones
+//! rebuilt from the pane's panelog (`--log`). No selection, tabs or
+//! configuration yet.
 //!
 //! The lanes (design §8.1):
 //! * **console** (default): the program runs under ConPTY — the built-in
@@ -17,12 +18,20 @@
 //!   tty's line discipline would, a line feed also returns to column 0 (the
 //!   emulator's new line mode, so no byte is rewritten).
 //!
-//! Threads: a reader moves shell output into the emulator (answering the
-//! console host's startup queries on the way) and wakes the window; the UI
-//! thread turns keys into bytes for the shell and draws when something
-//! changed, at most once per display refresh.
+//! Panes split the window's cell grid (`layout`); every pane draws into the
+//! same frame, so the renderer sees one grid whatever the layout. The keys
+//! are Windows Terminal's defaults: Alt+Shift+Plus / Minus / D split, Alt+Arrow
+//! and a click move the focus, Ctrl+Shift+W closes a pane.
+//!
+//! Threads: per pane, a reader moves program output into its emulator
+//! (answering the console host's startup queries on the way) and wakes the
+//! window; the UI thread turns keys into bytes for the focused pane and draws
+//! the panes that changed, at most once per display refresh.
 
 #![forbid(unsafe_code)]
+
+#[cfg_attr(not(windows), allow(dead_code))]
+mod layout;
 
 #[cfg(windows)]
 fn main() {
@@ -37,11 +46,17 @@ fn main() {
 
 #[cfg(windows)]
 mod app {
-    use fwrender::win::{display_refresh_hz, CpuPresenter, Event, Window};
-    use fwrender::{Atlas, CpuRenderer, FontRasterizer, Frame, Palette, Rasterizer, Sharpening};
+    use crate::layout::{neighbor, pane_at, Dir, Layout, PaneId, Placement, Rect, Toward};
+    use fwrender::win::{display_refresh_hz, CpuPresenter, Event, Waker, Window};
+    use fwrender::{
+        Atlas, CellInstance, CpuRenderer, FontRasterizer, Frame, GlyphKey, GlyphPart, Palette,
+        Rasterizer, Sharpening,
+    };
     use std::io;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::mpsc::SyncSender;
+    use std::sync::{Arc, Mutex, Weak};
     use std::time::{Duration, Instant};
     use vterm::Term;
 
@@ -62,6 +77,8 @@ options:
   --no-sharpen  draw the raw glyph outlines (no fitting or stem snapping)
   --max-fps N   frame-rate cap (default: the display's refresh rate)
   --title T     window title (default fwterm)
+  --panes N     open N panes (1-64, default 1) in a near-square grid, each
+                running the program
   --history N   lines of scrollback kept in memory (default 10000); scroll
                 with the mouse wheel or Shift+PageUp/PageDown, and typing
                 returns to the bottom
@@ -71,6 +88,14 @@ options:
                 Off by default: nothing bounds a log's size yet
   --stats PATH  on exit, write frame statistics for the time output flowed:
                 frames, frames per second, gaps between frames
+
+keys:
+  Alt+Shift+Plus    split the focused pane, the new one to the right
+  Alt+Shift+Minus   split it, the new one below
+  Alt+Shift+D       split it along its longer side
+  Alt+Arrow, click  focus the pane in that direction / under the pointer
+  Ctrl+Shift+W      close the focused pane (the last one closes the window)
+  Shift+PgUp/PgDn, wheel   scroll the focused pane back / forward
 ";
 
     struct Args {
@@ -85,6 +110,7 @@ options:
         stats: Option<String>,
         history: usize,
         log: Option<String>,
+        panes: usize,
         shell: Vec<String>,
     }
 
@@ -101,6 +127,7 @@ options:
             stats: None,
             history: 10_000,
             log: None,
+            panes: 1,
             shell: vec!["cmd.exe".into()],
         };
         let mut i = 0;
@@ -155,6 +182,14 @@ options:
                 "--title" => a.title = value(&mut i, "--title")?,
                 "--stats" => a.stats = Some(value(&mut i, "--stats")?),
                 "--log" => a.log = Some(value(&mut i, "--log")?),
+                "--panes" => {
+                    let v = value(&mut i, "--panes")?;
+                    a.panes = v
+                        .parse()
+                        .ok()
+                        .filter(|n| (1..=64).contains(n))
+                        .ok_or(format!("bad --panes {v:?}"))?;
+                }
                 "--history" => {
                     let v = value(&mut i, "--history")?;
                     a.history = v.parse().map_err(|_| format!("bad --history {v:?}"))?;
@@ -325,21 +360,20 @@ options:
     /// Checkpoint the screen once this much output has passed since the last.
     const CHECKPOINT_EVERY: u64 = 1024 * 1024;
 
-    /// Start the logger thread: appends output and checkpoints to a new
-    /// panelog under `dir`, flushing whenever it has nothing waiting so the
-    /// log is readable up to the recent past. Returns the sender and the log
-    /// folder.
-    fn start_logger(
-        dir: &str,
-    ) -> io::Result<(std::sync::mpsc::SyncSender<LogMsg>, std::path::PathBuf)> {
+    /// Start the logger thread for pane `id`: appends output and checkpoints
+    /// to a new panelog under `dir`, flushing whenever it has nothing waiting
+    /// so the log is readable up to the recent past. Returns the sender and
+    /// the log folder.
+    fn start_logger(dir: &str, id: PaneId) -> io::Result<(SyncSender<LogMsg>, PathBuf)> {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let folder = std::path::Path::new(dir).join(format!("pane-{stamp}-{}", std::process::id()));
+        let folder =
+            std::path::Path::new(dir).join(format!("pane-{stamp}-{}-{id}", std::process::id()));
         std::fs::create_dir_all(&folder)?;
         let cfg = panelog::Config {
-            pane: u64::from(std::process::id()),
+            pane: u64::from(std::process::id()) << 16 | id as u64,
             ..panelog::Config::default()
         };
         let mut writer = panelog::Writer::create(&folder, cfg)?;
@@ -436,27 +470,33 @@ options:
         }
     }
 
+    /// One pane's emulator and the flags its reader threads share with the
+    /// UI thread.
     struct Shared {
         term: Mutex<Term>,
         pending: AtomicBool,
         exited: AtomicBool,
         /// Output since the last checkpoint sent to the log.
-        since_checkpoint: std::sync::atomic::AtomicU64,
+        since_checkpoint: AtomicU64,
         /// The renderer is waiting for `term`; readers step aside. The lock is
         /// not fair, and a reader that releases and immediately re-takes it
         /// otherwise holds the renderer off for tens of milliseconds.
         want: AtomicBool,
-        /// Nanoseconds since `epoch` of the first and latest output read.
-        first_output: std::sync::atomic::AtomicU64,
-        last_output: std::sync::atomic::AtomicU64,
+    }
+
+    /// When output flowed, across every pane, for `--stats`.
+    struct Activity {
         epoch: Instant,
+        /// Nanoseconds since `epoch` of the first and latest output read.
+        first_output: AtomicU64,
+        last_output: AtomicU64,
     }
 
     /// Frame statistics over the time output was arriving, for `--stats`.
-    fn write_stats(path: &str, shared: &Shared, frames: &[u64]) -> io::Result<()> {
+    fn write_stats(path: &str, activity: &Activity, frames: &[u64]) -> io::Result<()> {
         let (first, last) = (
-            shared.first_output.load(Ordering::Acquire),
-            shared.last_output.load(Ordering::Acquire),
+            activity.first_output.load(Ordering::Acquire),
+            activity.last_output.load(Ordering::Acquire),
         );
         let during: Vec<u64> = frames
             .iter()
@@ -486,6 +526,341 @@ options:
         std::fs::write(path, text)
     }
 
+    /// One pane: a program in either lane, its emulator, its log, and where
+    /// it sits and how far back it is scrolled.
+    struct Pane {
+        id: PaneId,
+        shared: Arc<Shared>,
+        session: Arc<Mutex<Session>>,
+        log_tx: Option<SyncSender<LogMsg>>,
+        log_folder: Option<PathBuf>,
+        rect: Rect,
+        /// Scrollback view: how many lines back from live, and the history's
+        /// line count when last drawn, so the view stays on the same text
+        /// while output keeps scrolling in.
+        back: usize,
+        seen_scrolled: u64,
+        deep: Option<Deep>,
+    }
+
+    impl Pane {
+        /// Give the pane new cells; its emulator and program follow.
+        fn place(&mut self, rect: Rect) {
+            if rect == self.rect {
+                return;
+            }
+            self.rect = rect;
+            let (rows, cols) = (rect.rows.max(1), rect.cols.max(1));
+            self.shared.term.lock().unwrap().resize(rows, cols);
+            self.session
+                .lock()
+                .unwrap()
+                .resize(rows as u16, cols as u16);
+            self.deep = None;
+        }
+
+        /// Have the logger write out what it holds (bounded wait).
+        fn flush_log(&self) {
+            if let Some(tx) = &self.log_tx {
+                let (done, wait) = std::sync::mpsc::channel();
+                if tx.send(LogMsg::Flush(done)).is_ok() {
+                    let _ = wait.recv_timeout(Duration::from_secs(2));
+                }
+            }
+        }
+
+        /// Whether the pane has any cells to draw.
+        fn visible(&self) -> bool {
+            self.rect.rows > 0 && self.rect.cols > 0
+        }
+
+        /// Bring this pane's part of `frame` up to date. The caller has set
+        /// `want` (see the draw loop); it is cleared once the lock is held.
+        fn draw(&mut self, focused: bool, pipe: bool, frame: &mut Frame, pen: &mut Pen) {
+            let r = self.rect;
+            let shared = self.shared.clone();
+            let mut term = shared.term.lock().unwrap();
+            shared.want.store(false, Ordering::Release);
+            term.take_dirty();
+            let history = term.scrollback();
+            let scrolled = history.scrolled_lines();
+            if term.in_alternate_screen() {
+                self.back = 0; // full-screen programs: always live
+            } else if self.back > 0 && self.deep.is_none() {
+                // New lines pushed the text we are looking at further up.
+                self.back += (scrolled - self.seen_scrolled) as usize;
+            }
+            self.seen_scrolled = scrolled;
+            let held = history.history_len();
+            let (rows, cols) = (term.screen().rows(), term.screen().cols());
+            if self.back > held && self.log_folder.is_some() && !term.in_alternate_screen() {
+                // Past what memory holds: continue from the log. Its snapshot
+                // is frozen, so the view needs no anchoring.
+                if self.deep.is_none() {
+                    self.deep = self.log_folder.as_deref().and_then(|f| Deep::open(f).ok());
+                }
+                if let Some(d) = self.deep.as_mut() {
+                    self.back = self.back.min(d.total as usize);
+                    // The view's bottom is `back` lines above live, in log
+                    // lines (a wrapped line counts once here, once per row in
+                    // memory, so the hand-over is approximate).
+                    let end = d.total.saturating_sub(self.back as u64);
+                    let _ = d.rebuild(end.max(1), rows, cols, pipe);
+                    let s = d.term.screen();
+                    frame.update_view_at(
+                        r.top,
+                        r.left,
+                        s,
+                        s,
+                        0,
+                        false,
+                        pen.palette,
+                        pen.atlas,
+                        pen.raster,
+                    );
+                }
+            } else {
+                self.deep = None;
+                self.back = self.back.min(held);
+                frame.update_view_at(
+                    r.top,
+                    r.left,
+                    term.screen(),
+                    history,
+                    self.back,
+                    focused,
+                    pen.palette,
+                    pen.atlas,
+                    pen.raster,
+                );
+            }
+        }
+    }
+
+    /// What drawing a cell needs.
+    struct Pen<'a> {
+        palette: &'a Palette,
+        atlas: &'a mut Atlas,
+        raster: &'a mut FontRasterizer,
+    }
+
+    /// Divider colours: the lines around the focused pane stand out.
+    const DIVIDER: u32 = 0xFF4A_4A4A;
+    const DIVIDER_FOCUSED: u32 = 0xFF3A_96DD;
+
+    /// Draw the dividers of `placement`, those touching the focused pane in
+    /// the focus colour.
+    fn draw_dividers(placement: &Placement, focus: PaneId, frame: &mut Frame, pen: &mut Pen) {
+        let f = placement
+            .panes
+            .iter()
+            .find(|(id, _)| *id == focus)
+            .map(|(_, r)| *r)
+            .unwrap_or_default();
+        for &(row, col, ch) in &placement.dividers {
+            let near = row + 1 >= f.top
+                && row <= f.top + f.rows
+                && col + 1 >= f.left
+                && col <= f.left + f.cols;
+            let glyph = pen.atlas.slot(
+                GlyphKey {
+                    ch,
+                    style: 0,
+                    part: GlyphPart::Single,
+                },
+                pen.raster,
+            );
+            frame.put(
+                row,
+                col,
+                CellInstance {
+                    glyph,
+                    fg: if near { DIVIDER_FOCUSED } else { DIVIDER },
+                    bg: pen.palette.bg,
+                    flags: 0,
+                },
+            );
+        }
+    }
+
+    /// Move one output stream into a pane's emulator until it ends. The
+    /// session, for answering the console host, is held weakly: a closed
+    /// pane's session must drop, which closes the pseudoconsole and so ends
+    /// this stream.
+    #[allow(clippy::too_many_arguments)]
+    fn pump(
+        mut source: Box<dyn FnMut(&mut [u8]) -> io::Result<usize> + Send>,
+        session: Option<Weak<Mutex<Session>>>,
+        last: bool,
+        shared: Arc<Shared>,
+        activity: Arc<Activity>,
+        waker: Waker,
+        log_tx: Option<SyncSender<LogMsg>>,
+    ) {
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut watcher = fwbench::terminal::Watcher::new();
+            loop {
+                let n = match source(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                if let Some(session) = session.as_ref().and_then(Weak::upgrade) {
+                    for reply in watcher.replies(&buf[..n]) {
+                        let _ = session.lock().unwrap().write(reply);
+                    }
+                }
+                while shared.want.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                let now = activity.epoch.elapsed().as_nanos() as u64;
+                {
+                    let mut term = shared.term.lock().unwrap();
+                    term.feed(&buf[..n]);
+                    // Log in the order the emulator saw it, and checkpoint at
+                    // a point the replay can resume from.
+                    if let Some(tx) = &log_tx {
+                        let _ = tx.send(LogMsg::Data(buf[..n].to_vec(), now));
+                        let since = shared
+                            .since_checkpoint
+                            .fetch_add(n as u64, Ordering::AcqRel)
+                            + n as u64;
+                        if since >= CHECKPOINT_EVERY {
+                            if let Some(blob) = term.checkpoint() {
+                                let _ = tx.send(LogMsg::Checkpoint(blob));
+                                shared.since_checkpoint.store(0, Ordering::Release);
+                            }
+                        }
+                    }
+                }
+                activity.first_output.fetch_min(now, Ordering::AcqRel);
+                activity.last_output.store(now, Ordering::Release);
+                if !shared.pending.swap(true, Ordering::AcqRel) {
+                    waker.wake();
+                }
+            }
+            if last {
+                shared.exited.store(true, Ordering::Release);
+                waker.wake();
+            }
+        });
+    }
+
+    /// How often a console pane checks whether its program has exited.
+    const EXIT_POLL: Duration = Duration::from_millis(50);
+
+    /// Mark the pane exited when its console program ends. The console host
+    /// keeps the output pipe open after its last client exits (until the
+    /// pseudoconsole is closed), so the end of output cannot tell. Ends when
+    /// the pane is gone.
+    fn watch_exit(session: Weak<Mutex<Session>>, shared: Arc<Shared>, waker: Waker) {
+        std::thread::spawn(move || loop {
+            std::thread::sleep(EXIT_POLL);
+            let Some(session) = session.upgrade() else {
+                return;
+            };
+            let running = match &mut *session.lock().unwrap() {
+                Session::Console(p) => matches!(p.try_wait(), Ok(None)),
+                Session::Pipe { .. } => false,
+            };
+            if !running {
+                shared.exited.store(true, Ordering::Release);
+                waker.wake();
+                return;
+            }
+        });
+    }
+
+    /// Starts panes: the program from the command line, in the chosen lane.
+    struct Spawner<'a> {
+        args: &'a Args,
+        waker: Waker,
+        activity: Arc<Activity>,
+    }
+
+    impl Spawner<'_> {
+        fn spawn(&self, id: PaneId, rect: Rect) -> io::Result<Pane> {
+            let args = self.args;
+            let (rows, cols) = (rect.rows.max(1), rect.cols.max(1));
+            let shell_args: Vec<&str> = args.shell[1..].iter().map(String::as_str).collect();
+            let shared = Arc::new(Shared {
+                term: Mutex::new({
+                    let mut t = Term::with_history(rows, cols, args.history);
+                    if args.pipe {
+                        // No tty turns LF into CR LF on a pipe: new line mode
+                        // (LNM) makes the emulator do it, with no copy.
+                        t.feed(b"\x1b[20h");
+                    }
+                    t
+                }),
+                pending: AtomicBool::new(true),
+                exited: AtomicBool::new(false),
+                since_checkpoint: AtomicU64::new(0),
+                want: AtomicBool::new(false),
+            });
+            let (log_tx, log_folder) = match &args.log {
+                Some(dir) => {
+                    let (tx, folder) = start_logger(dir, id)?;
+                    (Some(tx), Some(folder))
+                }
+                None => (None, None),
+            };
+            let pump = |source, session, last| {
+                pump(
+                    source,
+                    session,
+                    last,
+                    shared.clone(),
+                    self.activity.clone(),
+                    self.waker.clone(),
+                    log_tx.clone(),
+                )
+            };
+            let session = if args.pipe {
+                use std::os::windows::process::CommandExt;
+                use std::process::{Command, Stdio};
+                // CREATE_NO_WINDOW: no console at all, not even a hidden one.
+                let mut child = Command::new(&args.shell[0])
+                    .args(&shell_args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .creation_flags(0x0800_0000)
+                    .spawn()?;
+                let (mut out, mut err) = (
+                    child.stdout.take().expect("piped"),
+                    child.stderr.take().expect("piped"),
+                );
+                pump(Box::new(move |b| io::Read::read(&mut err, b)), None, false);
+                pump(Box::new(move |b| io::Read::read(&mut out, b)), None, true);
+                let stdin = child.stdin.take();
+                Arc::new(Mutex::new(Session::Pipe { child, stdin }))
+            } else {
+                let pty = pty::Pty::spawn(&args.shell[0], &shell_args, rows as u16, cols as u16)?;
+                let mut reader = pty.reader()?;
+                let session = Arc::new(Mutex::new(Session::Console(pty)));
+                pump(
+                    Box::new(move |b| reader.read(b)),
+                    Some(Arc::downgrade(&session)),
+                    true,
+                );
+                watch_exit(Arc::downgrade(&session), shared.clone(), self.waker.clone());
+                session
+            };
+            Ok(Pane {
+                id,
+                shared,
+                session,
+                log_tx,
+                log_folder,
+                rect,
+                back: 0,
+                seen_scrolled: 0,
+                deep: None,
+            })
+        }
+    }
+
     pub fn run() -> i32 {
         let argv: Vec<String> = std::env::args().skip(1).collect();
         let args = match parse(&argv) {
@@ -500,6 +875,15 @@ options:
             Err(e) => {
                 eprintln!("fwterm: {e}");
                 1
+            }
+        }
+    }
+
+    /// Give every pane its cells for `placement`.
+    fn place_all(panes: &mut [Pane], placement: &Placement) {
+        for &(id, rect) in &placement.panes {
+            if let Some(p) = panes.iter_mut().find(|p| p.id == id) {
+                p.place(rect);
             }
         }
     }
@@ -552,118 +936,33 @@ options:
             }
         };
 
-        let grid = |w: u32, h: u32| ((h / m.cell_h).max(1) as u16, (w / m.cell_w).max(1) as u16);
-        let (rows, cols) = grid(w, h);
-        let shell_args: Vec<&str> = args.shell[1..].iter().map(String::as_str).collect();
-        let shared = Arc::new(Shared {
-            term: Mutex::new({
-                let mut t = Term::with_history(rows as usize, cols as usize, args.history);
-                if args.pipe {
-                    // No tty turns LF into CR LF on a pipe: new line mode
-                    // (LNM) makes the emulator do it, with no copy.
-                    t.feed(b"[20h");
-                }
-                t
-            }),
-            pending: AtomicBool::new(true),
-            exited: AtomicBool::new(false),
-            since_checkpoint: std::sync::atomic::AtomicU64::new(0),
-            want: AtomicBool::new(false),
-            first_output: std::sync::atomic::AtomicU64::new(u64::MAX),
-            last_output: std::sync::atomic::AtomicU64::new(0),
+        let grid = |w: u32, h: u32| {
+            (
+                (h / m.cell_h).max(1) as usize,
+                (w / m.cell_w).max(1) as usize,
+            )
+        };
+        let (mut grid_rows, mut grid_cols) = grid(w, h);
+        let activity = Arc::new(Activity {
             epoch: Instant::now(),
+            first_output: AtomicU64::new(u64::MAX),
+            last_output: AtomicU64::new(0),
         });
-        let (log_tx, log_folder) = match &args.log {
-            Some(dir) => {
-                let (tx, folder) = start_logger(dir)?;
-                (Some(tx), Some(folder))
-            }
-            None => (None, None),
+        let spawner = Spawner {
+            args,
+            waker: surface.window().waker(),
+            activity: activity.clone(),
         };
-        let waker = surface.window().waker();
-        // Move one output stream into the emulator until it ends.
-        let pump = |mut source: Box<dyn FnMut(&mut [u8]) -> io::Result<usize> + Send>,
-                    session: Option<Arc<Mutex<Session>>>,
-                    last: bool| {
-            let (shared, waker, log_tx) = (shared.clone(), waker.clone(), log_tx.clone());
-            std::thread::spawn(move || {
-                let mut buf = vec![0u8; 64 * 1024];
-                let mut watcher = fwbench::terminal::Watcher::new();
-                loop {
-                    let n = match source(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => n,
-                    };
-                    if let Some(session) = &session {
-                        for reply in watcher.replies(&buf[..n]) {
-                            let _ = session.lock().unwrap().write(reply);
-                        }
-                    }
-                    while shared.want.load(Ordering::Acquire) {
-                        std::thread::yield_now();
-                    }
-                    let now = shared.epoch.elapsed().as_nanos() as u64;
-                    {
-                        let mut term = shared.term.lock().unwrap();
-                        term.feed(&buf[..n]);
-                        // Log in the order the emulator saw it, and checkpoint
-                        // at a point the replay can resume from.
-                        if let Some(tx) = &log_tx {
-                            let _ = tx.send(LogMsg::Data(buf[..n].to_vec(), now));
-                            let since = shared
-                                .since_checkpoint
-                                .fetch_add(n as u64, Ordering::AcqRel)
-                                + n as u64;
-                            if since >= CHECKPOINT_EVERY {
-                                if let Some(blob) = term.checkpoint() {
-                                    let _ = tx.send(LogMsg::Checkpoint(blob));
-                                    shared.since_checkpoint.store(0, Ordering::Release);
-                                }
-                            }
-                        }
-                    }
-                    shared.first_output.fetch_min(now, Ordering::AcqRel);
-                    shared.last_output.store(now, Ordering::Release);
-                    if !shared.pending.swap(true, Ordering::AcqRel) {
-                        waker.wake();
-                    }
-                }
-                if last {
-                    shared.exited.store(true, Ordering::Release);
-                    waker.wake();
-                }
-            });
-        };
-        let session = if args.pipe {
-            use std::os::windows::process::CommandExt;
-            use std::process::{Command, Stdio};
-            // CREATE_NO_WINDOW: no console at all, not even a hidden one.
-            let mut child = Command::new(&args.shell[0])
-                .args(&shell_args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .creation_flags(0x0800_0000)
-                .spawn()?;
-            let (mut out, mut err) = (
-                child.stdout.take().expect("piped"),
-                child.stderr.take().expect("piped"),
-            );
-            pump(Box::new(move |b| io::Read::read(&mut err, b)), None, false);
-            pump(Box::new(move |b| io::Read::read(&mut out, b)), None, true);
-            let stdin = child.stdin.take();
-            Arc::new(Mutex::new(Session::Pipe { child, stdin }))
-        } else {
-            let pty = pty::Pty::spawn(&args.shell[0], &shell_args, rows, cols)?;
-            let mut reader = pty.reader()?;
-            let session = Arc::new(Mutex::new(Session::Console(pty)));
-            pump(
-                Box::new(move |b| reader.read(b)),
-                Some(session.clone()),
-                true,
-            );
-            session
-        };
+        let ids: Vec<PaneId> = (0..args.panes).collect();
+        let mut layout = Layout::grid(&ids);
+        let mut placement = layout.place(grid_rows, grid_cols);
+        let mut panes = placement
+            .panes
+            .iter()
+            .map(|&(id, rect)| spawner.spawn(id, rect))
+            .collect::<io::Result<Vec<Pane>>>()?;
+        let mut next_id = args.panes;
+        let mut focus: PaneId = 0;
 
         // This thread draws: it must win a core when a frame is due, even with
         // every core busy moving output.
@@ -675,162 +974,254 @@ options:
         let mut events = Vec::new();
         let mut input = Vec::new();
         let mut last_draw: Option<Instant> = None;
-        // Scrollback view: how many lines back from live, and the history's
-        // line count when last drawn, so the view stays on the same text
-        // while output keeps scrolling in.
-        let (mut back, mut seen_scrolled) = (0usize, 0u64);
-        let mut deep: Option<Deep> = None;
-        // On exit: have the logger write out what it holds (bounded wait).
-        let flush_log = || {
-            if let Some(tx) = &log_tx {
-                let (done, wait) = std::sync::mpsc::channel();
-                if tx.send(LogMsg::Flush(done)).is_ok() {
-                    let _ = wait.recv_timeout(Duration::from_secs(2));
-                }
-            }
-        };
-        let page = |h: u32| (h / m.cell_h).max(2) as usize - 1;
+        // The panes moved, or the focus did: redraw every pane and divider.
+        let mut layout_dirty = true;
+        // A key taken as a command still sends its character; drop it.
+        let mut drop_char = false;
         let mut frames: Vec<u64> = Vec::new();
         let finish = |frames: &[u64]| {
             if let Some(path) = &args.stats {
-                if let Err(e) = write_stats(path, &shared, frames) {
+                if let Err(e) = write_stats(path, &activity, frames) {
                     eprintln!("fwterm: --stats {path}: {e}");
                 }
             }
         };
         loop {
             // Sleep until an event, new output, or the next allowed frame.
+            let due = layout_dirty
+                || panes
+                    .iter()
+                    .any(|p| p.shared.pending.load(Ordering::Acquire));
             let timeout = match last_draw {
-                Some(t) if shared.pending.load(Ordering::Acquire) => {
-                    Some(min_interval.saturating_sub(t.elapsed()))
-                }
+                Some(t) if due => Some(min_interval.saturating_sub(t.elapsed())),
                 _ => None,
             };
             events.clear();
             surface.window().wait(timeout, &mut events);
             input.clear();
+            // Panes to take out after the events: (pane, kill it).
+            let mut closing: Vec<(PaneId, bool)> = Vec::new();
             for e in &events {
+                let Some(fi) = panes.iter().position(|p| p.id == focus) else {
+                    break;
+                };
                 match *e {
+                    Event::Char(_) if drop_char => drop_char = false,
                     Event::Char(c) => {
                         // Typing returns the view to live output.
-                        back = 0;
+                        panes[fi].back = 0;
                         char_bytes(c, &mut input);
                     }
                     Event::Key { vk, down: true } => {
-                        let (_, h) = surface.window().client_size();
+                        let (ctrl, shift) =
+                            (fwrender::win::ctrl_down(), fwrender::win::shift_down());
+                        let page = panes[fi].rect.rows.max(2) - 1;
+                        let pane = &mut panes[fi];
                         match vk {
-                            0x21 if fwrender::win::shift_down() => back += page(h),
-                            0x22 if fwrender::win::shift_down() => {
-                                back = back.saturating_sub(page(h))
+                            // Ctrl+Shift+W: close the pane.
+                            0x57 if ctrl && shift => {
+                                closing.push((focus, true));
+                                drop_char = true;
                             }
+                            0x21 if shift => pane.back += page,
+                            0x22 if shift => pane.back = pane.back.saturating_sub(page),
                             _ => {
                                 if let Some(b) = key_bytes(vk) {
-                                    back = 0;
+                                    pane.back = 0;
                                     input.extend_from_slice(b);
                                 }
                             }
                         }
-                        shared.pending.store(true, Ordering::Release);
+                        pane.shared.pending.store(true, Ordering::Release);
+                    }
+                    Event::SysKey { vk, down: true } => {
+                        let shift = fwrender::win::shift_down();
+                        let r = panes[fi].rect;
+                        let dir = match vk {
+                            // Alt+Shift+Plus / Minus / D: split the pane.
+                            0xBB | 0x6B if shift => Some(Dir::Across),
+                            0xBD | 0x6D if shift => Some(Dir::Down),
+                            0x44 if shift => {
+                                Some(if r.cols as u32 * m.cell_w >= r.rows as u32 * m.cell_h {
+                                    Dir::Across
+                                } else {
+                                    Dir::Down
+                                })
+                            }
+                            _ => None,
+                        };
+                        let toward = match vk {
+                            0x25 if !shift => Some(Toward::Left),
+                            0x27 if !shift => Some(Toward::Right),
+                            0x26 if !shift => Some(Toward::Up),
+                            0x28 if !shift => Some(Toward::Down),
+                            _ => None,
+                        };
+                        if let Some(dir) = dir {
+                            // Both halves need a cell, with a divider between.
+                            let room = match dir {
+                                Dir::Across => r.cols,
+                                Dir::Down => r.rows,
+                            };
+                            let id = next_id;
+                            if room >= 3 && layout.split(focus, dir, id) {
+                                next_id += 1;
+                                placement = layout.place(grid_rows, grid_cols);
+                                let rect = placement
+                                    .panes
+                                    .iter()
+                                    .find(|(p, _)| *p == id)
+                                    .map(|(_, r)| *r)
+                                    .unwrap_or_default();
+                                match spawner.spawn(id, rect) {
+                                    Ok(p) => {
+                                        panes.push(p);
+                                        focus = id;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("fwterm: new pane: {e}");
+                                        layout.remove(id);
+                                        placement = layout.place(grid_rows, grid_cols);
+                                    }
+                                }
+                                place_all(&mut panes, &placement);
+                                layout_dirty = true;
+                            }
+                        } else if let Some(to) = toward {
+                            if let Some(next) = neighbor(&placement.panes, focus, to) {
+                                focus = next;
+                                layout_dirty = true;
+                            }
+                        }
+                    }
+                    Event::Click(x, y) if x >= 0 && y >= 0 => {
+                        let (row, col) = (
+                            y as usize / m.cell_h as usize,
+                            x as usize / m.cell_w as usize,
+                        );
+                        if let Some(id) = pane_at(&placement.panes, row, col) {
+                            if id != focus {
+                                focus = id;
+                                layout_dirty = true;
+                            }
+                        }
                     }
                     Event::Wheel(delta) => {
                         // Three lines a notch, away from the user = back.
                         let lines = (delta.unsigned_abs() as usize * 3).div_euclid(120).max(1);
-                        back = if delta > 0 {
-                            back + lines
+                        let pane = &mut panes[fi];
+                        pane.back = if delta > 0 {
+                            pane.back + lines
                         } else {
-                            back.saturating_sub(lines)
+                            pane.back.saturating_sub(lines)
                         };
-                        shared.pending.store(true, Ordering::Release);
+                        pane.shared.pending.store(true, Ordering::Release);
                     }
                     Event::Resized(w, h) if w > 0 && h > 0 => {
                         surface.resize(w, h)?;
-                        let (rows, cols) = grid(w, h);
-                        shared
-                            .term
-                            .lock()
-                            .unwrap()
-                            .resize(rows as usize, cols as usize);
-                        session.lock().unwrap().resize(rows, cols);
+                        (grid_rows, grid_cols) = grid(w, h);
+                        placement = layout.place(grid_rows, grid_cols);
+                        place_all(&mut panes, &placement);
                         frame.damage_all();
-                        shared.pending.store(true, Ordering::Release);
+                        layout_dirty = true;
                     }
                     Event::CloseRequested => {
                         finish(&frames);
-                        flush_log();
-                        // Take the shell down with the window.
-                        session.lock().unwrap().kill();
+                        for p in &panes {
+                            p.flush_log();
+                        }
+                        // Take the programs down with the window.
+                        for p in &panes {
+                            p.session.lock().unwrap().kill();
+                        }
                         return Ok(0);
                     }
                     _ => {}
                 }
             }
             if !input.is_empty() {
-                // A pipe program that has exited or closed stdin just
-                // drops the keys.
-                let _ = session.lock().unwrap().write(&input);
+                // A pipe program that has exited or closed stdin just drops
+                // the keys.
+                if let Some(p) = panes.iter().find(|p| p.id == focus) {
+                    let _ = p.session.lock().unwrap().write(&input);
+                }
             }
-            if shared.exited.load(Ordering::Acquire) {
+            closing.extend(
+                panes
+                    .iter()
+                    .filter(|p| p.shared.exited.load(Ordering::Acquire))
+                    .map(|p| (p.id, false)),
+            );
+            let mut code = 0;
+            for (id, kill) in closing {
+                let Some(i) = panes.iter().position(|p| p.id == id) else {
+                    continue;
+                };
+                let pane = panes.remove(i);
+                pane.flush_log();
+                let mut session = pane.session.lock().unwrap();
+                code = if kill {
+                    session.kill();
+                    0
+                } else {
+                    session.wait()
+                };
+                drop(session);
+                let next = layout.remove(id);
+                if focus == id {
+                    focus = next.unwrap_or(0);
+                }
+                layout_dirty = true;
+            }
+            if layout.is_empty() {
+                // The last pane closed: so does the window, with its code.
                 finish(&frames);
-                flush_log();
-                return Ok(session.lock().unwrap().wait());
+                return Ok(code);
+            }
+            if layout_dirty {
+                placement = layout.place(grid_rows, grid_cols);
+                place_all(&mut panes, &placement);
             }
             if last_draw.map_or(false, |t| t.elapsed() < min_interval) {
                 continue;
             }
-            if !shared.pending.swap(false, Ordering::AcqRel) {
-                continue;
-            }
-            {
-                shared.want.store(true, Ordering::Release);
-                let mut term = shared.term.lock().unwrap();
-                shared.want.store(false, Ordering::Release);
-                term.take_dirty();
-                let history = term.scrollback();
-                let scrolled = history.scrolled_lines();
-                if term.in_alternate_screen() {
-                    back = 0; // full-screen programs: always live
-                } else if back > 0 && deep.is_none() {
-                    // New lines pushed the text we are looking at further up.
-                    back += (scrolled - seen_scrolled) as usize;
-                }
-                seen_scrolled = scrolled;
-                let held = history.history_len();
-                let (rows, cols) = (term.screen().rows(), term.screen().cols());
-                if back > held && log_folder.is_some() && !term.in_alternate_screen() {
-                    // Past what memory holds: continue from the log. Its
-                    // snapshot is frozen, so the view needs no anchoring.
-                    if deep.is_none() {
-                        deep = log_folder.as_deref().and_then(|f| Deep::open(f).ok());
+            let mut pen = Pen {
+                palette: &palette,
+                atlas: &mut atlas,
+                raster: &mut raster,
+            };
+            frame.set_grid(grid_rows, grid_cols, &palette);
+            // Ask every pane to be drawn for its lock first, then take them in
+            // turn: the readers finish their current chunks at the same time,
+            // so the frame waits for the slowest, not the sum of all.
+            let due: Vec<bool> = panes
+                .iter()
+                .map(|p| {
+                    let due = (p.shared.pending.swap(false, Ordering::AcqRel) || layout_dirty)
+                        && p.visible();
+                    if due {
+                        p.shared.want.store(true, Ordering::Release);
                     }
-                    if let Some(d) = deep.as_mut() {
-                        back = back.min(d.total as usize);
-                        // The view's bottom is `back` lines above live, in
-                        // log lines (a wrapped line counts once here, once per
-                        // row in memory, so the hand-over is approximate).
-                        let end = d.total.saturating_sub(back as u64);
-                        let _ = d.rebuild(end.max(1), rows, cols, args.pipe);
-                        frame.update(d.term.screen(), false, &palette, &mut atlas, &mut raster);
-                    }
-                } else {
-                    deep = None;
-                    back = back.min(held);
-                    frame.update_view(
-                        term.screen(),
-                        history,
-                        back,
-                        true,
-                        &palette,
-                        &mut atlas,
-                        &mut raster,
-                    );
+                    due
+                })
+                .collect();
+            let mut drew = false;
+            for (p, due) in panes.iter_mut().zip(due) {
+                if due {
+                    p.draw(p.id == focus, args.pipe, &mut frame, &mut pen);
+                    drew = true;
                 }
             }
-            if frame.damaged_rows() > 0 {
+            if layout_dirty {
+                draw_dividers(&placement, focus, &mut frame, &mut pen);
+                layout_dirty = false;
+            }
+            if drew && frame.damaged_rows() > 0 {
                 surface.draw(&frame, &mut atlas)?;
                 frame.clear_damage();
                 last_draw = Some(Instant::now());
                 if args.stats.is_some() {
-                    frames.push(shared.epoch.elapsed().as_nanos() as u64);
+                    frames.push(activity.epoch.elapsed().as_nanos() as u64);
                 }
             }
         }

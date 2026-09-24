@@ -185,6 +185,10 @@ pub const WM_NCDESTROY: u32 = 0x0082;
 pub const WM_KEYDOWN: u32 = 0x0100;
 pub const WM_KEYUP: u32 = 0x0101;
 pub const WM_CHAR: u32 = 0x0102;
+pub const WM_SYSKEYDOWN: u32 = 0x0104;
+pub const WM_SYSKEYUP: u32 = 0x0105;
+pub const WM_SYSCHAR: u32 = 0x0106;
+pub const WM_LBUTTONDOWN: u32 = 0x0201;
 /// winuser.h.
 pub const WM_MOUSEWHEEL: u32 = 0x020A;
 pub const WM_APP: u32 = 0x8000;

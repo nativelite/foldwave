@@ -218,6 +218,84 @@ impl Frame {
         )
     }
 
+    /// Size the frame to `rows x cols` for composing several screens into it
+    /// ([`Frame::update_view_at`], [`Frame::put`]). A change of size or of
+    /// the palette's background blanks every cell and damages every row.
+    /// Returns how many rows became damaged.
+    pub fn set_grid(&mut self, rows: usize, cols: usize, palette: &Palette) -> usize {
+        if rows == self.rows && cols == self.cols && palette.bg == self.background {
+            return 0;
+        }
+        self.rows = rows;
+        self.cols = cols;
+        self.cells = vec![
+            CellInstance {
+                bg: palette.bg,
+                fg: palette.fg,
+                ..CellInstance::default()
+            };
+            rows * cols
+        ];
+        self.damage = vec![true; rows];
+        self.background = palette.bg;
+        rows
+    }
+
+    /// Like [`Frame::update_view`], into the part of the frame whose top-left
+    /// cell is `(top, left)` and whose size is `screen`'s, clipped to the
+    /// frame. The frame keeps its size ([`Frame::set_grid`]); cells outside
+    /// that part are left as they are. For several panes in one frame.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_view_at(
+        &mut self,
+        top: usize,
+        left: usize,
+        screen: &Screen,
+        history: &Screen,
+        back: usize,
+        cursor: bool,
+        palette: &Palette,
+        atlas: &mut Atlas,
+        raster: &mut dyn Rasterizer,
+    ) -> usize {
+        let back = back.min(history.history_len());
+        let rows = screen.rows();
+        let at = screen.cursor();
+        let at = (cursor && at.row + back < rows).then(|| ansi::Cursor::new(at.row + back, at.col));
+        self.paint(
+            top,
+            left,
+            rows,
+            screen.cols(),
+            at,
+            |r, c| {
+                if r < back {
+                    history.history_cell(back - 1 - r, c)
+                } else {
+                    screen.cell(r - back, c)
+                }
+            },
+            palette,
+            atlas,
+            raster,
+        )
+    }
+
+    /// Set one cell (a pane divider, say), damaging its row if it changed.
+    /// Returns whether it did; a cell outside the frame is ignored.
+    pub fn put(&mut self, row: usize, col: usize, cell: CellInstance) -> bool {
+        if row >= self.rows || col >= self.cols {
+            return false;
+        }
+        let slot = &mut self.cells[row * self.cols + col];
+        if *slot == cell {
+            return false;
+        }
+        *slot = cell;
+        self.damage[row] = true;
+        true
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn update_with(
         &mut self,
@@ -229,15 +307,28 @@ impl Frame {
         atlas: &mut Atlas,
         raster: &mut dyn Rasterizer,
     ) -> usize {
+        let newly = self.set_grid(rows, cols, palette);
+        newly + self.paint(0, 0, rows, cols, at, cell_at, palette, atlas, raster)
+    }
+
+    /// Resolve `rows x cols` cells from `cell_at` into the frame at
+    /// `(top, left)`, clipped to the frame; returns rows newly damaged.
+    #[allow(clippy::too_many_arguments)]
+    fn paint(
+        &mut self,
+        top: usize,
+        left: usize,
+        rows: usize,
+        cols: usize,
+        at: Option<ansi::Cursor>,
+        cell_at: impl Fn(usize, usize) -> ansi::Cell,
+        palette: &Palette,
+        atlas: &mut Atlas,
+        raster: &mut dyn Rasterizer,
+    ) -> usize {
         let mut newly = 0;
-        if rows != self.rows || cols != self.cols || palette.bg != self.background {
-            self.rows = rows;
-            self.cols = cols;
-            self.cells = vec![CellInstance::default(); rows * cols];
-            self.damage = vec![true; rows];
-            self.background = palette.bg;
-            newly = rows;
-        }
+        let rows = rows.min(self.rows.saturating_sub(top));
+        let cols = cols.min(self.cols.saturating_sub(left));
         for r in 0..rows {
             self.scratch.clear();
             let mut lead = ' ';
@@ -281,11 +372,12 @@ impl Frame {
                     flags,
                 });
             }
-            let row = &mut self.cells[r * cols..(r + 1) * cols];
+            let start = (top + r) * self.cols + left;
+            let row = &mut self.cells[start..start + cols];
             if row != &self.scratch[..] {
                 row.copy_from_slice(&self.scratch);
-                if !self.damage[r] {
-                    self.damage[r] = true;
+                if !self.damage[top + r] {
+                    self.damage[top + r] = true;
                     newly += 1;
                 }
             }
@@ -420,6 +512,55 @@ mod tests {
         let mut max = Frame::new();
         max.update_view(&s, &s, s.history_len(), false, &p, &mut a, &mut r);
         assert_eq!(far.cells(), max.cells());
+    }
+
+    #[test]
+    fn screens_compose_into_parts_of_one_frame() {
+        let (p, mut a, mut r) = setup();
+        let (mut left, mut right) = (Screen::new(2, 3), Screen::new(2, 4));
+        left.write_str(0, 0, "abc", Style::default());
+        right.write_str(1, 0, "wxyz", Style::default());
+        right.set_cursor(Cursor::new(0, 1));
+        let mut f = Frame::new();
+        assert_eq!(f.set_grid(3, 8, &p), 3, "a new size damages every row");
+        f.clear_damage();
+        assert_eq!(f.set_grid(3, 8, &p), 0, "the same size does not");
+        f.update_view_at(0, 0, &left, &left, 0, false, &p, &mut a, &mut r);
+        f.update_view_at(0, 4, &right, &right, 0, true, &p, &mut a, &mut r);
+        let mut alone = Frame::new();
+        alone.update(&right, true, &p, &mut a, &mut r);
+        assert_eq!(&f.row(1)[4..8], alone.row(1), "right pane at column 4");
+        assert_eq!(&f.row(0)[4..8], alone.row(0), "its cursor too");
+        assert_ne!(f.row(0)[0].glyph, 0, "left pane at column 0");
+        assert_eq!(f.row(0)[3], f.row(2)[0], "untouched cells stay blank");
+        assert_eq!(f.row(2)[0].bg, p.bg);
+        assert_eq!(f.damage(), [true, true, false]);
+        f.clear_damage();
+        // Drawing the same again damages nothing; a changed pane only its rows.
+        f.update_view_at(0, 4, &right, &right, 0, true, &p, &mut a, &mut r);
+        assert_eq!(f.damaged_rows(), 0);
+        right.write_str(1, 0, "q", Style::default());
+        assert_eq!(
+            f.update_view_at(0, 4, &right, &right, 0, true, &p, &mut a, &mut r),
+            1
+        );
+        assert_eq!(f.damage(), [false, true, false]);
+        // A part that runs past the frame is clipped, not a panic.
+        f.update_view_at(2, 6, &right, &right, 0, false, &p, &mut a, &mut r);
+        let divider = CellInstance {
+            glyph: 7,
+            fg: 1,
+            bg: 2,
+            flags: 0,
+        };
+        f.clear_damage();
+        assert!(f.put(2, 3, divider));
+        assert!(!f.put(2, 3, divider), "unchanged");
+        assert!(!f.put(3, 0, divider), "outside");
+        assert_eq!(
+            (f.row(2)[3], f.damage()),
+            (divider, &[false, false, true][..])
+        );
     }
 
     #[test]
