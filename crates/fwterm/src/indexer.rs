@@ -12,7 +12,13 @@
 //! generation's first block (no bytes before it), the logger builds the
 //! signature itself, as before. Signatures still in flight when a generation
 //! rolls over are rebuilt by panelog when that log is next opened.
+//!
+//! A pane host's logger (design §8.8a) runs in another process, so its
+//! blocks reach the indexer another way: the host announces each block once
+//! it is durable, and a [`fetcher`](Indexer::fetcher) thread here reads it
+//! from the log and queues it like any other.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
@@ -129,6 +135,85 @@ impl<R: Send + 'static> Indexer<R> {
             Err(TrySendError::Full(j)) | Err(TrySendError::Disconnected(j)) => Err(j),
         }
     }
+}
+
+/// A block of a log another process is writing (a pane host's), announced
+/// as durable, to read and sign here.
+pub struct Remote<R> {
+    pub reply: R,
+    /// The generation's folder.
+    pub dir: PathBuf,
+    pub generation: u32,
+    pub block: u64,
+}
+
+impl<R: Clone + Send + 'static> Indexer<R> {
+    /// Start a thread that reads announced blocks from their logs and queues
+    /// them for the GPU. It builds a signature itself, and hands it to
+    /// `deliver`, for a generation's first block (no bytes before it) or when
+    /// the GPU's queue is full. A block it cannot read is skipped: panelog
+    /// rebuilds its signature when that log is opened.
+    pub fn fetcher(
+        &self,
+        deliver: impl Fn(&R, u32, u64, Vec<u8>) + Send + 'static,
+    ) -> SyncSender<Remote<R>> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Remote<R>>(QUEUE);
+        let ix = self.clone();
+        std::thread::spawn(move || {
+            while let Ok(first) = rx.recv() {
+                // Everything announced so far, with one open per log.
+                let mut todo = vec![first];
+                todo.extend(rx.try_iter());
+                let mut logs: Vec<(PathBuf, Option<panelog::ByteReader>)> = Vec::new();
+                for r in todo {
+                    let at = match logs.iter().position(|(d, _)| *d == r.dir) {
+                        Some(k) => k,
+                        None => {
+                            logs.push((r.dir.clone(), panelog::ByteReader::open(&r.dir).ok()));
+                            logs.len() - 1
+                        }
+                    };
+                    let Some(log) = &logs[at].1 else { continue };
+                    let Some((lead, bytes)) = read_block(log, r.block) else {
+                        continue;
+                    };
+                    let local = match lead {
+                        None => Some(panelog::signature(None, &bytes)),
+                        Some(lead) => ix
+                            .submit(Job {
+                                reply: r.reply.clone(),
+                                generation: r.generation,
+                                block: r.block,
+                                lead,
+                                bytes,
+                            })
+                            .err()
+                            .map(|j| panelog::signature(Some(j.lead), &j.bytes)),
+                    };
+                    if let Some(sig) = local {
+                        ix.counts.cpu.fetch_add(1, Ordering::Relaxed);
+                        deliver(&r.reply, r.generation, r.block, sig);
+                    }
+                }
+            }
+        });
+        tx
+    }
+}
+
+/// Block `block` of `log` and the two bytes before it (none for block 0).
+fn read_block(log: &panelog::ByteReader, block: u64) -> Option<(Option<[u8; 2]>, Vec<u8>)> {
+    let start = block * BLOCK as u64;
+    if block == 0 {
+        let mut bytes = vec![0u8; BLOCK];
+        log.read_exact_at(0, &mut bytes).ok()?;
+        return Some((None, bytes));
+    }
+    let mut buf = vec![0u8; BLOCK + 2];
+    log.read_exact_at(start - 2, &mut buf).ok()?;
+    let lead = [buf[0], buf[1]];
+    buf.drain(..2);
+    Some((Some(lead), buf))
 }
 
 fn run<R>(
@@ -281,5 +366,52 @@ mod tests {
             assert_eq!(Some(&sig), want.get(&(g, blk)), "pane {g} block {blk}");
         }
         assert_eq!(ix.counts.gpu.load(Ordering::Relaxed), sent);
+    }
+
+    #[test]
+    fn the_fetcher_signs_announced_blocks_of_a_log_written_elsewhere() {
+        type Reply = std::sync::mpsc::Sender<(u32, u64, Vec<u8>)>;
+        let deliver = |r: &Reply, g, b, sig| {
+            let _ = r.send((g, b, sig));
+        };
+        let Some(ix) = Indexer::start(deliver) else {
+            return; // no CUDA here
+        };
+        let fetch = ix.fetcher(deliver);
+        let dir = std::env::temp_dir().join("fwterm-fetcher-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let data = text(5 * BLOCK + 1000);
+        let mut w = panelog::Writer::create(&dir, panelog::Config::default()).unwrap();
+        w.defer_signatures().unwrap();
+        w.append(&data, 1).unwrap();
+        w.flush().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Every block announced, plus one that is not in the log: skipped.
+        for block in 0..6 {
+            let remote = Remote {
+                reply: tx.clone(),
+                dir: dir.clone(),
+                generation: 4,
+                block,
+            };
+            fetch.send(remote).unwrap();
+        }
+        let mut got = std::collections::BTreeMap::new();
+        for _ in 0..5 {
+            let (g, b, sig) = rx.recv_timeout(Duration::from_secs(20)).unwrap();
+            assert_eq!(g, 4);
+            got.insert(b, sig);
+        }
+        assert!(rx.recv_timeout(Duration::from_millis(800)).is_err());
+        for (b, sig) in got {
+            let k = b as usize;
+            let lead = (k > 0).then(|| [data[k * BLOCK - 2], data[k * BLOCK - 1]]);
+            let want = panelog::signature(lead, &data[k * BLOCK..(k + 1) * BLOCK]);
+            assert_eq!(sig, want, "block {b}");
+            w.add_signature(b, &sig).unwrap();
+        }
+        assert_eq!(w.signature_count(), 5);
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

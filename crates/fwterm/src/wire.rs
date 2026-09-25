@@ -42,6 +42,14 @@ pub enum FromHost {
         first: u64,
         lines: Vec<Vec<Cell>>,
     },
+    /// Block `block` of generation `generation` (the folder `dir` in the
+    /// pane's log folder) is durable in the log: the window may read it and
+    /// build its search signature on the GPU (design §8.8a).
+    BlockReady {
+        generation: u32,
+        dir: String,
+        block: u64,
+    },
 }
 
 /// To the host.
@@ -59,6 +67,13 @@ pub enum ToHost {
     History {
         first: u64,
         count: u32,
+    },
+    /// The search signature of a block announced with
+    /// [`FromHost::BlockReady`], for the host's logger to store.
+    Signature {
+        generation: u32,
+        block: u64,
+        sig: Vec<u8>,
     },
 }
 
@@ -224,10 +239,12 @@ const T_UPDATE: u8 = 1;
 const T_MARK: u8 = 2;
 const T_EXITED: u8 = 3;
 const T_HISTORY: u8 = 4;
+const T_BLOCK: u8 = 5;
 const T_INPUT: u8 = 11;
 const T_RESIZE: u8 = 12;
 const T_SHED: u8 = 13;
 const T_ASK: u8 = 14;
+const T_SIG: u8 = 15;
 
 /// Largest message body accepted: a bound on what a damaged stream can make
 /// the reader allocate.
@@ -432,6 +449,16 @@ impl FromHost {
                 }
                 T_HISTORY
             }
+            FromHost::BlockReady {
+                generation,
+                dir,
+                block,
+            } => {
+                b.extend_from_slice(&generation.to_le_bytes());
+                b.extend_from_slice(&block.to_le_bytes());
+                b.extend_from_slice(dir.as_bytes());
+                T_BLOCK
+            }
         };
         w.write_all(&frame(tag, &b))
     }
@@ -484,6 +511,17 @@ impl FromHost {
                 }
                 FromHost::History { first, lines }
             }
+            T_BLOCK => {
+                let generation = b.u32()?;
+                let block = b.u64()?;
+                let dir = std::str::from_utf8(&body[b.at..]).map_err(|_| bad())?;
+                b.at = body.len();
+                FromHost::BlockReady {
+                    generation,
+                    dir: dir.to_string(),
+                    block,
+                }
+            }
             _ => return Err(bad()),
         };
         if b.at != body.len() {
@@ -508,6 +546,16 @@ impl ToHost {
                 b.extend_from_slice(&count.to_le_bytes());
                 (T_ASK, b)
             }
+            ToHost::Signature {
+                generation,
+                block,
+                sig,
+            } => {
+                let mut b = generation.to_le_bytes().to_vec();
+                b.extend_from_slice(&block.to_le_bytes());
+                b.extend_from_slice(sig);
+                (T_SIG, b)
+            }
         };
         w.write_all(&frame(tag, &b))
     }
@@ -526,6 +574,17 @@ impl ToHost {
                 first: b.u64()?,
                 count: b.u32()?,
             },
+            T_SIG => {
+                let generation = b.u32()?;
+                let block = b.u64()?;
+                let sig = body[b.at..].to_vec();
+                b.at = body.len();
+                ToHost::Signature {
+                    generation,
+                    block,
+                    sig,
+                }
+            }
             _ => return Err(bad()),
         };
         if b.at != body.len() {
@@ -669,6 +728,11 @@ mod tests {
                     }],
                 ],
             },
+            FromHost::BlockReady {
+                generation: 3,
+                dir: "gen-1758800000000-00003".to_string(),
+                block: 17,
+            },
         ];
         for m in &msgs {
             let mut b = Vec::new();
@@ -689,6 +753,11 @@ mod tests {
             ToHost::History {
                 first: 12,
                 count: 40,
+            },
+            ToHost::Signature {
+                generation: 2,
+                block: 9,
+                sig: vec![7u8; 8192],
             },
         ] {
             let mut b = Vec::new();

@@ -225,6 +225,8 @@ keys:
         host_log: Option<String>,
         host_gen: u64,
         host_id: usize,
+        /// The window builds this pane host's search signatures (GPU).
+        host_window_signs: bool,
         hidden: Hidden,
         zoom: bool,
         panes: usize,
@@ -258,6 +260,7 @@ keys:
             host_log: None,
             host_gen: 256 << 20,
             host_id: 0,
+            host_window_signs: false,
             hidden: Hidden::Always,
             zoom: false,
             panes: 1,
@@ -366,6 +369,10 @@ keys:
                         .ok_or(format!("bad --host-size {v:?}"))?;
                 }
                 "--host-log" => a.host_log = Some(value(&mut i, "--host-log")?),
+                "--host-window-signs" => {
+                    a.host_window_signs = true;
+                    i += 1;
+                }
                 "--host-gen" => {
                     let v = value(&mut i, "--host-gen")?;
                     a.host_gen = v.parse().map_err(|_| format!("bad --host-gen {v:?}"))?;
@@ -568,6 +575,18 @@ keys:
             }
         }
 
+        /// Hand a pane host the search signature of a block it announced.
+        fn sign(&mut self, generation: u32, block: u64, sig: Vec<u8>) {
+            if let Session::Host { stdin: Some(s), .. } = self {
+                let msg = wire::ToHost::Signature {
+                    generation,
+                    block,
+                    sig,
+                };
+                let _ = msg.write(s);
+            }
+        }
+
         /// Ask a pane host for history lines (see [`Pane::history_for`]).
         fn ask_history(&mut self, first: u64, count: u32) -> io::Result<()> {
             match self {
@@ -639,48 +658,108 @@ keys:
     /// to the pane's current generation under `pane_dir`, starting the next
     /// one when told, and flushing whenever it has nothing waiting so the log
     /// is readable up to the recent past.
-    /// A finished search signature on its way back to a logger:
-    /// (generation, block, signature).
-    type SigReply = std::sync::mpsc::Sender<(u32, u64, Vec<u8>)>;
+    /// Where a finished search signature goes: (generation, block,
+    /// signature) to a logger here, or to a pane host's.
+    type SigReply = Arc<dyn Fn(u32, u64, Vec<u8>) + Send + Sync>;
     type GpuIndexer = indexer::Indexer<SigReply>;
+    /// Blocks of pane hosts' logs, for the window to read and sign.
+    type Fetch = SyncSender<indexer::Remote<SigReply>>;
 
-    /// A logger's search signatures when the GPU builds them: the blocks it
-    /// has cut, and signatures back early, waiting for their turn.
+    /// Tells the window a block is durable: (generation, its folder's name,
+    /// block).
+    type Announce = Box<dyn Fn(u32, &str, u64) + Send>;
+
+    /// Who builds a logger's search signatures.
+    enum SignBy {
+        /// The logger, as it appends (panelog's own way).
+        Itself,
+        /// The window's GPU indexer, in this process.
+        Gpu(GpuIndexer),
+        /// The window, for a pane host's logger: each block is announced
+        /// once durable, and its signature comes back on `sigs`.
+        Window {
+            announce: Announce,
+            sigs: std::sync::mpsc::Receiver<(u32, u64, Vec<u8>)>,
+        },
+    }
+
+    /// A logger's search signatures when it defers them: how they are
+    /// built, and signatures back early, waiting for their turn.
     struct Signing {
-        indexer: GpuIndexer,
-        reply: SigReply,
-        stager: indexer::BlockStager,
+        how: How,
         ready: std::collections::BTreeMap<u64, Vec<u8>>,
+    }
+
+    enum How {
+        /// The blocks this logger has cut, for the GPU.
+        Gpu {
+            indexer: GpuIndexer,
+            reply: SigReply,
+            stager: indexer::BlockStager,
+        },
+        /// Blocks announced to the window so far, this generation.
+        Window { announce: Announce, announced: u64 },
     }
 
     impl Signing {
         /// Hand every block `bytes` completes to the GPU, or build it here
         /// when the GPU cannot take it now; then store what is in order.
         fn appended(&mut self, bytes: &[u8], generation: u32, w: &mut panelog::Writer) {
-            for st in self.stager.push(bytes) {
+            let How::Gpu {
+                indexer,
+                reply,
+                stager,
+            } = &mut self.how
+            else {
+                return;
+            };
+            for st in stager.push(bytes) {
                 let local = match st.lead {
                     // A generation's first block: nothing before it to send.
                     None => Some(panelog::signature(None, &st.bytes)),
                     Some(lead) => {
                         let job = indexer::Job {
-                            reply: self.reply.clone(),
+                            reply: reply.clone(),
                             generation,
                             block: st.block,
                             lead,
                             bytes: st.bytes,
                         };
-                        self.indexer
+                        indexer
                             .submit(job)
                             .err()
                             .map(|j| panelog::signature(Some(j.lead), &j.bytes))
                     }
                 };
                 if let Some(sig) = local {
-                    self.indexer.counts.cpu.fetch_add(1, Ordering::Relaxed);
+                    indexer.counts.cpu.fetch_add(1, Ordering::Relaxed);
                     self.ready.insert(st.block, sig);
                 }
             }
             self.store(w);
+        }
+
+        /// Announce the blocks `w` has made durable since the last call, when
+        /// the window signs them.
+        fn announce(&mut self, generation: u32, name: &str, w: &panelog::Writer) {
+            if let How::Window {
+                announce,
+                announced,
+            } = &mut self.how
+            {
+                while (*announced + 1) * BLOCK_BYTES <= w.durable_len() {
+                    announce(generation, name, *announced);
+                    *announced += 1;
+                }
+            }
+        }
+
+        /// A new generation starts: its blocks count from 0.
+        fn rolled(&mut self) {
+            match &mut self.how {
+                How::Gpu { stager, .. } => *stager = indexer::BlockStager::default(),
+                How::Window { announced, .. } => *announced = 0,
+            }
         }
 
         fn arrived(&mut self, block: u64, sig: Vec<u8>, w: &mut panelog::Writer) {
@@ -719,33 +798,48 @@ keys:
     const RETIRE_FOR: Duration = Duration::from_secs(2);
     const BLOCK_BYTES: u64 = panelog::SIG_BLOCK;
 
-    fn start_logger(
-        pane_dir: PathBuf,
-        id: PaneId,
-        gpu: Option<GpuIndexer>,
-    ) -> io::Result<SyncSender<LogMsg>> {
+    fn start_logger(pane_dir: PathBuf, id: PaneId, sign: SignBy) -> io::Result<SyncSender<LogMsg>> {
         let cfg = panelog::Config {
             pane: u64::from(std::process::id()) << 16 | id as u64,
             ..panelog::Config::default()
         };
-        let deferred = gpu.is_some();
+        let deferred = !matches!(sign, SignBy::Itself);
         let open = move |n: u32| {
-            let dir = pane_dir.join(logstore::gen_name(logstore::now_ms(), n));
-            let mut w = panelog::Writer::create(&dir, cfg)?;
+            let name = logstore::gen_name(logstore::now_ms(), n);
+            let mut w = panelog::Writer::create(&pane_dir.join(&name), cfg)?;
             if deferred {
                 w.defer_signatures()?;
             }
-            Ok::<_, io::Error>(w)
+            Ok::<_, io::Error>((w, name))
         };
         let mut generation = 0u32;
-        let mut writer = open(generation)?;
+        let (mut writer, mut name) = open(generation)?;
         let (tx, rx) = std::sync::mpsc::sync_channel::<LogMsg>(LOG_QUEUE);
-        let (sig_tx, sig_rx) = std::sync::mpsc::channel();
+        let (sig_tx, own_sigs) = std::sync::mpsc::channel();
         let mut retiring: Option<Retiring> = None;
-        let mut signing = gpu.map(|indexer| Signing {
-            indexer,
-            reply: sig_tx,
-            stager: indexer::BlockStager::default(),
+        let (how, sig_rx) = match sign {
+            SignBy::Itself => (None, own_sigs),
+            SignBy::Gpu(indexer) => {
+                let reply: SigReply = Arc::new(move |g, b, sig| {
+                    let _ = sig_tx.send((g, b, sig));
+                });
+                let how = How::Gpu {
+                    indexer,
+                    reply,
+                    stager: indexer::BlockStager::default(),
+                };
+                (Some(how), own_sigs)
+            }
+            SignBy::Window { announce, sigs } => (
+                Some(How::Window {
+                    announce,
+                    announced: 0,
+                }),
+                sigs,
+            ),
+        };
+        let mut signing = how.map(|how| Signing {
+            how,
             ready: Default::default(),
         });
         std::thread::spawn(move || {
@@ -804,13 +898,17 @@ keys:
                     }
                     Ok(LogMsg::Roll(blob)) => {
                         let _ = writer.flush();
-                        let next = match open(generation + 1) {
+                        if let Some(s) = signing.as_mut() {
+                            s.announce(generation, &name, &writer);
+                        }
+                        let (next, next_name) = match open(generation + 1) {
                             Ok(w) => w,
                             Err(_) => return,
                         };
+                        name = next_name;
                         let old = std::mem::replace(&mut writer, next);
                         if let Some(s) = signing.as_mut() {
-                            s.stager = indexer::BlockStager::default();
+                            s.rolled();
                             // Keep the old generation open for its signatures
                             // still on the GPU; the one before goes now.
                             if let Some(mut r) = retiring.take() {
@@ -842,6 +940,10 @@ keys:
                         let _ = writer.flush();
                         return;
                     }
+                }
+                // Appends and flushes make blocks durable.
+                if let Some(s) = signing.as_mut() {
+                    s.announce(generation, &name, &writer);
                 }
             }
         });
@@ -1975,6 +2077,8 @@ keys:
         place: Arc<Vec<u32>>,
         /// Builds the logs' search signatures on the GPU, if it can.
         gpu: Option<GpuIndexer>,
+        /// Reads pane hosts' blocks for it.
+        fetch: Option<Fetch>,
         waker: Waker,
         activity: Arc<Activity>,
     }
@@ -2022,6 +2126,7 @@ keys:
                 pane.pane_dir.as_deref(),
                 gen,
                 self.logs,
+                self.fetch.as_ref(),
                 wake,
                 &note,
             ) {
@@ -2069,7 +2174,8 @@ keys:
                 Some(store) if args.isolate => (None, Some(store.session.pane_dir(id))),
                 Some(store) => {
                     let dir = store.session.pane_dir(id);
-                    match start_logger(dir.clone(), id, self.gpu.clone()) {
+                    let sign = self.gpu.clone().map_or(SignBy::Itself, SignBy::Gpu);
+                    match start_logger(dir.clone(), id, sign) {
                         Ok(tx) => (
                             Some(LogLink {
                                 tx,
@@ -2111,6 +2217,7 @@ keys:
                     pane_dir.as_deref(),
                     gen,
                     &self.logs,
+                    self.fetch.as_ref(),
                     wake,
                     "",
                 )?;
@@ -2169,6 +2276,7 @@ keys:
         pane_dir: Option<&Path>,
         gen: u64,
         logs: &Logs,
+        fetch: Option<&Fetch>,
         wake: Wake,
         note: &str,
     ) -> io::Result<Arc<Mutex<Session>>> {
@@ -2192,12 +2300,28 @@ keys:
         if let Some(dir) = pane_dir {
             cmd.arg("--host-log").arg(dir);
         }
+        // Blocks of its log come here to be signed on the GPU.
+        let fetch = fetch.filter(|_| pane_dir.is_some()).cloned();
+        if fetch.is_some() {
+            cmd.arg("--host-window-signs");
+        }
         cmd.arg("--").args(&args.shell);
         cmd.env("FWTERM_BANNER", format!("{}{note}", logs.banner()));
         let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
         let mut out = child.stdout.take().expect("piped");
         let stdin = child.stdin.take();
+        let session = Arc::new(Mutex::new(Session::Host { child, stdin }));
         let (shared, activity) = (shared.clone(), activity.clone());
+        let pane_dir = pane_dir.map(Path::to_path_buf);
+        // A signature goes back to this host while it runs.
+        let reply: SigReply = {
+            let s = Arc::downgrade(&session);
+            Arc::new(move |g, b, sig| {
+                if let Some(s) = s.upgrade() {
+                    s.lock().unwrap().sign(g, b, sig);
+                }
+            })
+        };
         std::thread::spawn(move || {
             let mut out = io::BufReader::new(&mut out);
             loop {
@@ -2226,6 +2350,24 @@ keys:
                         }
                         continue;
                     }
+                    Ok(wire::FromHost::BlockReady {
+                        generation,
+                        dir,
+                        block,
+                    }) => {
+                        // A generation folder in this pane's folder, by name.
+                        let named =
+                            logstore::gen_stamp(&dir).is_some() && !dir.contains(['/', '\\', ':']);
+                        if let (Some(fetch), Some(pane_dir), true) = (&fetch, &pane_dir, named) {
+                            let _ = fetch.send(indexer::Remote {
+                                reply: reply.clone(),
+                                dir: pane_dir.join(&dir),
+                                generation,
+                                block,
+                            });
+                        }
+                        continue;
+                    }
                     Ok(wire::FromHost::Exited(_)) => {
                         // The program ended: the pane closes, as any pane does.
                         shared.exited.store(true, Ordering::Release);
@@ -2244,7 +2386,7 @@ keys:
                 wake();
             }
         });
-        Ok(Arc::new(Mutex::new(Session::Host { child, stdin })))
+        Ok(session)
     }
 
     /// Start the pane's program in its lane, with reader threads feeding
@@ -2585,17 +2727,16 @@ keys:
             Arc::new(AtomicBool::new(false))
         };
         let gpu = (args.gpu_index && logs.store.is_some())
-            .then(|| {
-                indexer::Indexer::start(|r: &SigReply, g, b, sig| {
-                    let _ = r.send((g, b, sig));
-                })
-            })
+            .then(|| indexer::Indexer::start(|r: &SigReply, g, b, sig| r(g, b, sig)))
             .flatten();
         let index_counts = gpu.as_ref().map(|g| g.counts.clone());
         let spawner = Spawner {
             args,
             logs: &logs,
             place: place.clone(),
+            fetch: gpu
+                .as_ref()
+                .map(|g| g.fetcher(|r: &SigReply, g, b, sig| r(g, b, sig))),
             gpu,
             waker: surface.window().waker(),
             activity: activity.clone(),
@@ -3388,6 +3529,79 @@ keys:
             let f = parse(&argv(&["--font", "Cascadia Mono"])).unwrap();
             assert_eq!(f.font.as_deref(), Some("Cascadia Mono"));
             assert!(parse(&argv(&[])).unwrap().font.is_none());
+            // Pane-host flags, as `start_host` passes them.
+            let h = parse(&argv(&[
+                "--pane-host",
+                "--host-window-signs",
+                "--host-id",
+                "3",
+                "--",
+                "cmd",
+            ]))
+            .unwrap();
+            assert!(h.pane_host && h.host_window_signs);
+            assert_eq!(
+                (h.host_id, h.shell.as_slice()),
+                (3, &["cmd".to_string()][..])
+            );
+        }
+
+        #[test]
+        fn a_host_logger_announces_durable_blocks_and_stores_the_window_signatures() {
+            let root = std::env::temp_dir().join("fwterm-window-signs");
+            let _ = std::fs::remove_dir_all(&root);
+            let (inline, remote) = (root.join("inline"), root.join("remote"));
+            let (ann_tx, announced) = std::sync::mpsc::channel();
+            let (sig_tx, sigs) = std::sync::mpsc::channel();
+            let announce: Announce = Box::new(move |g, dir: &str, b| {
+                let _ = ann_tx.send((g, dir.to_string(), b));
+            });
+            let window =
+                start_logger(remote.clone(), 0, SignBy::Window { announce, sigs }).unwrap();
+            let itself = start_logger(inline.clone(), 0, SignBy::Itself).unwrap();
+            let block = BLOCK_BYTES as usize;
+            let data: Vec<u8> = (0..3 * block + 500)
+                .map(|i| b"cargo: warning unused \r\n"[i % 24])
+                .collect();
+            for chunk in data.chunks(64 << 10) {
+                window.send(LogMsg::Data(chunk.to_vec(), 1)).unwrap();
+                itself.send(LogMsg::Data(chunk.to_vec(), 1)).unwrap();
+            }
+            // The window reads each announced block and signs it.
+            for k in 0..3u64 {
+                let (g, dir, b) = announced.recv_timeout(Duration::from_secs(10)).unwrap();
+                assert_eq!((g, b), (0, k));
+                let r = panelog::ByteReader::open(&remote.join(&dir)).unwrap();
+                let at = k as usize * block;
+                let lead = (k > 0).then(|| [data[at - 2], data[at - 1]]);
+                let mut bytes = vec![0u8; block];
+                r.read_exact_at(at as u64, &mut bytes).unwrap();
+                sig_tx
+                    .send((g, b, panelog::signature(lead, &bytes)))
+                    .unwrap();
+            }
+            assert!(announced.recv_timeout(Duration::from_millis(300)).is_err());
+            // The logger stores them within its idle wake (1 s).
+            std::thread::sleep(Duration::from_millis(1500));
+            for tx in [&window, &itself] {
+                let (done, wait) = std::sync::mpsc::channel();
+                tx.send(LogMsg::Flush(done)).unwrap();
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            let sig_file = |dir: &Path| {
+                let gen = std::fs::read_dir(dir)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                std::fs::read(gen.join("search.sig")).unwrap()
+            };
+            let got = sig_file(&remote);
+            assert_eq!(got.len(), 3 * (panelog::SIG_BYTES + 4));
+            assert_eq!(got, sig_file(&inline));
+            drop((window, itself));
+            let _ = std::fs::remove_dir_all(&root);
         }
 
         #[test]

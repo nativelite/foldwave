@@ -5,7 +5,10 @@
 //! The window starts one per pane with `--isolate`, talks to it over its
 //! stdin and stdout (`wire`): it sends keys, resizes and shedding; this sends
 //! screen updates, at most every [`UPDATE_EVERY`] and at once after quiet,
-//! the pane's shell-integration marks, and the program's exit code.
+//! the pane's shell-integration marks, and the program's exit code. With
+//! `--host-window-signs` it also announces each durable block of its log;
+//! the window builds the block's search signature on the GPU and sends it
+//! back for the logger to store.
 
 use super::*;
 use crate::wire::{FromHost, Sender, ToHost};
@@ -47,9 +50,32 @@ pub fn run(args: &Args) -> io::Result<i32> {
         catching_up: AtomicBool::new(false),
         want: AtomicBool::new(false),
     });
+    // To the window: updates from the loop below, history from the input
+    // thread, blocks from the logger; one whole message at a time.
+    let out = Arc::new(Mutex::new(io::BufWriter::new(io::stdout())));
+
+    // The window builds the log's search signatures on the GPU: the logger
+    // announces each block once durable and stores what comes back.
+    let (sign, sig_tx) = if args.host_window_signs {
+        let (tx, sigs) = std::sync::mpsc::channel();
+        let o = out.clone();
+        let announce: Announce = Box::new(move |generation, dir: &str, block| {
+            let mut o = o.lock().unwrap();
+            let dir = dir.to_string();
+            let msg = FromHost::BlockReady {
+                generation,
+                dir,
+                block,
+            };
+            let _ = msg.write(&mut *o).and_then(|()| o.flush());
+        });
+        (SignBy::Window { announce, sigs }, Some(tx))
+    } else {
+        (SignBy::Itself, None)
+    };
     let log = match &args.host_log {
         Some(dir) => Some(LogLink {
-            tx: start_logger(PathBuf::from(dir), args.host_id, None)?,
+            tx: start_logger(PathBuf::from(dir), args.host_id, sign)?,
             gen_limit: Arc::new(AtomicU64::new(args.host_gen)),
             nudge: std::sync::mpsc::sync_channel(1).0,
         }),
@@ -79,10 +105,6 @@ pub fn run(args: &Args) -> io::Result<i32> {
         log.clone(),
         &Arc::new(Vec::new()),
     )?;
-
-    // To the window: updates from the loop below, history from the input
-    // thread; one whole message at a time.
-    let out = Arc::new(Mutex::new(io::BufWriter::new(io::stdout())));
 
     // From the window: keys, resizes, requests for history. Its end is the
     // window's: take the program down too.
@@ -132,6 +154,15 @@ pub fn run(args: &Args) -> io::Result<i32> {
                         }
                     }
                     Ok(ToHost::Shed(_)) => {}
+                    Ok(ToHost::Signature {
+                        generation,
+                        block,
+                        sig,
+                    }) => {
+                        if let Some(tx) = &sig_tx {
+                            let _ = tx.send((generation, block, sig));
+                        }
+                    }
                     Ok(ToHost::History { first, count }) => {
                         let lines: Vec<_> = match &*shared.term.lock().unwrap() {
                             Emu::Local(t) => (first..first + u64::from(count.min(HISTORY_MAX)))

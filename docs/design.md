@@ -1763,9 +1763,28 @@ take the ship down.
       shown). 4 isolated panes flooding 1 GiB each, one shown: 22.0 CPU-s for
       all fwterm processes shedding, against 32.6–33.7 without (about -33 %).
       The 2,000,000-line catch-up test ends exactly on its last line.
-    - GPU signatures are not built for hosts' logs: each host would need its
-      own CUDA context, or would have to send its blocks to the window's
-      indexer. Hosts build signatures on the CPU. Open.
+  - **GPU signatures for hosts' logs (built 2026-09-25).** One CUDA context
+    per host would cost GPU memory per pane and lose the batching across
+    panes, so the window's indexer signs hosts' blocks too. A host's logger
+    defers its signatures and announces each block once it is durable
+    (`FromHost::BlockReady`: generation, folder, block). A fetcher thread in
+    the window reads the block from the log (`panelog::ByteReader`, which
+    opens only the segments: `Reader::open` would rebuild every missing
+    signature on the CPU) and queues it with the window's own panes' blocks;
+    the signature goes back as `ToHost::Signature` and the logger stores it
+    in order. The window builds a signature itself for a generation's first
+    block, or when the GPU's queue is full. Without CUDA a host signs its own
+    log, as before. Hosts start with `--host-window-signs` when the window
+    has an indexer.
+    - Tested: the stored `search.sig` is byte-identical to one built inline;
+      the fetcher's signatures equal panelog's.
+    - Measured on a pane host driven without a window (pipe lane, 1 GiB of
+      `fwbench --emit`, 3 runs each): 244–249 MiB/s against 232–253
+      signing itself; host CPU 4.91–5.02 s against 6.14–6.47 (about
+      −1.3 CPU-s per GiB, the signatures' cost). 1,023 blocks announced over
+      4 generations, in order. The window's side (reading blocks, GPU
+      launches) is not measured yet: it needs a run with a window, on an
+      unlocked session.
     - **On by default since 2026-09-25** (founder decision, §11 row 11);
       `--no-isolate` turns it off.
     - Not with `--no-log`: an isolated pane keeps no history of its own and
@@ -1942,7 +1961,7 @@ Founder answers of 2026-09-15.
 | 8 | Targets | **Confirmed**, plus **fault isolation**: a crash recovers without taking the ship down | §4 targets; §8.8a design |
 | 9 | Leveraging the whole machine | **Aim offload at work that is GPU-shaped, not at the utilization number.** The governor's first input is CPU pressure | Founder observation 2026-09-15: CPU 80–99% while the GPU idles. §8.7b places every stage and names what will never move; index construction (§8.7a) is the new GPU candidate; E3 measures it |
 | 10 | Hidden panes | **Founder decision (2026-09-24): a hidden pane stops parsing by default** (`--hidden always`); shedding only under CPU pressure (`busy`) and never shedding (`never`) stay as options | Shown again, a pane catches up from its log (200 MB in about 0.3 s, §8.8). The cost is that short fast-forward on switching, bought with about 40 % of fwterm's CPU while panes are hidden |
-| 11 | Fault isolation | **Founder decision (2026-09-25): every pane runs in a pane host process by default**; `--no-isolate` keeps it in the window's process | "It keeps it more resilient." Measured at parity on throughput, frames and latency, ~9 % more CPU for one pane; a crashed host restarts in ~0.1 s (§8.8a). GPU signatures for hosts' logs are still to come |
+| 11 | Fault isolation | **Founder decision (2026-09-25): every pane runs in a pane host process by default**; `--no-isolate` keeps it in the window's process | "It keeps it more resilient." Measured at parity on throughput, frames and latency, ~9 % more CPU for one pane; a crashed host restarts in ~0.1 s (§8.8a). Hosts' logs are signed on the window's GPU indexer (§8.8a) |
 
 **Experiment E2: built-in console host vs OpenConsole (part of M0).**
 
