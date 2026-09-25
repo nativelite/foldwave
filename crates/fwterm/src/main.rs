@@ -1456,7 +1456,7 @@ keys:
         fn line_chars(term: &Emu, n: u64) -> Option<Vec<(char, bool)>> {
             let history = term.scrollback();
             let screen = term.screen();
-            let scrolled = history.scrolled_lines();
+            let scrolled = term.scrolled_lines();
             let mut row = Vec::new();
             let held = if n >= scrolled {
                 let r = (n - scrolled) as usize;
@@ -1572,7 +1572,7 @@ keys:
             shared.want.store(false, Ordering::Release);
             term.take_dirty();
             let history = term.scrollback();
-            let scrolled = history.scrolled_lines();
+            let scrolled = term.scrolled_lines();
             if term.in_alternate_screen() {
                 self.back = 0; // full-screen programs: always live
             } else if self.back > 0 && self.deep.is_none() {
@@ -2026,7 +2026,7 @@ keys:
         wake: Wake,
     ) -> io::Result<Arc<Mutex<Session>>> {
         use std::process::{Command, Stdio};
-        *shared.term.lock().unwrap() = Emu::Remote(wire::Mirror::new(rows, cols, args.history));
+        *shared.term.lock().unwrap() = Emu::Remote(wire::Mirror::new(rows, cols));
         let mut cmd = Command::new(std::env::current_exe()?);
         cmd.arg("--pane-host")
             .args(["--host-size", &format!("{rows}x{cols}")])

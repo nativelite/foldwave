@@ -1724,11 +1724,28 @@ take the ship down.
     every update carries up to 10,000 lines that scrolled off (the mirror's
     history), 250 times a second. Each line is decoded from the host's
     history, encoded, decoded again and stored a second time.
-  - **Next:** mirror only the screen and the scroll count, and let an
-    isolated pane's scrollback, selection of old lines and blocks read the
-    log the host already writes. Then the supervisor: restart a host that
-    dies and rebuild its screen from the log. `--isolate` stays opt-in until
-    it matches in-process throughput.
+  - **Fixed the same day: only the screen and a line count travel now.**
+    The mirror keeps no history; an isolated pane scrolls back into its log.
+    Measured again (2 rounds):
+
+    | | In process | `--isolate` |
+    | --- | --- | --- |
+    | 1 pane | 261–268 MiB/s, 150 fps, gap p99 7.2 ms | 253–260 MiB/s, 151 fps, gap p99 7.2 ms |
+    | 16 panes | 1,102–1,179 MiB/s, 120–133 fps | 1,111–1,136 MiB/s, 131–139 fps |
+    | CPU of all fwterm processes, 1 pane | 13.0 s | 14.1–14.3 s |
+
+    Throughput and frames are at parity; one pane costs ~9 % more CPU. The
+    16-pane CPU was sampled every 0.5 s and misses hosts that exit before the
+    last sample, so it is not compared.
+  - **What an isolated pane cannot do yet:** copy lines that have left the
+    screen. The blocks test copies `out 20`..`out 40` of `out 1`..`out 40`,
+    the part still on screen. The host still holds those lines in memory.
+  - **Next:**
+    - The window asks the host for history lines when it needs them (a
+      copy, a scrolled-back view): exact, and only when used.
+    - Then the supervisor: restart a host that dies and rebuild its screen
+      from the log.
+    - `--isolate` stays opt-in until both are done.
 
 
 ### 8.9 Platform notes

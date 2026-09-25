@@ -2,12 +2,17 @@
 //!
 //! With `--isolate`, a pane's program, parser and log live in a pane-host
 //! process, so a crash there cannot take the window down. The window keeps a
-//! display-only copy of the pane, a [`Mirror`], fed with [`Update`]s: the
-//! lines that scrolled off the top since the last update, taken from the
-//! host's history (a row can change after an update and leave before the
-//! next, so the mirror's own copy of it would be stale), and the rows that
-//! differ from what was last sent. The [`Sender`] on the host works out each
-//! update by comparing the screen with its copy of what it sent.
+//! display-only copy of the pane's screen, a [`Mirror`], fed with
+//! [`Update`]s: how many lines scrolled off the top since the last update, and
+//! the rows that differ from what was last sent. The [`Sender`] on the host
+//! works out each update by comparing the screen with its copy of what it
+//! sent.
+//!
+//! History does not travel. A first cut sent every line that scrolled off, up
+//! to 10,000 an update, and cost a flood half its throughput and four times
+//! the CPU. The host writes the pane's log; an isolated pane's scrollback
+//! reads that. The mirror counts lines only, so selections and blocks keep
+//! their numbering.
 //!
 //! Rows travel as UTF-8 text plus runs of style, trailing blanks dropped, so
 //! a line costs about what its text does.
@@ -51,10 +56,6 @@ pub struct Update {
     /// Lines that scrolled off the top of the primary screen since the last
     /// update.
     pub scrolled: u64,
-    /// The newest of them, oldest first, as many as the host's history
-    /// holds: the mirror's history is the same size, so older ones would
-    /// fall out of it anyway.
-    pub lines: Vec<Vec<Cell>>,
     /// The full-screen (alternate) screen is showing.
     pub alt: bool,
     /// Rows that changed, with their cells.
@@ -87,14 +88,6 @@ impl Sender {
         let scrolled = history.scrolled_lines().saturating_sub(self.scrolled);
         let resized = (rows, cols) != self.size;
         let switched = alt != self.alt;
-        // The lines that left, from the history as far as it holds them.
-        let kept = (scrolled as usize).min(history.history_len());
-        let mut lines = Vec::with_capacity(kept);
-        for age in (0..kept).rev() {
-            let mut line = Vec::new();
-            history.history_row(age, &mut line);
-            lines.push(line);
-        }
         // What the mirror shows after it scrolls the same way.
         if resized || switched {
             self.sent.clear();
@@ -119,7 +112,6 @@ impl Sender {
         let c = screen.cursor();
         Some(Update {
             scrolled,
-            lines,
             alt,
             rows: changed,
             cursor: (c.row as u16, c.col as u16),
@@ -128,21 +120,22 @@ impl Sender {
     }
 }
 
-/// The window's display-only copy of a pane.
+/// The window's display-only copy of a pane's screen.
 pub struct Mirror {
     pub primary: Screen,
     pub alt: Screen,
     pub in_alt: bool,
-    history: usize,
+    /// Lines scrolled off the top of the primary screen, as the host counts.
+    pub scrolled: u64,
 }
 
 impl Mirror {
-    pub fn new(rows: usize, cols: usize, history: usize) -> Mirror {
+    pub fn new(rows: usize, cols: usize) -> Mirror {
         Mirror {
-            primary: Screen::with_history(rows, cols, history),
+            primary: Screen::new(rows, cols),
             alt: Screen::new(rows, cols),
             in_alt: false,
-            history,
+            scrolled: 0,
         }
     }
 
@@ -158,27 +151,18 @@ impl Mirror {
     pub fn apply(&mut self, u: &Update) {
         let (rows, cols) = (u.size.0.max(1) as usize, u.size.1.max(1) as usize);
         if (rows, cols) != (self.primary.rows(), self.primary.cols()) {
-            let mut p = Screen::with_history(rows, cols, self.history);
-            p.copy_history_from(&self.primary);
-            self.primary = p;
+            self.primary = Screen::new(rows, cols);
             self.alt = Screen::new(rows, cols);
         }
-        // Scroll as the host did. Lines older than the host still holds go
-        // blind (they are beyond the history either side keeps); each line
-        // sent goes through the top row, so it lands in history as it was.
+        // Scroll as the host did; a whole screen or more of scrolling
+        // replaces every row, and the update carries them all.
+        self.scrolled += u.scrolled;
         let blank = Cell::default();
-        let mut blind = (u.scrolled as usize).saturating_sub(u.lines.len());
-        while blind > 0 {
-            let n = blind.min(rows);
+        let n = (u.scrolled as usize).min(rows);
+        if n > 0 {
             self.primary.scroll_rows_up(0, rows - 1, n, blank);
-            blind -= n;
         }
         let mut row = Vec::with_capacity(cols);
-        for line in &u.lines {
-            padded(line, cols, &mut row);
-            self.primary.copy_cells(0, 0, &row);
-            self.primary.scroll_rows_up(0, rows - 1, 1, blank);
-        }
         self.in_alt = u.alt;
         let screen = if u.alt {
             &mut self.alt
@@ -387,10 +371,6 @@ impl FromHost {
         let tag = match self {
             FromHost::Update(u) => {
                 b.extend_from_slice(&u.scrolled.to_le_bytes());
-                b.extend_from_slice(&(u.lines.len() as u32).to_le_bytes());
-                for line in &u.lines {
-                    put_row(&mut b, line);
-                }
                 b.push(u.alt as u8);
                 b.extend_from_slice(&u.size.0.to_le_bytes());
                 b.extend_from_slice(&u.size.1.to_le_bytes());
@@ -424,11 +404,6 @@ impl FromHost {
         let msg = match tag {
             T_UPDATE => {
                 let scrolled = b.u64()?;
-                let n = b.u32()? as usize;
-                let mut lines = Vec::new();
-                for _ in 0..n {
-                    lines.push(b.row()?);
-                }
                 let alt = b.u8()? != 0;
                 let size = (b.u16()?, b.u16()?);
                 let cursor = (b.u16()?, b.u16()?);
@@ -440,7 +415,6 @@ impl FromHost {
                 }
                 FromHost::Update(Update {
                     scrolled,
-                    lines,
                     alt,
                     rows,
                     cursor,
@@ -509,17 +483,6 @@ mod tests {
         (0..s.rows()).map(|r| row_of(s, r)).collect()
     }
 
-    fn history_rows(s: &Screen, n: usize) -> Vec<Vec<Cell>> {
-        (0..n.min(s.history_len()))
-            .map(|age| {
-                let mut v = Vec::new();
-                s.history_row(age, &mut v);
-                v.resize(s.cols(), Cell::default());
-                v
-            })
-            .collect()
-    }
-
     /// Output with colours, long lines that wrap, and a trip to the
     /// alternate screen and back.
     fn output(seed: u32) -> Vec<u8> {
@@ -551,7 +514,7 @@ mod tests {
             let data = output(seed);
             let mut term = vterm::Term::with_history(12, 40, 500);
             let mut sender = Sender::default();
-            let mut mirror = Mirror::new(12, 40, 500);
+            let mut mirror = Mirror::new(12, 40);
             let mut x = seed | 1;
             let mut at = 0;
             while at < data.len() {
@@ -578,25 +541,16 @@ mod tests {
                         "seed {seed}"
                     );
                     assert_eq!(mirror.screen().cursor(), term.screen().cursor());
-                    assert_eq!(
-                        mirror.primary.scrolled_lines(),
-                        term.scrollback().scrolled_lines()
-                    );
+                    assert_eq!(mirror.scrolled, term.scrollback().scrolled_lines());
                 }
             }
-            // The whole history the host still holds, line for line.
-            assert_eq!(
-                history_rows(&mirror.primary, 500),
-                history_rows(term.scrollback(), 500),
-                "seed {seed}"
-            );
         }
     }
 
     #[test]
     fn a_resize_reaches_the_mirror() {
         let mut term = vterm::Term::with_history(10, 30, 100);
-        let (mut sender, mut mirror) = (Sender::default(), Mirror::new(10, 30, 100));
+        let (mut sender, mut mirror) = (Sender::default(), Mirror::new(10, 30));
         term.feed(b"one\r\ntwo\r\n");
         mirror.apply(&sender.update(&term).unwrap());
         term.resize(6, 50);
@@ -648,7 +602,6 @@ mod tests {
         let mut b = Vec::new();
         let mut u = Update {
             scrolled: 0,
-            lines: vec![],
             alt: false,
             rows: vec![(
                 0,

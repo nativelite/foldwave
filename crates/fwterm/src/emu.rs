@@ -21,7 +21,17 @@ impl Emu {
         }
     }
 
-    /// The primary screen, with the history.
+    /// Lines scrolled off the top since the pane started: the numbering
+    /// selections and blocks use.
+    pub fn scrolled_lines(&self) -> u64 {
+        match self {
+            Emu::Local(t) => t.scrollback().scrolled_lines(),
+            Emu::Remote(m) => m.scrolled,
+        }
+    }
+
+    /// The primary screen, with the history (none for a mirror: an isolated
+    /// pane's history is its log).
     pub fn scrollback(&self) -> &Screen {
         match self {
             Emu::Local(t) => t.scrollback(),
