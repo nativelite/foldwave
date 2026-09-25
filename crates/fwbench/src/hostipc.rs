@@ -65,9 +65,11 @@ pub struct Report {
     pub message: usize,
     /// Bytes per screen-update frame, and how many were sent.
     pub frame_bytes: usize,
+    /// Frames sent.
     pub frames: u32,
     /// How fast the window side received them.
     pub frames_per_sec: f64,
+    /// The same in MiB/s.
     pub mib_per_sec: f64,
 }
 
