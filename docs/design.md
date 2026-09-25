@@ -1766,9 +1766,8 @@ take the ship down.
     - GPU signatures are not built for hosts' logs: each host would need its
       own CUDA context, or would have to send its blocks to the window's
       indexer. Hosts build signatures on the CPU. Open.
-    - `--isolate` is opt-in; making it the default is the founder's call,
-      given the numbers above (throughput and latency at parity, ~9 % more
-      CPU for one pane).
+    - **On by default since 2026-09-25** (founder decision, §11 row 11);
+      `--no-isolate` turns it off.
 
 
 ### 8.9 Platform notes
@@ -1939,6 +1938,7 @@ Founder answers of 2026-09-15.
 | 8 | Targets | **Confirmed**, plus **fault isolation**: a crash recovers without taking the ship down | §4 targets; §8.8a design |
 | 9 | Leveraging the whole machine | **Aim offload at work that is GPU-shaped, not at the utilization number.** The governor's first input is CPU pressure | Founder observation 2026-09-15: CPU 80–99% while the GPU idles. §8.7b places every stage and names what will never move; index construction (§8.7a) is the new GPU candidate; E3 measures it |
 | 10 | Hidden panes | **Founder decision (2026-09-24): a hidden pane stops parsing by default** (`--hidden always`); shedding only under CPU pressure (`busy`) and never shedding (`never`) stay as options | Shown again, a pane catches up from its log (200 MB in about 0.3 s, §8.8). The cost is that short fast-forward on switching, bought with about 40 % of fwterm's CPU while panes are hidden |
+| 11 | Fault isolation | **Founder decision (2026-09-25): every pane runs in a pane host process by default**; `--no-isolate` keeps it in the window's process | "It keeps it more resilient." Measured at parity on throughput, frames and latency, ~9 % more CPU for one pane; a crashed host restarts in ~0.1 s (§8.8a). GPU signatures for hosts' logs are still to come |
 
 **Experiment E2: built-in console host vs OpenConsole (part of M0).**
 

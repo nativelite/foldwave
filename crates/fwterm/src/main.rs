@@ -160,9 +160,10 @@ options:
                 logs, catching up from its log when shown again: always
                 (default), busy (only while other programs keep the CPU
                 nearly full), or never. Without a log it keeps parsing
-  --isolate     run each pane's program, parser and log in a pane host
-                process of its own (design 8.8a): a crash there ends that
-                pane, not the window
+  --no-isolate  run every pane's program, parser and log in this process.
+                By default each pane has a pane host process of its own
+                (design 8.8a): a crash there restarts that pane in ~0.1 s
+                and leaves the window and the other panes running
   --shell-integration S  on (default): cmd.exe marks its prompts and commands
                 (OSC 133, through PROMPT), so Ctrl+Up/Down and Ctrl+Shift+O
                 work; other shells mark them themselves if set up to; off
@@ -250,7 +251,7 @@ keys:
             gpu_index: true,
             shell_integration: true,
             pane_host: false,
-            isolate: false,
+            isolate: true,
             host_size: (24, 80),
             host_log: None,
             host_gen: 256 << 20,
@@ -349,6 +350,10 @@ keys:
                 }
                 "--isolate" => {
                     a.isolate = true;
+                    i += 1;
+                }
+                "--no-isolate" => {
+                    a.isolate = false;
                     i += 1;
                 }
                 "--host-size" => {
