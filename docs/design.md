@@ -1698,6 +1698,38 @@ take the ship down.
       pane (screen, history lines for scrollback, selection, blocks), fed by
       the host with changed rows and lines leaving the screen, while the log
       stays readable from disk as now.
+  - **Built behind `--isolate` (2026-09-25), opt-in.**
+    - [`wire.rs`](../crates/fwterm/src/wire.rs): the protocol, a host-side
+      `Sender` (compares the screen with what it last sent) and the window's
+      `Mirror`. Tested: a real emulator fed colour, wrapping, wide and
+      full-screen output in random chunks; the mirror's screen, cursor, line
+      count and whole history equal the host's.
+    - `fwterm --pane-host` ([`app/host.rs`](../crates/fwterm/src/app/host.rs))
+      runs one pane's program, parser and log.
+    - With `--isolate`, the window starts one host per pane and draws from
+      its mirror. Blocks, search and scrollback into the log work; the
+      blocks test passes unchanged.
+  - **Measured against in-process (pipe lane, `fwbench --emit`, 2 rounds):**
+
+    | | In process | `--isolate` |
+    | --- | --- | --- |
+    | key echo p50 / p90 / p99 (100 samples) | 7.25 / 11.45 / 13.41 ms | 7.86 / 11.28 / 13.02 ms |
+    | 1 pane, 4 GiB | 266–269 MiB/s, 150 fps | 147–148 MiB/s, 41–42 fps |
+    | 16 panes, 512 MiB each | 1,153–1,183 MiB/s, 133 fps | 610–619 MiB/s, 97 fps |
+    | CPU of all fwterm processes, 1 pane | 12.6–12.9 s | 47–49 s |
+
+    Latency is at parity: the difference is inside fwprobe's 6 ms step.
+    Throughput is not.
+  - **The cause is the protocol, not the process boundary.** During a flood
+    every update carries up to 10,000 lines that scrolled off (the mirror's
+    history), 250 times a second. Each line is decoded from the host's
+    history, encoded, decoded again and stored a second time.
+  - **Next:** mirror only the screen and the scroll count, and let an
+    isolated pane's scrollback, selection of old lines and blocks read the
+    log the host already writes. Then the supervisor: restart a host that
+    dies and rebuild its screen from the log. `--isolate` stays opt-in until
+    it matches in-process throughput.
+
 
 ### 8.9 Platform notes
 - **Windows:** console apps need ConPTY, so a console host always sits between

@@ -1959,6 +1959,7 @@ keys:
                     .as_ref()
                     .map_or(256 << 20, |st| st.gen_limit.load(Ordering::Acquire));
                 let session = start_host(
+                    &self.activity,
                     args,
                     id,
                     rows,
@@ -2013,6 +2014,7 @@ keys:
     /// sends to the pane's mirror.
     #[allow(clippy::too_many_arguments)]
     fn start_host(
+        activity: &Arc<Activity>,
         args: &Args,
         id: PaneId,
         rows: usize,
@@ -2048,7 +2050,7 @@ keys:
         let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
         let mut out = child.stdout.take().expect("piped");
         let stdin = child.stdin.take();
-        let shared = shared.clone();
+        let (shared, activity) = (shared.clone(), activity.clone());
         std::thread::spawn(move || {
             let mut out = io::BufReader::new(&mut out);
             loop {
@@ -2057,6 +2059,10 @@ keys:
                         if let Emu::Remote(m) = &mut *shared.term.lock().unwrap() {
                             m.apply(&u);
                         }
+                        // For --stats: output flowed until now.
+                        let now = activity.epoch.elapsed().as_nanos() as u64;
+                        activity.first_output.fetch_min(now, Ordering::AcqRel);
+                        activity.last_output.store(now, Ordering::Release);
                     }
                     Ok(wire::FromHost::Mark { kind, line, exit }) => {
                         let kind = match kind {
