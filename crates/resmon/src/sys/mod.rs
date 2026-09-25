@@ -11,14 +11,14 @@
 mod windows;
 #[cfg(windows)]
 pub use windows::{
-    cpu_sets, cpu_times, fixed_volumes, place_current_thread, processes, snapshot, system_info,
-    volume,
+    cpu_sets, cpu_times, fixed_volumes, job_assign, job_new, place_current_thread, processes,
+    snapshot, system_info, volume, Job,
 };
 
 #[cfg(not(windows))]
 mod unsupported;
 #[cfg(not(windows))]
 pub use unsupported::{
-    cpu_sets, cpu_times, fixed_volumes, place_current_thread, processes, snapshot, system_info,
-    volume,
+    cpu_sets, cpu_times, fixed_volumes, job_assign, job_new, place_current_thread, processes,
+    snapshot, system_info, volume, Job,
 };

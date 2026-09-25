@@ -516,6 +516,8 @@ keys:
         Pipe {
             child: std::process::Child,
             stdin: Option<std::process::ChildStdin>,
+            /// Ends the program if this process ends first, however it ends.
+            _job: Option<resmon::job::KillOnClose>,
         },
         /// `--isolate`: a pane host process runs the program (`app::host`).
         Host {
@@ -2268,7 +2270,16 @@ keys:
             pump(Box::new(move |b| io::Read::read(&mut err, b)), None, false);
             pump(Box::new(move |b| io::Read::read(&mut out, b)), None, true);
             let stdin = child.stdin.take();
-            Arc::new(Mutex::new(Session::Pipe { child, stdin }))
+            // In a job that closes with this process: a crash here (a pane
+            // host's, with --isolate) cannot leave the program running.
+            let job = resmon::job::KillOnClose::new()
+                .ok()
+                .filter(|j| j.assign(&child).is_ok());
+            Arc::new(Mutex::new(Session::Pipe {
+                child,
+                stdin,
+                _job: job,
+            }))
         } else {
             let env = if args.shell_integration {
                 shell_integration(&args.shell[0])

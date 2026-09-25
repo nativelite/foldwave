@@ -154,6 +154,88 @@ extern "system" {
     fn GetCurrentProcess() -> Handle;
     fn GetCurrentThread() -> Handle;
     fn SetThreadSelectedCpuSets(thread: Handle, ids: *const u32, count: u32) -> Bool;
+    fn CreateJobObjectW(attributes: *mut std::ffi::c_void, name: *const u16) -> Handle;
+    fn SetInformationJobObject(
+        job: Handle,
+        class: u32,
+        info: *const std::ffi::c_void,
+        len: u32,
+    ) -> Bool;
+    fn AssignProcessToJobObject(job: Handle, process: Handle) -> Bool;
+}
+
+/// `JOBOBJECT_BASIC_LIMIT_INFORMATION`.
+#[repr(C)]
+#[derive(Default)]
+struct JobBasicLimits {
+    per_process_user_time: i64,
+    per_job_user_time: i64,
+    limit_flags: u32,
+    min_working_set: usize,
+    max_working_set: usize,
+    active_process_limit: u32,
+    affinity: usize,
+    priority_class: u32,
+    scheduling_class: u32,
+}
+
+/// `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`.
+#[repr(C)]
+#[derive(Default)]
+struct JobExtendedLimits {
+    basic: JobBasicLimits,
+    io: IoCounters,
+    process_memory_limit: usize,
+    job_memory_limit: usize,
+    peak_process_memory: usize,
+    peak_job_memory: usize,
+}
+
+const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
+const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9;
+
+/// A job object handle, closed on drop (which ends its processes).
+pub struct Job(OwnedHandle);
+
+// SAFETY: a job object handle is a kernel handle, valid from any thread; the
+// job is only assigned to and closed, both thread-safe calls.
+unsafe impl Send for Job {}
+// SAFETY: as above; `&Job` only allows `job_assign`.
+unsafe impl Sync for Job {}
+
+/// A new kill-on-close job.
+pub fn job_new() -> io::Result<Job> {
+    // SAFETY: no attributes and no name are both allowed.
+    let h = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
+    if h.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let job = Job(OwnedHandle(h));
+    let mut info = JobExtendedLimits::default();
+    info.basic.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // SAFETY: `info` is the structure the class names, with its exact size.
+    let ok = unsafe {
+        SetInformationJobObject(
+            job.0 .0,
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            (&info as *const JobExtendedLimits).cast(),
+            std::mem::size_of::<JobExtendedLimits>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(job)
+}
+
+/// Put `child` in `job`.
+pub fn job_assign(job: &Job, child: &std::process::Child) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    // SAFETY: both handles are live for the call.
+    if unsafe { AssignProcessToJobObject(job.0 .0, child.as_raw_handle().cast()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// The raw `SYSTEM_CPU_SET_INFORMATION` records for every logical processor.

@@ -39,6 +39,7 @@
 pub mod cpu;
 pub mod delta;
 pub mod gpu;
+pub mod job;
 pub mod proc;
 pub mod report;
 pub mod sys;

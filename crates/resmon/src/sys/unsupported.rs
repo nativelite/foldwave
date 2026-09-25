@@ -52,6 +52,19 @@ pub fn place_current_thread(_ids: &[u32]) -> io::Result<()> {
     unsupported()
 }
 
+/// No jobs on an unsupported platform.
+pub struct Job;
+
+/// Always fails on an unsupported platform.
+pub fn job_new() -> io::Result<Job> {
+    unsupported()
+}
+
+/// Always fails on an unsupported platform.
+pub fn job_assign(_job: &Job, _child: &std::process::Child) -> io::Result<()> {
+    unsupported()
+}
+
 /// None known on an unsupported platform.
 pub fn fixed_volumes() -> Vec<std::path::PathBuf> {
     Vec::new()
