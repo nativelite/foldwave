@@ -1314,6 +1314,8 @@ keys:
         blocks: Mutex<blocks::Blocks>,
         /// In a pane host: marks waiting to go to the window.
         marks_out: Option<Mutex<Vec<(u8, u64, Option<i32>)>>>,
+        /// An isolated pane's host crashed and is to be restarted.
+        host_died: AtomicBool,
         /// An isolated pane waiting for history lines from its host.
         history_reply: Mutex<Option<std::sync::mpsc::Sender<(u64, Vec<Vec<ansi::Cell>>)>>>,
         /// Output since the last checkpoint sent to the log.
@@ -1418,6 +1420,8 @@ keys:
         hidden: bool,
         /// Showing a search hit: its line in the pane's logs, and the needle.
         find_view: Option<(u64, String)>,
+        /// When this pane's host was restarted, for the crash-loop guard.
+        restarts: Vec<Instant>,
     }
 
     impl Pane {
@@ -1954,7 +1958,64 @@ keys:
         activity: Arc<Activity>,
     }
 
+    /// Restarts a crashed host at most this often before its pane closes.
+    const RESTARTS: usize = 3;
+    const RESTART_WINDOW: Duration = Duration::from_secs(30);
+
     impl Spawner<'_> {
+        /// Start a new host for an isolated pane whose host crashed: a fresh
+        /// program, a new log generation in the same pane folder (so the
+        /// earlier output is still there to scroll back to and search), and
+        /// a red line saying what happened. False when the pane has crashed
+        /// too often and should close.
+        fn restart(&self, pane: &mut Pane) -> bool {
+            let now = Instant::now();
+            pane.restarts
+                .retain(|t| now.duration_since(*t) < RESTART_WINDOW);
+            if pane.restarts.len() >= RESTARTS {
+                return false;
+            }
+            pane.restarts.push(now);
+            let (rows, cols) = (pane.rect.rows.max(1), pane.rect.cols.max(1));
+            let gen = self
+                .logs
+                .store
+                .as_ref()
+                .map_or(256 << 20, |st| st.gen_limit.load(Ordering::Acquire));
+            let wake: Wake = {
+                let w = self.waker.clone();
+                Arc::new(move || w.wake())
+            };
+            *pane.shared.blocks.lock().unwrap() = blocks::Blocks::default();
+            let note = format!(
+                "{RED}[fwterm: this pane's host process stopped; started a new one. \
+                 Earlier output is in the log: scroll back or search.]{RESET}\r\n"
+            );
+            match start_host(
+                &self.activity,
+                self.args,
+                pane.id,
+                rows,
+                cols,
+                &pane.shared,
+                pane.pane_dir.as_deref(),
+                gen,
+                self.logs,
+                wake,
+                &note,
+            ) {
+                Ok(session) => {
+                    pane.session = session;
+                    pane.back = 0;
+                    pane.deep = None;
+                    pane.find_view = None;
+                    pane.shared.pending.store(true, Ordering::Release);
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+
         fn spawn(&self, id: PaneId, rect: Rect) -> io::Result<Pane> {
             let args = self.args;
             let (rows, cols) = (rect.rows.max(1), rect.cols.max(1));
@@ -1974,6 +2035,7 @@ keys:
                 blocks: Mutex::new(blocks::Blocks::default()),
                 marks_out: None,
                 history_reply: Mutex::new(None),
+                host_died: AtomicBool::new(false),
                 since_checkpoint: AtomicU64::new(0),
                 gen_bytes: AtomicU64::new(0),
                 parsing: AtomicBool::new(true),
@@ -2027,6 +2089,7 @@ keys:
                     gen,
                     &self.logs,
                     wake,
+                    "",
                 )?;
                 return Ok(Pane {
                     id,
@@ -2040,6 +2103,7 @@ keys:
                     deep: None,
                     hidden: false,
                     find_view: None,
+                    restarts: Vec::new(),
                 });
             }
             let session = start_session(
@@ -2064,6 +2128,7 @@ keys:
                 deep: None,
                 hidden: false,
                 find_view: None,
+                restarts: Vec::new(),
             })
         }
     }
@@ -2082,6 +2147,7 @@ keys:
         gen: u64,
         logs: &Logs,
         wake: Wake,
+        note: &str,
     ) -> io::Result<Arc<Mutex<Session>>> {
         use std::process::{Command, Stdio};
         *shared.term.lock().unwrap() = Emu::Remote(wire::Mirror::new(rows, cols));
@@ -2104,7 +2170,7 @@ keys:
             cmd.arg("--host-log").arg(dir);
         }
         cmd.arg("--").args(&args.shell);
-        cmd.env("FWTERM_BANNER", logs.banner());
+        cmd.env("FWTERM_BANNER", format!("{}{note}", logs.banner()));
         let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
         let mut out = child.stdout.take().expect("piped");
         let stdin = child.stdin.take();
@@ -2137,9 +2203,16 @@ keys:
                         }
                         continue;
                     }
-                    Ok(wire::FromHost::Exited(_)) | Err(_) => {
-                        // The program ended, or the host did.
+                    Ok(wire::FromHost::Exited(_)) => {
+                        // The program ended: the pane closes, as any pane does.
                         shared.exited.store(true, Ordering::Release);
+                        wake();
+                        return;
+                    }
+                    Err(_) => {
+                        // The host ended without saying so: it crashed. The
+                        // window restarts it (see `Spawner::restart`).
+                        shared.host_died.store(true, Ordering::Release);
                         wake();
                         return;
                     }
@@ -2972,6 +3045,17 @@ keys:
                 // the keys.
                 if let Some(p) = panes.iter().find(|p| p.id == focus) {
                     let _ = p.session.lock().unwrap().write(&input);
+                }
+            }
+            // A crashed pane host is restarted; one that crashes too often
+            // closes its pane.
+            for p in panes.iter_mut() {
+                if p.shared.host_died.swap(false, Ordering::AcqRel) {
+                    if spawner.restart(p) {
+                        layout_dirty = true;
+                    } else {
+                        p.shared.exited.store(true, Ordering::Release);
+                    }
                 }
             }
             closing.extend(

@@ -1740,12 +1740,27 @@ take the ship down.
   - **What an isolated pane cannot do yet:** copy lines that have left the
     screen. The blocks test copies `out 20`..`out 40` of `out 1`..`out 40`,
     the part still on screen. The host still holds those lines in memory.
-  - **Next:**
-    - The window asks the host for history lines when it needs them (a
-      copy, a scrolled-back view): exact, and only when used.
-    - Then the supervisor: restart a host that dies and rebuild its screen
-      from the log.
-    - `--isolate` stays opt-in until both are done.
+  - **History on demand (built 2026-09-25).** A copy asks the host for the
+    lines that left the screen (`ToHost::History`); the blocks test copies
+    `out 1`..`out 40` exactly under `--isolate`.
+  - **Supervisor (built 2026-09-25).** When a host's pipe ends without an
+    exit message, the host crashed. The window starts a new host for that
+    pane: a fresh program, a new log generation in the same pane folder, so
+    the earlier output stays there to scroll back to and search. The new
+    screen opens with a red line saying what happened. More than 3 restarts
+    in 30 s and the pane closes instead.
+    - Checked by killing a host process from outside: a new host was running
+      99 ms later, the window kept running, the pane showed the note and a
+      fresh shell, and `echo alive after restart` answered.
+    - Four kills in a row: 3 restarts, then the pane closed.
+  - **Still open:**
+    - The crashed program itself is not recovered: a console-lane program
+      dies with its pseudoconsole, and a pipe-lane one is left running (no
+      job object yet).
+    - Hidden-pane shedding and GPU signatures are not wired into hosts.
+    - `--isolate` is opt-in; making it the default is the founder's call,
+      given the numbers above (throughput and latency at parity, ~9 % more
+      CPU for one pane).
 
 
 ### 8.9 Platform notes

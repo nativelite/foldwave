@@ -37,6 +37,7 @@ pub fn run(args: &Args) -> io::Result<i32> {
         blocks: Mutex::new(blocks::Blocks::default()),
         marks_out: Some(Mutex::new(Vec::new())),
         history_reply: Mutex::new(None),
+        host_died: AtomicBool::new(false),
         pending: AtomicBool::new(true),
         exited: AtomicBool::new(false),
         since_checkpoint: AtomicU64::new(0),
