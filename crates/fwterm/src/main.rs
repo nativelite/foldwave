@@ -520,6 +520,11 @@ keys:
         Mark(panelog::Mark),
     }
 
+    /// How soon after output stops the logger flushes it.
+    const LOG_FLUSH_AFTER: Duration = Duration::from_millis(50);
+    /// How often an idle logger wakes to store signatures from the GPU.
+    const LOG_IDLE_WAKE: Duration = Duration::from_secs(1);
+
     /// Chunks the logger may lag behind by (64 KiB each: 4 MiB). Past this the
     /// reader waits for the disk: memory stays bounded, output is never lost.
     const LOG_QUEUE: usize = 64;
@@ -581,13 +586,35 @@ keys:
         }
 
         fn store(&mut self, w: &mut panelog::Writer) {
-            while let Some(sig) = self.ready.remove(&w.signature_count()) {
+            Self::store_into(&mut self.ready, w);
+        }
+
+        /// Store the signatures in `ready` that are next in `w`'s order.
+        fn store_into(
+            ready: &mut std::collections::BTreeMap<u64, Vec<u8>>,
+            w: &mut panelog::Writer,
+        ) {
+            while let Some(sig) = ready.remove(&w.signature_count()) {
                 if w.add_signature(w.signature_count(), &sig).is_err() {
                     break;
                 }
             }
         }
     }
+
+    /// A generation that has rolled over, kept open a little longer so the
+    /// signatures still on the GPU land in its log.
+    struct Retiring {
+        generation: u32,
+        writer: panelog::Writer,
+        ready: std::collections::BTreeMap<u64, Vec<u8>>,
+        until: Instant,
+    }
+
+    /// How long a rolled-over generation waits for its last signatures: the
+    /// indexer gathers for up to 400 ms, then builds and returns them.
+    const RETIRE_FOR: Duration = Duration::from_secs(2);
+    const BLOCK_BYTES: u64 = panelog::SIG_BLOCK;
 
     fn start_logger(
         pane_dir: PathBuf,
@@ -611,6 +638,7 @@ keys:
         let mut writer = open(generation)?;
         let (tx, rx) = std::sync::mpsc::sync_channel::<LogMsg>(LOG_QUEUE);
         let (sig_tx, sig_rx) = std::sync::mpsc::channel();
+        let mut retiring: Option<Retiring> = None;
         let mut signing = gpu.map(|indexer| Signing {
             indexer,
             reply: sig_tx,
@@ -620,15 +648,37 @@ keys:
         std::thread::spawn(move || {
             let mut dirty = false;
             loop {
-                let msg = rx.recv_timeout(Duration::from_millis(50));
-                // Signatures back from the GPU, for this generation only: an
-                // older one's are rebuilt by panelog when it is opened.
+                // Flush 50 ms after output stops; with nothing to flush, wake
+                // only to store signatures back from the GPU (design §4: an
+                // idle terminal does not poll).
+                let wait = if dirty || retiring.is_some() {
+                    LOG_FLUSH_AFTER
+                } else {
+                    LOG_IDLE_WAKE
+                };
+                let msg = rx.recv_timeout(wait);
+                // Signatures back from the GPU: for this generation, or for
+                // the one just rolled over while it is still kept open. Any
+                // later than that are rebuilt by panelog when its log opens.
                 if let Some(s) = signing.as_mut() {
                     while let Ok((g, block, sig)) = sig_rx.try_recv() {
                         if g == generation {
                             s.arrived(block, sig, &mut writer);
                             dirty = true;
+                        } else if let Some(r) = retiring.as_mut().filter(|r| r.generation == g) {
+                            r.ready.insert(block, sig);
+                            Signing::store_into(&mut r.ready, &mut r.writer);
                         }
+                    }
+                }
+                // Let the old generation go once every whole block has its
+                // signature, or its time is up.
+                if retiring.as_ref().is_some_and(|r| {
+                    r.writer.signature_count() >= r.writer.len() / BLOCK_BYTES
+                        || Instant::now() >= r.until
+                }) {
+                    if let Some(mut r) = retiring.take() {
+                        let _ = r.writer.flush();
                     }
                 }
                 match msg {
@@ -651,15 +701,26 @@ keys:
                     }
                     Ok(LogMsg::Roll(blob)) => {
                         let _ = writer.flush();
-                        generation += 1;
-                        writer = match open(generation) {
+                        let next = match open(generation + 1) {
                             Ok(w) => w,
                             Err(_) => return,
                         };
+                        let old = std::mem::replace(&mut writer, next);
                         if let Some(s) = signing.as_mut() {
                             s.stager = indexer::BlockStager::default();
-                            s.ready.clear();
+                            // Keep the old generation open for its signatures
+                            // still on the GPU; the one before goes now.
+                            if let Some(mut r) = retiring.take() {
+                                let _ = r.writer.flush();
+                            }
+                            retiring = Some(Retiring {
+                                generation,
+                                writer: old,
+                                ready: std::mem::take(&mut s.ready),
+                                until: Instant::now() + RETIRE_FOR,
+                            });
                         }
+                        generation += 1;
                         let _ = writer.checkpoint(&blob);
                         dirty = true;
                     }
@@ -1027,7 +1088,9 @@ keys:
         searched: String,
         hits: Vec<find::Hit>,
         at: usize,
-        running: Option<std::sync::mpsc::Receiver<Vec<find::Hit>>>,
+        running: Option<std::sync::mpsc::Receiver<(Vec<find::Hit>, Duration)>>,
+        /// How long the last search took, start to hits.
+        took: Option<Duration>,
     }
 
     /// Hits kept per generation of each pane.
@@ -1194,6 +1257,7 @@ keys:
         activity: &Activity,
         frames: &[u64],
         index: Option<&indexer::Counts>,
+        search: Option<(Duration, usize)>,
     ) -> io::Result<()> {
         let (first, last) = (
             activity.first_output.load(Ordering::Acquire),
@@ -1231,6 +1295,14 @@ keys:
                 c.gpu.load(Ordering::Relaxed),
                 c.cpu.load(Ordering::Relaxed),
                 c.launches.load(Ordering::Relaxed)
+            ),
+            None => text,
+        };
+        // The last search: how long it took and how many hits.
+        let text = match search {
+            Some((took, hits)) => format!(
+                "{text}last_search_ms {:.1}\nlast_search_hits {hits}\n",
+                took.as_secs_f64() * 1e3
             ),
             None => text,
         };
@@ -1703,7 +1775,7 @@ keys:
     }
 
     /// How often a console pane checks whether its program has exited.
-    const EXIT_POLL: Duration = Duration::from_millis(50);
+    const EXIT_POLL: Duration = Duration::from_millis(200);
 
     /// Mark the pane exited when its console program ends. The console host
     /// keeps the output pipe open after its last client exits (until the
@@ -2165,9 +2237,14 @@ keys:
             }
         };
         let mut frames: Vec<u64> = Vec::new();
+        // The last search's time and hits, for --stats.
+        let last_search: Mutex<Option<(Duration, usize)>> = Mutex::new(None);
         let finish = |frames: &[u64]| {
             if let Some(path) = &args.stats {
-                if let Err(e) = write_stats(path, &activity, frames, index_counts.as_deref()) {
+                let search = *last_search.lock().unwrap();
+                if let Err(e) =
+                    write_stats(path, &activity, frames, index_counts.as_deref(), search)
+                {
                     say!("fwterm: --stats {path}: {e}");
                 }
             }
@@ -2227,12 +2304,26 @@ keys:
                                 let (tx, rx) = std::sync::mpsc::channel();
                                 let (needle, w) = (f.query.clone(), waker.clone());
                                 std::thread::spawn(move || {
-                                    let mut all = Vec::new();
-                                    for (id, dir) in jobs {
-                                        all.extend(search_pane(id, &dir, &needle, FIND_LIMIT));
-                                    }
+                                    let started = Instant::now();
+                                    // Every pane at once: each opens and
+                                    // searches its own generations.
+                                    let mut all: Vec<find::Hit> = std::thread::scope(|sc| {
+                                        let handles: Vec<_> = jobs
+                                            .iter()
+                                            .map(|(id, dir)| {
+                                                let needle = &needle;
+                                                sc.spawn(move || {
+                                                    search_pane(*id, dir, needle, FIND_LIMIT)
+                                                })
+                                            })
+                                            .collect();
+                                        handles
+                                            .into_iter()
+                                            .flat_map(|h| h.join().unwrap_or_default())
+                                            .collect()
+                                    });
                                     find::order(&mut all);
-                                    let _ = tx.send(all);
+                                    let _ = tx.send((all, started.elapsed()));
                                     w.wake();
                                 });
                                 f.running = Some(rx);
@@ -2617,8 +2708,10 @@ keys:
             }
             // Search results, when the search thread has them.
             if let Some(f) = find_bar.as_mut() {
-                if let Some(hits) = f.running.as_ref().and_then(|rx| rx.try_recv().ok()) {
+                if let Some((hits, took)) = f.running.as_ref().and_then(|rx| rx.try_recv().ok()) {
                     f.running = None;
+                    f.took = Some(took);
+                    *last_search.lock().unwrap() = Some((took, hits.len()));
                     f.hits = hits;
                     f.at = 0;
                     if let Some(hit) = f.hits.first().cloned() {
@@ -2685,12 +2778,20 @@ keys:
                 let status = match (&f.running, f.hits.len()) {
                     (Some(_), _) => "searching every pane's log...".to_string(),
                     (None, 0) if !f.searched.is_empty() && f.searched == f.query => {
-                        "no matches".into()
+                        let ms = f.took.map_or(0.0, |t| t.as_secs_f64() * 1e3);
+                        format!("no matches ({ms:.0} ms)")
                     }
                     (None, 0) => "Enter searches every pane's log, Esc closes".into(),
                     (None, n) if f.searched == f.query => {
                         let h = &f.hits[f.at];
-                        format!("{}/{} in pane {}: {}", f.at + 1, n, h.pane + 1, h.text)
+                        let ms = f.took.map_or(0.0, |t| t.as_secs_f64() * 1e3);
+                        format!(
+                            "{}/{} ({ms:.0} ms) in pane {}: {}",
+                            f.at + 1,
+                            n,
+                            h.pane + 1,
+                            h.text
+                        )
                     }
                     (None, _) => "Enter searches again".into(),
                 };
