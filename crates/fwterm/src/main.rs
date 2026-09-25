@@ -51,6 +51,8 @@ mod layout;
 mod logstore;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod select;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod wire;
 
 #[cfg(windows)]
 fn main() {
