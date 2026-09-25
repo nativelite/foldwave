@@ -71,6 +71,8 @@ fn main() {
 mod app {
     use crate::blocks;
     use crate::emu::Emu;
+
+    mod host;
     use crate::find;
     use crate::governor::{self, Hidden, Level, Place};
     use crate::indexer;
@@ -206,6 +208,13 @@ keys:
         governor: bool,
         gpu_index: bool,
         shell_integration: bool,
+        /// Run as a pane host (`app::host`), for a window started with
+        /// `--isolate`: its screen size, log folder, generation size, pane id.
+        pane_host: bool,
+        host_size: (u16, u16),
+        host_log: Option<String>,
+        host_gen: u64,
+        host_id: usize,
         hidden: Hidden,
         zoom: bool,
         panes: usize,
@@ -233,6 +242,11 @@ keys:
             governor: true,
             gpu_index: true,
             shell_integration: true,
+            pane_host: false,
+            host_size: (24, 80),
+            host_log: None,
+            host_gen: 256 << 20,
+            host_id: 0,
             hidden: Hidden::Always,
             zoom: false,
             panes: 1,
@@ -320,6 +334,26 @@ keys:
                         "never" => Hidden::Never,
                         _ => return Err(format!("bad --hidden {v:?}")),
                     };
+                }
+                "--pane-host" => {
+                    a.pane_host = true;
+                    i += 1;
+                }
+                "--host-size" => {
+                    let v = value(&mut i, "--host-size")?;
+                    a.host_size = v
+                        .split_once('x')
+                        .and_then(|(r, c)| Some((r.parse().ok()?, c.parse().ok()?)))
+                        .ok_or(format!("bad --host-size {v:?}"))?;
+                }
+                "--host-log" => a.host_log = Some(value(&mut i, "--host-log")?),
+                "--host-gen" => {
+                    let v = value(&mut i, "--host-gen")?;
+                    a.host_gen = v.parse().map_err(|_| format!("bad --host-gen {v:?}"))?;
+                }
+                "--host-id" => {
+                    let v = value(&mut i, "--host-id")?;
+                    a.host_id = v.parse().map_err(|_| format!("bad --host-id {v:?}"))?;
                 }
                 "--shell-integration" => {
                     let v = value(&mut i, "--shell-integration")?;
@@ -1231,6 +1265,8 @@ keys:
         /// The commands in the output, from shell-integration marks. Taken
         /// while holding `term`.
         blocks: Mutex<blocks::Blocks>,
+        /// In a pane host: marks waiting to go to the window.
+        marks_out: Option<Mutex<Vec<(u8, u64, Option<i32>)>>>,
         /// Output since the last checkpoint sent to the log.
         since_checkpoint: AtomicU64,
         /// Output in the log's current generation.
@@ -1655,7 +1691,7 @@ keys:
         last: bool,
         shared: Arc<Shared>,
         activity: Arc<Activity>,
-        waker: Waker,
+        wake: Wake,
         log: Option<LogLink>,
         place: Arc<Vec<u32>>,
     ) {
@@ -1720,6 +1756,11 @@ keys:
                                 let line = term.scrollback().scrolled_lines()
                                     + term.screen().cursor().row as u64;
                                 blocks.mark(m.kind, line, m.exit_code);
+                                if let Some(out) = &shared.marks_out {
+                                    out.lock()
+                                        .unwrap()
+                                        .push((m.kind.letter(), line, m.exit_code));
+                                }
                             }
                         }
                         term.feed(&buf[at..n]);
@@ -1769,15 +1810,19 @@ keys:
                 activity.first_output.fetch_min(now, Ordering::AcqRel);
                 activity.last_output.store(now, Ordering::Release);
                 if !shared.pending.swap(true, Ordering::AcqRel) {
-                    waker.wake();
+                    wake();
                 }
             }
             if last {
                 shared.exited.store(true, Ordering::Release);
-                waker.wake();
+                wake();
             }
         });
     }
+
+    /// Tells whoever draws the pane that it changed: the window's waker, or
+    /// a pane host's update loop.
+    type Wake = Arc<dyn Fn() + Send + Sync>;
 
     /// How often a console pane checks whether its program has exited.
     const EXIT_POLL: Duration = Duration::from_millis(200);
@@ -1786,7 +1831,7 @@ keys:
     /// keeps the output pipe open after its last client exits (until the
     /// pseudoconsole is closed), so the end of output cannot tell. Ends when
     /// the pane is gone.
-    fn watch_exit(session: Weak<Mutex<Session>>, shared: Arc<Shared>, waker: Waker) {
+    fn watch_exit(session: Weak<Mutex<Session>>, shared: Arc<Shared>, wake: Wake) {
         std::thread::spawn(move || loop {
             std::thread::sleep(EXIT_POLL);
             let Some(session) = session.upgrade() else {
@@ -1798,7 +1843,7 @@ keys:
             };
             if !running {
                 shared.exited.store(true, Ordering::Release);
-                waker.wake();
+                wake();
                 return;
             }
         });
@@ -1835,6 +1880,7 @@ keys:
                 pending: AtomicBool::new(true),
                 exited: AtomicBool::new(false),
                 blocks: Mutex::new(blocks::Blocks::default()),
+                marks_out: None,
                 since_checkpoint: AtomicU64::new(0),
                 gen_bytes: AtomicU64::new(0),
                 parsing: AtomicBool::new(true),
@@ -1865,60 +1911,20 @@ keys:
                 }
                 None => (None, None),
             };
-            let pump = |source, session, last| {
-                pump(
-                    source,
-                    session,
-                    last,
-                    shared.clone(),
-                    self.activity.clone(),
-                    self.waker.clone(),
-                    log.clone(),
-                    self.place.clone(),
-                )
+            let wake: Wake = {
+                let w = self.waker.clone();
+                Arc::new(move || w.wake())
             };
-            let session = if args.pipe {
-                use std::os::windows::process::CommandExt;
-                use std::process::{Command, Stdio};
-                // CREATE_NO_WINDOW: no console at all, not even a hidden one.
-                let mut child = Command::new(&args.shell[0])
-                    .args(&shell_args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .creation_flags(0x0800_0000)
-                    .spawn()?;
-                let (mut out, mut err) = (
-                    child.stdout.take().expect("piped"),
-                    child.stderr.take().expect("piped"),
-                );
-                pump(Box::new(move |b| io::Read::read(&mut err, b)), None, false);
-                pump(Box::new(move |b| io::Read::read(&mut out, b)), None, true);
-                let stdin = child.stdin.take();
-                Arc::new(Mutex::new(Session::Pipe { child, stdin }))
-            } else {
-                let env = if args.shell_integration {
-                    shell_integration(&args.shell[0])
-                } else {
-                    Vec::new()
-                };
-                let pty = pty::Pty::spawn_with_env(
-                    &args.shell[0],
-                    &shell_args,
-                    rows as u16,
-                    cols as u16,
-                    &env,
-                )?;
-                let mut reader = pty.reader()?;
-                let session = Arc::new(Mutex::new(Session::Console(pty)));
-                pump(
-                    Box::new(move |b| reader.read(b)),
-                    Some(Arc::downgrade(&session)),
-                    true,
-                );
-                watch_exit(Arc::downgrade(&session), shared.clone(), self.waker.clone());
-                session
-            };
+            let session = start_session(
+                args,
+                rows,
+                cols,
+                &shared,
+                &self.activity,
+                wake,
+                log.clone(),
+                &self.place,
+            )?;
             Ok(Pane {
                 id,
                 shared,
@@ -1933,6 +1939,77 @@ keys:
                 find_view: None,
             })
         }
+    }
+
+    /// Start the pane's program in its lane, with reader threads feeding
+    /// `shared`: the part of a pane that a pane host runs too.
+    #[allow(clippy::too_many_arguments)]
+    fn start_session(
+        args: &Args,
+        rows: usize,
+        cols: usize,
+        shared: &Arc<Shared>,
+        activity: &Arc<Activity>,
+        wake: Wake,
+        log: Option<LogLink>,
+        place: &Arc<Vec<u32>>,
+    ) -> io::Result<Arc<Mutex<Session>>> {
+        let shell_args: Vec<&str> = args.shell[1..].iter().map(String::as_str).collect();
+        let pump = |source, session, last| {
+            pump(
+                source,
+                session,
+                last,
+                shared.clone(),
+                activity.clone(),
+                wake.clone(),
+                log.clone(),
+                place.clone(),
+            )
+        };
+        let session = if args.pipe {
+            use std::os::windows::process::CommandExt;
+            use std::process::{Command, Stdio};
+            // CREATE_NO_WINDOW: no console at all, not even a hidden one.
+            let mut child = Command::new(&args.shell[0])
+                .args(&shell_args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .creation_flags(0x0800_0000)
+                .spawn()?;
+            let (mut out, mut err) = (
+                child.stdout.take().expect("piped"),
+                child.stderr.take().expect("piped"),
+            );
+            pump(Box::new(move |b| io::Read::read(&mut err, b)), None, false);
+            pump(Box::new(move |b| io::Read::read(&mut out, b)), None, true);
+            let stdin = child.stdin.take();
+            Arc::new(Mutex::new(Session::Pipe { child, stdin }))
+        } else {
+            let env = if args.shell_integration {
+                shell_integration(&args.shell[0])
+            } else {
+                Vec::new()
+            };
+            let pty = pty::Pty::spawn_with_env(
+                &args.shell[0],
+                &shell_args,
+                rows as u16,
+                cols as u16,
+                &env,
+            )?;
+            let mut reader = pty.reader()?;
+            let session = Arc::new(Mutex::new(Session::Console(pty)));
+            pump(
+                Box::new(move |b| reader.read(b)),
+                Some(Arc::downgrade(&session)),
+                true,
+            );
+            watch_exit(Arc::downgrade(&session), shared.clone(), wake.clone());
+            session
+        };
+        Ok(session)
     }
 
     /// Environment that makes `shell` mark its prompts and commands (OSC
@@ -1992,6 +2069,12 @@ keys:
         };
         if args.choose_log_drive {
             return choose_log_drive(&args);
+        }
+        if args.pane_host {
+            return match host::run(&args) {
+                Ok(code) => code,
+                Err(_) => 1,
+            };
         }
         match start(&args) {
             Ok(code) => code,
@@ -2092,8 +2175,10 @@ keys:
         }
     }
 
-    fn start(args: &Args) -> io::Result<i32> {
-        // Console lane host (design §11 row 6): an explicit --conpty, else a
+    /// Console lane host (design §11 row 6), for the window's panes or a pane
+    /// host's: set once, before the first console starts.
+    fn choose_console_host(args: &Args) -> io::Result<()> {
+        // An explicit --conpty, else a
         // conpty.dll shipped beside fwterm.exe (Microsoft's ConPTY package,
         // with OpenConsole.exe next to it), else the built-in console host.
         if let Some(dll) = &args.conpty {
@@ -2117,6 +2202,11 @@ keys:
         if !args.pipe {
             pty::inherit_cursor(true);
         }
+        Ok(())
+    }
+
+    fn start(args: &Args) -> io::Result<i32> {
+        choose_console_host(args)?;
         let mut raster = match &args.font {
             // Consolas by its known files: no need to scan the font folders.
             None => FontRasterizer::consolas(args.px)?,
