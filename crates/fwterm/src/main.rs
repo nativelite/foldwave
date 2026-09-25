@@ -38,6 +38,8 @@
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
 #[cfg_attr(not(windows), allow(dead_code))]
+mod blocks;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod governor;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod indexer;
@@ -61,6 +63,7 @@ fn main() {
 
 #[cfg(windows)]
 mod app {
+    use crate::blocks;
     use crate::governor::{self, Hidden, Level, Place};
     use crate::indexer;
     use crate::layout::{neighbor, pane_at, Dir, Layout, PaneId, Placement, Rect, Toward};
@@ -145,6 +148,9 @@ options:
                 logs, catching up from its log when shown again: always
                 (default), busy (only while other programs keep the CPU
                 nearly full), or never. Without a log it keeps parsing
+  --shell-integration S  on (default): cmd.exe marks its prompts and commands
+                (OSC 133, through PROMPT), so Ctrl+Up/Down and Ctrl+Shift+O
+                work; other shells mark them themselves if set up to; off
   --gpu-index G on (default): build the logs' search signatures on the GPU
                 (NVIDIA, through its driver), off the loggers' threads; off:
                 on each pane's logger thread. Without CUDA it is off
@@ -161,6 +167,8 @@ keys:
   Alt+Arrow, click  focus the pane in that direction / under the pointer
   Ctrl+Shift+W      close the focused pane (the last one closes the window)
   Ctrl+Shift+Z      zoom the focused pane to the whole window, or back
+  Ctrl+Up/Down      jump to the previous / next command's prompt
+  Ctrl+Shift+O      select a command's output (then Ctrl+C copies it)
   drag, double-click   select text in a pane / select a word
   Ctrl+Shift+C      copy the selection (Ctrl+C too while there is one;
                     otherwise Ctrl+C goes to the program)
@@ -187,6 +195,7 @@ keys:
         place: Place,
         governor: bool,
         gpu_index: bool,
+        shell_integration: bool,
         hidden: Hidden,
         zoom: bool,
         panes: usize,
@@ -213,6 +222,7 @@ keys:
             place: Place::Off,
             governor: true,
             gpu_index: true,
+            shell_integration: true,
             hidden: Hidden::Always,
             zoom: false,
             panes: 1,
@@ -299,6 +309,14 @@ keys:
                         "always" => Hidden::Always,
                         "never" => Hidden::Never,
                         _ => return Err(format!("bad --hidden {v:?}")),
+                    };
+                }
+                "--shell-integration" => {
+                    let v = value(&mut i, "--shell-integration")?;
+                    a.shell_integration = match v.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        _ => return Err(format!("bad --shell-integration {v:?}")),
                     };
                 }
                 "--gpu-index" => {
@@ -493,6 +511,8 @@ keys:
         Roll(Vec<u8>),
         /// Flush now and answer (on exit, so no output is lost).
         Flush(std::sync::mpsc::Sender<()>),
+        /// A shell-integration mark, at its offset in the current generation.
+        Mark(panelog::Mark),
     }
 
     /// Chunks the logger may lag behind by (64 KiB each: 4 MiB). Past this the
@@ -618,6 +638,10 @@ keys:
                     }
                     Ok(LogMsg::Checkpoint(blob)) => {
                         let _ = writer.checkpoint(&blob);
+                        dirty = true;
+                    }
+                    Ok(LogMsg::Mark(mark)) => {
+                        let _ = writer.mark(mark);
                         dirty = true;
                     }
                     Ok(LogMsg::Roll(blob)) => {
@@ -1036,6 +1060,9 @@ keys:
         term: Mutex<Term>,
         pending: AtomicBool,
         exited: AtomicBool,
+        /// The commands in the output, from shell-integration marks. Taken
+        /// while holding `term`.
+        blocks: Mutex<blocks::Blocks>,
         /// Output since the last checkpoint sent to the log.
         since_checkpoint: AtomicU64,
         /// Output in the log's current generation.
@@ -1421,6 +1448,8 @@ keys:
             }
             let mut buf = vec![0u8; 64 * 1024];
             let mut watcher = fwbench::terminal::Watcher::new();
+            let mut scanner = ansi::MarkScanner::new();
+            let mut found = Vec::new();
             loop {
                 let n = match source(&mut buf) {
                     Ok(0) | Err(_) => break,
@@ -1455,8 +1484,44 @@ keys:
                     }
                     // A shed pane's emulator waits; the log has the bytes.
                     let parse = log.is_none() || shared.parsing.load(Ordering::Acquire);
-                    if parse {
+                    // Shell-integration marks: where in this chunk each falls.
+                    let base = scanner.position();
+                    found.clear();
+                    scanner.feed(&buf[..n], &mut found);
+                    let at_in_chunk =
+                        |m: &ansi::ShellMark| (m.offset.saturating_sub(base) as usize).min(n);
+                    if parse && !found.is_empty() {
+                        // Feed up to each mark and note the line the cursor is
+                        // on there: that is where the block boundary goes.
+                        let mut blocks = shared.blocks.lock().unwrap();
+                        let mut at = 0;
+                        for m in &found {
+                            let upto = at_in_chunk(m).max(at);
+                            term.feed(&buf[at..upto]);
+                            at = upto;
+                            if !term.in_alternate_screen() {
+                                let line = term.scrollback().scrolled_lines()
+                                    + term.screen().cursor().row as u64;
+                                blocks.mark(m.kind, line, m.exit_code);
+                            }
+                        }
+                        term.feed(&buf[at..n]);
+                        let history = term.scrollback();
+                        blocks
+                            .forget_before(history.scrolled_lines() - history.history_len() as u64);
+                    } else if parse {
                         term.feed(&buf[..n]);
+                    }
+                    if let Some(log) = &log {
+                        let chunk_at = shared.gen_bytes.load(Ordering::Acquire);
+                        for m in &found {
+                            let _ = log.tx.send(LogMsg::Mark(panelog::Mark {
+                                offset: chunk_at + at_in_chunk(m) as u64,
+                                kind: m.kind.letter(),
+                                value: m.exit_code.map_or(-1, i64::from),
+                                time_ns: now,
+                            }));
+                        }
                     }
                     // Checkpoint at a point the replay can resume from; roll
                     // over to a new generation at one.
@@ -1552,6 +1617,7 @@ keys:
                 }),
                 pending: AtomicBool::new(true),
                 exited: AtomicBool::new(false),
+                blocks: Mutex::new(blocks::Blocks::default()),
                 since_checkpoint: AtomicU64::new(0),
                 gen_bytes: AtomicU64::new(0),
                 parsing: AtomicBool::new(true),
@@ -1614,7 +1680,18 @@ keys:
                 let stdin = child.stdin.take();
                 Arc::new(Mutex::new(Session::Pipe { child, stdin }))
             } else {
-                let pty = pty::Pty::spawn(&args.shell[0], &shell_args, rows as u16, cols as u16)?;
+                let env = if args.shell_integration {
+                    shell_integration(&args.shell[0])
+                } else {
+                    Vec::new()
+                };
+                let pty = pty::Pty::spawn_with_env(
+                    &args.shell[0],
+                    &shell_args,
+                    rows as u16,
+                    cols as u16,
+                    &env,
+                )?;
                 let mut reader = pty.reader()?;
                 let session = Arc::new(Mutex::new(Session::Console(pty)));
                 pump(
@@ -1638,6 +1715,26 @@ keys:
                 hidden: false,
             })
         }
+    }
+
+    /// Environment that makes `shell` mark its prompts and commands (OSC
+    /// 133). cmd.exe takes it in PROMPT: end of the last command (`D`),
+    /// prompt start (`A`), the prompt itself (the user's own PROMPT if set),
+    /// command start (`B`). cmd cannot mark output start or send an exit code.
+    fn shell_integration(shell: &str) -> Vec<(String, String)> {
+        let name = std::path::Path::new(shell)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if name != "cmd" {
+            return Vec::new();
+        }
+        let own = std::env::var("PROMPT").unwrap_or_else(|_| "$P$G".into());
+        vec![(
+            "PROMPT".into(),
+            format!(r"$E]133;D$E\$E]133;A$E\{own}$E]133;B$E\"),
+        )]
     }
 
     /// How often the governor reads the CPU counters.
@@ -2010,6 +2107,51 @@ keys:
                             drop_char = true;
                             continue;
                         }
+                        // Ctrl+Shift+O: select the output of the command at
+                        // the top of the view (at the live view, the latest
+                        // with output), from shell-integration marks.
+                        if vk == 0x4F && ctrl && shift {
+                            let p = &panes[fi];
+                            let top = p.seen_scrolled.saturating_sub(p.back as u64);
+                            let at = if p.back == 0 { u64::MAX } else { top };
+                            let term = p.shared.term.lock().unwrap();
+                            let cols = term.screen().cols();
+                            let mut out = p.shared.blocks.lock().unwrap().output_at(at);
+                            // Not the blank lines a shell leaves before its
+                            // next prompt (cmd prints one after every command).
+                            if let Some(lines) = out.as_mut() {
+                                let blank = |n: u64| {
+                                    Pane::line_chars(&term, n)
+                                        .is_some_and(|l| l.iter().all(|(c, _)| *c == ' '))
+                                };
+                                while lines.end > lines.start && blank(lines.end - 1) {
+                                    lines.end -= 1;
+                                }
+                            }
+                            let out = out.filter(|l| !l.is_empty());
+                            drop(term);
+                            if let Some(lines) = out {
+                                let sel = Selection {
+                                    anchor: Point {
+                                        line: lines.start,
+                                        col: 0,
+                                    },
+                                    head: Point {
+                                        line: lines.end - 1,
+                                        col: cols.saturating_sub(1),
+                                    },
+                                };
+                                let p = &mut panes[fi];
+                                // Bring its first line into view if it is above.
+                                if lines.start < top {
+                                    p.back = (p.seen_scrolled - lines.start) as usize;
+                                }
+                                p.shared.pending.store(true, Ordering::Release);
+                                selection = Some((focus, sel));
+                            }
+                            drop_char = true;
+                            continue;
+                        }
                         // Ctrl+Shift+Z: zoom the pane, or unzoom.
                         if vk == 0x5A && ctrl && shift {
                             zoom = match zoom {
@@ -2028,6 +2170,21 @@ keys:
                             0x57 if ctrl && shift => {
                                 closing.push((focus, true));
                                 drop_char = true;
+                            }
+                            // Ctrl+Up / Ctrl+Down: the previous / next prompt
+                            // at the top of the view.
+                            0x26 | 0x28 if ctrl && !shift => {
+                                let top = pane.seen_scrolled.saturating_sub(pane.back as u64);
+                                let blocks = pane.shared.blocks.lock().unwrap();
+                                let to = if vk == 0x26 {
+                                    blocks.prev_prompt(top)
+                                } else {
+                                    blocks.next_prompt(top)
+                                };
+                                drop(blocks);
+                                if let Some(line) = to {
+                                    pane.back = pane.seen_scrolled.saturating_sub(line) as usize;
+                                }
                             }
                             0x21 if shift => pane.back += page,
                             0x22 if shift => pane.back = pane.back.saturating_sub(page),
