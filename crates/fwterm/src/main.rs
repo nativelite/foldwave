@@ -40,6 +40,8 @@
 #[cfg_attr(not(windows), allow(dead_code))]
 mod blocks;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod find;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod governor;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod indexer;
@@ -64,6 +66,7 @@ fn main() {
 #[cfg(windows)]
 mod app {
     use crate::blocks;
+    use crate::find;
     use crate::governor::{self, Hidden, Level, Place};
     use crate::indexer;
     use crate::layout::{neighbor, pane_at, Dir, Layout, PaneId, Placement, Rect, Toward};
@@ -169,6 +172,8 @@ keys:
   Ctrl+Shift+Z      zoom the focused pane to the whole window, or back
   Ctrl+Up/Down      jump to the previous / next command's prompt
   Ctrl+Shift+O      select a command's output (then Ctrl+C copies it)
+  Ctrl+Shift+F      search every pane's log: type, Enter searches, Enter /
+                    Shift+Enter step through hits (newest first), Esc closes
   drag, double-click   select text in a pane / select a word
   Ctrl+Shift+C      copy the selection (Ctrl+C too while there is one;
                     otherwise Ctrl+C goes to the program)
@@ -973,6 +978,101 @@ keys:
         }
     }
 
+    /// Hits for `needle` (ignoring ASCII case) in every generation of one
+    /// pane's logs, at most `limit` per generation, with lines numbered as
+    /// [`Deep`] numbers them.
+    fn search_pane(id: PaneId, dir: &Path, needle: &str, limit: usize) -> Vec<find::Hit> {
+        let mut hits = Vec::new();
+        let mut start = 0u64;
+        let opts = panelog::SearchOptions {
+            ignore_case: true,
+            limit,
+        };
+        for g in logstore::generations(dir) {
+            // One retention is deleting cannot be opened: skipped, as Deep does.
+            let Ok(r) = panelog::Reader::open(&g) else {
+                continue;
+            };
+            let stamp = g
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(logstore::gen_stamp)
+                .unwrap_or(0);
+            for offset in r.search(needle.as_bytes(), &opts).unwrap_or_default() {
+                let Ok(local) = r.line_of(offset) else {
+                    continue;
+                };
+                let text = r
+                    .line(local)
+                    .map(|l| find::clean(&l, 240))
+                    .unwrap_or_default();
+                hits.push(find::Hit {
+                    pane: id,
+                    line: start + local,
+                    text,
+                    generation: stamp,
+                    offset,
+                });
+            }
+            start += r.line_count() - 1;
+        }
+        hits
+    }
+
+    /// The search bar: what is typed, what was last searched, its hits and
+    /// which one is shown.
+    #[derive(Default)]
+    struct FindBar {
+        query: String,
+        searched: String,
+        hits: Vec<find::Hit>,
+        at: usize,
+        running: Option<std::sync::mpsc::Receiver<Vec<find::Hit>>>,
+    }
+
+    /// Hits kept per generation of each pane.
+    const FIND_LIMIT: usize = 500;
+
+    /// Search bar colours.
+    const BAR_BG: u32 = 0xFF26_4F78;
+    const BAR_FG: u32 = 0xFFE8_E8E8;
+
+    /// Leave the search: every pane back to its live view.
+    fn close_find(panes: &mut [Pane]) {
+        for p in panes.iter_mut() {
+            if p.find_view.take().is_some() {
+                p.deep = None;
+                p.back = 0;
+                p.shared.pending.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    /// Show `hit`: its pane focused (unzoomed if another was zoomed), its log
+    /// rebuilt there, any other pane's hit put away.
+    fn show_hit(
+        hit: &find::Hit,
+        needle: &str,
+        panes: &mut [Pane],
+        zoom: &mut Option<PaneId>,
+        focus: &mut PaneId,
+    ) {
+        if zoom.is_some() && *zoom != Some(hit.pane) {
+            *zoom = None;
+        }
+        for p in panes.iter_mut() {
+            if p.id == hit.pane {
+                p.find_view = Some((hit.line, needle.to_string()));
+                p.shared.pending.store(true, Ordering::Release);
+                *focus = hit.pane;
+            } else if p.find_view.take().is_some() {
+                p.deep = None;
+                p.back = 0;
+                p.shared.pending.store(true, Ordering::Release);
+            }
+        }
+    }
+
     /// A pane rebuilt from its log at some past line: the scrollback beyond
     /// what memory holds.
     struct Deep {
@@ -1154,6 +1254,8 @@ keys:
         deep: Option<Deep>,
         /// Behind a zoomed pane: kept, not drawn.
         hidden: bool,
+        /// Showing a search hit: its line in the pane's logs, and the needle.
+        find_view: Option<(u64, String)>,
     }
 
     impl Pane {
@@ -1331,7 +1433,45 @@ keys:
             self.seen_scrolled = scrolled;
             let held = history.history_len();
             let (rows, cols) = (term.screen().rows(), term.screen().cols());
-            if self.back > held && self.pane_dir.is_some() && !term.in_alternate_screen() {
+            if let Some((line, needle)) = self.find_view.clone() {
+                // A search hit: the log rebuilt a little past its line, the
+                // match highlighted where it landed.
+                if self.deep.as_ref().map_or(true, |d| d.total <= line) {
+                    self.deep = self.pane_dir.as_deref().and_then(|f| Deep::open(f).ok());
+                }
+                if let Some(d) = self.deep.as_mut() {
+                    let end = (line + 1 + rows as u64 / 2).min(d.total);
+                    let _ = d.rebuild(end.max(1), rows, cols, pipe);
+                    let s = d.term.screen();
+                    // Where the hit should be: `end - 1 - line` lines above
+                    // the last one written; wrapped lines move it up.
+                    let bottom = s.cursor().row;
+                    let expect = bottom.saturating_sub((end - 1 - line) as usize);
+                    let highlight = (0..s.rows())
+                        .filter_map(|row| {
+                            let chars: Vec<char> =
+                                (0..s.cols()).map(|c| s.cell(row, c).ch).collect();
+                            find::match_in_row(&chars, &needle).map(|(a, b)| (row, a, b))
+                        })
+                        .min_by_key(|&(row, _, _)| row.abs_diff(expect))
+                        .map(|(row, a, b)| Highlight {
+                            start: (row, a),
+                            end: (row, b),
+                        });
+                    frame.update_view_at(
+                        r.top,
+                        r.left,
+                        s,
+                        s,
+                        0,
+                        false,
+                        highlight,
+                        pen.palette,
+                        pen.atlas,
+                        pen.raster,
+                    );
+                }
+            } else if self.back > held && self.pane_dir.is_some() && !term.in_alternate_screen() {
                 // Past what memory holds: continue from the log. Its snapshot
                 // is frozen, so the view needs no anchoring.
                 if self.deep.is_none() {
@@ -1713,6 +1853,7 @@ keys:
                 seen_scrolled: 0,
                 deep: None,
                 hidden: false,
+                find_view: None,
             })
         }
     }
@@ -1989,6 +2130,7 @@ keys:
         let mut next_id = args.panes;
         let mut focus: PaneId = 0;
         let mut zoom: Option<PaneId> = (args.zoom && args.panes > 1).then_some(0);
+        let mut find_bar: Option<FindBar> = None;
         // Every pane starts at its real size; a zoom then hides the rest.
         if zoom.is_some() {
             placement = layout.place_zoomed(zoom, grid_rows, grid_cols);
@@ -2061,6 +2203,76 @@ keys:
                 let Some(fi) = panes.iter().position(|p| p.id == focus) else {
                     break;
                 };
+                // The search bar takes what is typed while it is open; keys
+                // other than its own toggle do not reach the program.
+                if let Some(f) = find_bar.as_mut() {
+                    match *e {
+                        Event::Char(_) if drop_char => {
+                            drop_char = false;
+                            continue;
+                        }
+                        Event::Char('\u{1b}') => {
+                            find_bar = None;
+                            close_find(&mut panes);
+                            layout_dirty = true;
+                            continue;
+                        }
+                        Event::Char('\r') => {
+                            if f.query.is_empty() {
+                            } else if f.query != f.searched {
+                                let jobs: Vec<(PaneId, PathBuf)> = panes
+                                    .iter()
+                                    .filter_map(|p| Some((p.id, p.pane_dir.clone()?)))
+                                    .collect();
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                let (needle, w) = (f.query.clone(), waker.clone());
+                                std::thread::spawn(move || {
+                                    let mut all = Vec::new();
+                                    for (id, dir) in jobs {
+                                        all.extend(search_pane(id, &dir, &needle, FIND_LIMIT));
+                                    }
+                                    find::order(&mut all);
+                                    let _ = tx.send(all);
+                                    w.wake();
+                                });
+                                f.running = Some(rx);
+                                f.searched = f.query.clone();
+                                f.hits.clear();
+                                f.at = 0;
+                            } else if !f.hits.is_empty() {
+                                let n = f.hits.len();
+                                f.at = if fwrender::win::shift_down() {
+                                    (f.at + n - 1) % n
+                                } else {
+                                    (f.at + 1) % n
+                                };
+                                let hit = f.hits[f.at].clone();
+                                show_hit(&hit, &f.searched, &mut panes, &mut zoom, &mut focus);
+                            }
+                            layout_dirty = true;
+                            continue;
+                        }
+                        Event::Char('\u{8}') => {
+                            f.query.pop();
+                            layout_dirty = true;
+                            continue;
+                        }
+                        Event::Char(c) if !c.is_control() => {
+                            f.query.push(c);
+                            layout_dirty = true;
+                            continue;
+                        }
+                        Event::Char(_) => continue,
+                        Event::Key { vk, down: true }
+                            if !(vk == 0x46
+                                && fwrender::win::ctrl_down()
+                                && fwrender::win::shift_down()) =>
+                        {
+                            continue
+                        }
+                        _ => {}
+                    }
+                }
                 match *e {
                     Event::Char(_) if drop_char => drop_char = false,
                     Event::Char(c) => {
@@ -2104,6 +2316,17 @@ keys:
                                 Ok(None) => {}
                                 Err(e) => say!("fwterm: paste: {e}"),
                             }
+                            drop_char = true;
+                            continue;
+                        }
+                        // Ctrl+Shift+F: search every pane's log, or stop.
+                        if vk == 0x46 && ctrl && shift {
+                            if find_bar.take().is_some() {
+                                close_find(&mut panes);
+                            } else {
+                                find_bar = Some(FindBar::default());
+                            }
+                            layout_dirty = true;
                             drop_char = true;
                             continue;
                         }
@@ -2307,6 +2530,11 @@ keys:
                     }
                     Event::Release(..) => press = None,
                     Event::Wheel(delta) => {
+                        // Scrolling leaves a search hit for the live view.
+                        if panes[fi].find_view.take().is_some() {
+                            panes[fi].deep = None;
+                            panes[fi].back = 0;
+                        }
                         // Three lines a notch, away from the user = back.
                         let lines = (delta.unsigned_abs() as usize * 3).div_euclid(120).max(1);
                         let pane = &mut panes[fi];
@@ -2387,6 +2615,18 @@ keys:
                 finish(&frames);
                 return Ok(code);
             }
+            // Search results, when the search thread has them.
+            if let Some(f) = find_bar.as_mut() {
+                if let Some(hits) = f.running.as_ref().and_then(|rx| rx.try_recv().ok()) {
+                    f.running = None;
+                    f.hits = hits;
+                    f.at = 0;
+                    if let Some(hit) = f.hits.first().cloned() {
+                        show_hit(&hit, &f.searched, &mut panes, &mut zoom, &mut focus);
+                    }
+                    layout_dirty = true;
+                }
+            }
             if layout_dirty {
                 placement = layout.place_zoomed(zoom, grid_rows, grid_cols);
                 place_all(&mut panes, &placement);
@@ -2440,6 +2680,45 @@ keys:
                 draw_dividers(&placement, focus, &mut frame, &mut pen);
                 layout_dirty = false;
             }
+            // The search bar, over the window's bottom row.
+            if let Some(f) = &find_bar {
+                let status = match (&f.running, f.hits.len()) {
+                    (Some(_), _) => "searching every pane's log...".to_string(),
+                    (None, 0) if !f.searched.is_empty() && f.searched == f.query => {
+                        "no matches".into()
+                    }
+                    (None, 0) => "Enter searches every pane's log, Esc closes".into(),
+                    (None, n) if f.searched == f.query => {
+                        let h = &f.hits[f.at];
+                        format!("{}/{} in pane {}: {}", f.at + 1, n, h.pane + 1, h.text)
+                    }
+                    (None, _) => "Enter searches again".into(),
+                };
+                let text: Vec<char> = format!(" find: {}_   {status}", f.query).chars().collect();
+                let row = grid_rows.saturating_sub(1);
+                for col in 0..grid_cols {
+                    let ch = text.get(col).copied().unwrap_or(' ');
+                    let glyph = pen.atlas.slot(
+                        GlyphKey {
+                            ch,
+                            style: 0,
+                            part: GlyphPart::Single,
+                        },
+                        pen.raster,
+                    );
+                    frame.put(
+                        row,
+                        col,
+                        CellInstance {
+                            glyph,
+                            fg: BAR_FG,
+                            bg: BAR_BG,
+                            flags: 0,
+                        },
+                    );
+                }
+                drew = true;
+            }
             if drew && frame.damaged_rows() > 0 {
                 surface.draw(&frame, &mut atlas)?;
                 frame.clear_damage();
@@ -2473,6 +2752,43 @@ keys:
                 .collect::<String>()
                 .trim_end()
                 .to_string()
+        }
+
+        #[test]
+        fn search_hits_are_numbered_as_the_log_view_numbers_lines() {
+            let pane = std::env::temp_dir().join(format!("fwterm-find-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&pane);
+            let cfg = panelog::Config::default();
+            let mut term = Term::new(4, 20);
+            let first = b"L0\r\nL1 needle A\r\nL2\r\n".to_vec();
+            {
+                let mut w =
+                    panelog::Writer::create(&pane.join(logstore::gen_name(1, 0)), cfg).unwrap();
+                w.append(&first, 0).unwrap();
+                term.feed(&first);
+            }
+            {
+                let mut w =
+                    panelog::Writer::create(&pane.join(logstore::gen_name(2, 1)), cfg).unwrap();
+                w.checkpoint(&term.checkpoint().unwrap()).unwrap();
+                w.append(b"L3\r\nL4 NEEDLE B\r\n", 0).unwrap();
+            }
+            let mut hits = search_pane(7, &pane, "needle", 100);
+            find::order(&mut hits);
+            let got: Vec<(usize, u64, &str)> = hits
+                .iter()
+                .map(|h| (h.pane, h.line, h.text.as_str()))
+                .collect();
+            // Newest first; lines counted across generations as Deep counts.
+            assert_eq!(got, vec![(7, 4, "L4 NEEDLE B"), (7, 1, "L1 needle A")]);
+            let mut d = Deep::open(&pane).unwrap();
+            for h in &hits {
+                d.rebuild(h.line + 1, 4, 20, false).unwrap();
+                let s = d.term.screen();
+                let on_screen = (0..s.rows()).any(|r| row(&d.term, r) == h.text);
+                assert!(on_screen, "line {} shows {:?}", h.line, h.text);
+            }
+            let _ = std::fs::remove_dir_all(&pane);
         }
 
         #[test]

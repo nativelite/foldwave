@@ -172,7 +172,8 @@ pub fn gen_name(stamp: u64, n: u32) -> String {
     format!("gen-{stamp:013}-{n:05}")
 }
 
-fn gen_stamp(name: &str) -> Option<u64> {
+/// A generation's creation time (ms), from its folder name.
+pub fn gen_stamp(name: &str) -> Option<u64> {
     name.strip_prefix("gen-")?.split('-').next()?.parse().ok()
 }
 
