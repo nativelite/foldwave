@@ -12,6 +12,9 @@ use crate::wire::{FromHost, Sender, ToHost};
 use std::io::Write;
 use std::sync::Condvar;
 
+/// Most history lines one request returns.
+const HISTORY_MAX: u32 = 100_000;
+
 /// Fastest updates go out: a key's echo waits for none of it after quiet.
 const UPDATE_EVERY: Duration = Duration::from_millis(4);
 
@@ -33,6 +36,7 @@ pub fn run(args: &Args) -> io::Result<i32> {
         })),
         blocks: Mutex::new(blocks::Blocks::default()),
         marks_out: Some(Mutex::new(Vec::new())),
+        history_reply: Mutex::new(None),
         pending: AtomicBool::new(true),
         exited: AtomicBool::new(false),
         since_checkpoint: AtomicU64::new(0),
@@ -75,10 +79,15 @@ pub fn run(args: &Args) -> io::Result<i32> {
         &Arc::new(Vec::new()),
     )?;
 
-    // From the window: keys, resizes. Its end is the window's: take the
-    // program down too.
+    // To the window: updates from the loop below, history from the input
+    // thread; one whole message at a time.
+    let out = Arc::new(Mutex::new(io::BufWriter::new(io::stdout())));
+
+    // From the window: keys, resizes, requests for history. Its end is the
+    // window's: take the program down too.
     {
         let (session, shared, wake) = (session.clone(), shared.clone(), wake.clone());
+        let out = out.clone();
         std::thread::spawn(move || {
             let mut input = io::stdin().lock();
             loop {
@@ -96,6 +105,17 @@ pub fn run(args: &Args) -> io::Result<i32> {
                         wake();
                     }
                     Ok(ToHost::Shed(_)) => {}
+                    Ok(ToHost::History { first, count }) => {
+                        let lines: Vec<_> = match &*shared.term.lock().unwrap() {
+                            Emu::Local(t) => (first..first + u64::from(count.min(HISTORY_MAX)))
+                                .map(|n| crate::wire::host_line(t, n).unwrap_or_default())
+                                .collect(),
+                            Emu::Remote(_) => Vec::new(),
+                        };
+                        let mut o = out.lock().unwrap();
+                        let _ = FromHost::History { first, lines }.write(&mut *o);
+                        let _ = o.flush();
+                    }
                     Err(_) => {
                         session.lock().unwrap().kill();
                         std::process::exit(0);
@@ -105,7 +125,6 @@ pub fn run(args: &Args) -> io::Result<i32> {
         });
     }
 
-    let mut out = io::BufWriter::new(io::stdout().lock());
     let mut sender = Sender::default();
     let mut last = Instant::now() - UPDATE_EVERY;
     loop {
@@ -140,8 +159,9 @@ pub fn run(args: &Args) -> io::Result<i32> {
                 Emu::Remote(_) => None,
             }
         };
+        let mut o = out.lock().unwrap();
         if let Some(u) = update {
-            FromHost::Update(u).write(&mut out)?;
+            FromHost::Update(u).write(&mut *o)?;
         }
         let marks: Vec<_> = shared
             .marks_out
@@ -149,9 +169,10 @@ pub fn run(args: &Args) -> io::Result<i32> {
             .map(|m| std::mem::take(&mut *m.lock().unwrap()))
             .unwrap_or_default();
         for (kind, line, exit) in marks {
-            FromHost::Mark { kind, line, exit }.write(&mut out)?;
+            FromHost::Mark { kind, line, exit }.write(&mut *o)?;
         }
-        out.flush()?;
+        o.flush()?;
+        drop(o);
         last = Instant::now();
         if shared.exited.load(Ordering::Acquire) {
             if let Some(log) = &log {
@@ -161,8 +182,9 @@ pub fn run(args: &Args) -> io::Result<i32> {
                 }
             }
             let code = session.lock().unwrap().wait();
-            FromHost::Exited(code).write(&mut out)?;
-            out.flush()?;
+            let mut o = out.lock().unwrap();
+            FromHost::Exited(code).write(&mut *o)?;
+            o.flush()?;
             return Ok(code);
         }
     }

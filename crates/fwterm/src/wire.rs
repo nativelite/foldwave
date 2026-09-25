@@ -36,6 +36,12 @@ pub enum FromHost {
     },
     /// The program ended with this code; the host exits after sending it.
     Exited(i32),
+    /// Lines `first..` asked for with [`ToHost::History`]; a line the host no
+    /// longer holds comes back empty.
+    History {
+        first: u64,
+        lines: Vec<Vec<Cell>>,
+    },
 }
 
 /// To the host.
@@ -48,6 +54,12 @@ pub enum ToHost {
     },
     /// Hidden: stop parsing, only log; or catch up and parse again.
     Shed(bool),
+    /// Send lines `first..first + count` (numbered as the mirror counts:
+    /// lines scrolled off, then screen rows).
+    History {
+        first: u64,
+        count: u32,
+    },
 }
 
 /// One screen update.
@@ -118,6 +130,22 @@ impl Sender {
             size: (rows as u16, cols as u16),
         })
     }
+}
+
+/// Line `n` of the host's pane, numbered as the mirror numbers lines: from
+/// history while it holds it, from the screen for rows still on it; `None`
+/// once it is gone from both.
+pub fn host_line(term: &vterm::Term, n: u64) -> Option<Vec<Cell>> {
+    let history = term.scrollback();
+    let scrolled = history.scrolled_lines();
+    if n >= scrolled {
+        let r = (n - scrolled) as usize;
+        let s = term.scrollback();
+        return (r < s.rows()).then(|| row_of(s, r));
+    }
+    let age = (scrolled - 1 - n) as usize;
+    let mut line = Vec::new();
+    history.history_row(age, &mut line).then_some(line)
 }
 
 /// The window's display-only copy of a pane's screen.
@@ -195,9 +223,11 @@ fn padded(cells: &[Cell], cols: usize, out: &mut Vec<Cell>) {
 const T_UPDATE: u8 = 1;
 const T_MARK: u8 = 2;
 const T_EXITED: u8 = 3;
+const T_HISTORY: u8 = 4;
 const T_INPUT: u8 = 11;
 const T_RESIZE: u8 = 12;
 const T_SHED: u8 = 13;
+const T_ASK: u8 = 14;
 
 /// Largest message body accepted: a bound on what a damaged stream can make
 /// the reader allocate.
@@ -394,6 +424,14 @@ impl FromHost {
                 b.extend_from_slice(&code.to_le_bytes());
                 T_EXITED
             }
+            FromHost::History { first, lines } => {
+                b.extend_from_slice(&first.to_le_bytes());
+                b.extend_from_slice(&(lines.len() as u32).to_le_bytes());
+                for line in lines {
+                    put_row(&mut b, line);
+                }
+                T_HISTORY
+            }
         };
         w.write_all(&frame(tag, &b))
     }
@@ -433,6 +471,19 @@ impl FromHost {
                 }
             }
             T_EXITED => FromHost::Exited(b.u32()? as i32),
+            T_HISTORY => {
+                let first = b.u64()?;
+                let n = b.u32()? as usize;
+                // Each row is at least 6 bytes: refuse a count the body cannot hold.
+                if n > body.len() / 6 {
+                    return Err(bad());
+                }
+                let mut lines = Vec::with_capacity(n);
+                for _ in 0..n {
+                    lines.push(b.row()?);
+                }
+                FromHost::History { first, lines }
+            }
             _ => return Err(bad()),
         };
         if b.at != body.len() {
@@ -452,6 +503,11 @@ impl ToHost {
                 (T_RESIZE, b)
             }
             ToHost::Shed(on) => (T_SHED, vec![*on as u8]),
+            ToHost::History { first, count } => {
+                let mut b = first.to_le_bytes().to_vec();
+                b.extend_from_slice(&count.to_le_bytes());
+                (T_ASK, b)
+            }
         };
         w.write_all(&frame(tag, &b))
     }
@@ -466,6 +522,10 @@ impl ToHost {
                 cols: b.u16()?,
             },
             T_SHED => ToHost::Shed(b.u8()? != 0),
+            T_ASK => ToHost::History {
+                first: b.u64()?,
+                count: b.u32()?,
+            },
             _ => return Err(bad()),
         };
         if b.at != body.len() {
@@ -548,6 +608,31 @@ mod tests {
     }
 
     #[test]
+    fn the_host_finds_a_line_in_history_or_on_screen_by_the_mirrors_numbering() {
+        let mut term = vterm::Term::with_history(4, 10, 5);
+        for i in 0..12 {
+            term.feed(format!("L{i}\r\n").as_bytes());
+        }
+        let text = |n| {
+            host_line(&term, n).map(|l| {
+                l.iter()
+                    .map(|c| c.ch)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+        };
+        // 12 lines and the cursor's empty one: 9 scrolled off, 5 kept.
+        assert_eq!(term.scrollback().scrolled_lines(), 9);
+        assert_eq!(text(8).as_deref(), Some("L8"), "newest in history");
+        assert_eq!(text(4).as_deref(), Some("L4"), "oldest kept");
+        assert_eq!(text(3), None, "beyond the history");
+        assert_eq!(text(9).as_deref(), Some("L9"), "top screen row");
+        assert_eq!(text(12).as_deref(), Some(""), "the cursor's row");
+        assert_eq!(text(13), None, "past the screen");
+    }
+
+    #[test]
     fn a_resize_reaches_the_mirror() {
         let mut term = vterm::Term::with_history(10, 30, 100);
         let (mut sender, mut mirror) = (Sender::default(), Mirror::new(10, 30));
@@ -574,6 +659,16 @@ mod tests {
                 exit: None,
             },
             FromHost::Exited(9),
+            FromHost::History {
+                first: 1000,
+                lines: vec![
+                    vec![],
+                    vec![Cell {
+                        ch: 'q',
+                        ..Cell::default()
+                    }],
+                ],
+            },
         ];
         for m in &msgs {
             let mut b = Vec::new();
@@ -591,6 +686,10 @@ mod tests {
                 cols: 120,
             },
             ToHost::Shed(true),
+            ToHost::History {
+                first: 12,
+                count: 40,
+            },
         ] {
             let mut b = Vec::new();
             m.write(&mut b).unwrap();

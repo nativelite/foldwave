@@ -85,6 +85,7 @@ mod app {
         Atlas, CellInstance, CpuRenderer, FontRasterizer, Frame, GlyphKey, GlyphPart, Highlight,
         Metrics, Palette, Rasterizer, Sharpening,
     };
+    use std::collections::HashMap;
     use std::io;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -547,6 +548,16 @@ keys:
                     let _ = wire::ToHost::Resize { rows, cols }.write(s);
                 }
                 _ => {}
+            }
+        }
+
+        /// Ask a pane host for history lines (see [`Pane::history_for`]).
+        fn ask_history(&mut self, first: u64, count: u32) -> io::Result<()> {
+            match self {
+                Session::Host { stdin: Some(s), .. } => {
+                    wire::ToHost::History { first, count }.write(s)
+                }
+                _ => Err(io::ErrorKind::Unsupported.into()),
             }
         }
 
@@ -1303,6 +1314,8 @@ keys:
         blocks: Mutex<blocks::Blocks>,
         /// In a pane host: marks waiting to go to the window.
         marks_out: Option<Mutex<Vec<(u8, u64, Option<i32>)>>>,
+        /// An isolated pane waiting for history lines from its host.
+        history_reply: Mutex<Option<std::sync::mpsc::Sender<(u64, Vec<Vec<ansi::Cell>>)>>>,
         /// Output since the last checkpoint sent to the log.
         since_checkpoint: AtomicU64,
         /// Output in the log's current generation.
@@ -1451,14 +1464,57 @@ keys:
             })
         }
 
+        /// For an isolated pane, the lines in `lines` that have left its
+        /// screen, fetched from its host (which holds its history), waiting
+        /// up to half a second. Empty for a local pane: its history is here.
+        fn history_for(&self, lines: std::ops::Range<u64>) -> HashMap<u64, Vec<ansi::Cell>> {
+            let scrolled = match &*self.shared.term.lock().unwrap() {
+                Emu::Remote(m) => m.scrolled,
+                Emu::Local(_) => return HashMap::new(),
+            };
+            let end = lines.end.min(scrolled);
+            if lines.start >= end {
+                return HashMap::new();
+            }
+            let count = (end - lines.start).min(100_000) as u32;
+            let (tx, rx) = std::sync::mpsc::channel();
+            *self.shared.history_reply.lock().unwrap() = Some(tx);
+            if self
+                .session
+                .lock()
+                .unwrap()
+                .ask_history(lines.start, count)
+                .is_err()
+            {
+                return HashMap::new();
+            }
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok((first, got)) => got
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, l)| !l.is_empty())
+                    .map(|(i, l)| (first + i as u64, l))
+                    .collect(),
+                Err(_) => HashMap::new(),
+            }
+        }
+
         /// The characters of output line `n`, one per column (a wide
-        /// character's second half repeats it), if the pane still holds it.
-        fn line_chars(term: &Emu, n: u64) -> Option<Vec<(char, bool)>> {
+        /// character's second half repeats it), if the pane still holds it
+        /// (or `fetched` has it, for an isolated pane).
+        fn line_chars(
+            term: &Emu,
+            n: u64,
+            fetched: &HashMap<u64, Vec<ansi::Cell>>,
+        ) -> Option<Vec<(char, bool)>> {
             let history = term.scrollback();
             let screen = term.screen();
             let scrolled = term.scrolled_lines();
             let mut row = Vec::new();
-            let held = if n >= scrolled {
+            let held = if let Some(cells) = fetched.get(&n) {
+                row.extend_from_slice(cells);
+                true
+            } else if n >= scrolled {
                 let r = (n - scrolled) as usize;
                 row.extend((0..screen.cols()).map(|c| screen.cell(r, c)));
                 r < screen.rows()
@@ -1485,10 +1541,11 @@ keys:
 
         /// The selected text.
         fn selection_text(&self, sel: &Selection) -> String {
-            let term = self.shared.term.lock().unwrap();
             let (start, end) = sel.ordered();
+            let fetched = self.history_for(start.line..end.line + 1);
+            let term = self.shared.term.lock().unwrap();
             select::text(start, end, term.screen().cols(), |n, from, to| {
-                let chars = Self::line_chars(&term, n)?;
+                let chars = Self::line_chars(&term, n, &fetched)?;
                 Some(
                     chars[from.min(chars.len())..to.min(chars.len())]
                         .iter()
@@ -1502,7 +1559,7 @@ keys:
         /// The word under `at`, as a selection.
         fn word_at(&self, at: Point) -> Option<Selection> {
             let term = self.shared.term.lock().unwrap();
-            let chars: Vec<char> = Self::line_chars(&term, at.line)?
+            let chars: Vec<char> = Self::line_chars(&term, at.line, &HashMap::new())?
                 .into_iter()
                 .map(|(c, _)| c)
                 .collect();
@@ -1916,6 +1973,7 @@ keys:
                 exited: AtomicBool::new(false),
                 blocks: Mutex::new(blocks::Blocks::default()),
                 marks_out: None,
+                history_reply: Mutex::new(None),
                 since_checkpoint: AtomicU64::new(0),
                 gen_bytes: AtomicU64::new(0),
                 parsing: AtomicBool::new(true),
@@ -2072,6 +2130,12 @@ keys:
                             _ => ansi::MarkKind::CommandEnd,
                         };
                         shared.blocks.lock().unwrap().mark(kind, line, exit);
+                    }
+                    Ok(wire::FromHost::History { first, lines }) => {
+                        if let Some(tx) = shared.history_reply.lock().unwrap().take() {
+                            let _ = tx.send((first, lines));
+                        }
+                        continue;
                     }
                     Ok(wire::FromHost::Exited(_)) | Err(_) => {
                         // The program ended, or the host did.
@@ -2676,7 +2740,7 @@ keys:
                             // next prompt (cmd prints one after every command).
                             if let Some(lines) = out.as_mut() {
                                 let blank = |n: u64| {
-                                    Pane::line_chars(&term, n)
+                                    Pane::line_chars(&term, n, &HashMap::new())
                                         .is_some_and(|l| l.iter().all(|(c, _)| *c == ' '))
                                 };
                                 while lines.end > lines.start && blank(lines.end - 1) {
