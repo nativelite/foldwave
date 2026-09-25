@@ -40,6 +40,8 @@
 #[cfg_attr(not(windows), allow(dead_code))]
 mod blocks;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod emu;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod find;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod governor;
@@ -68,6 +70,7 @@ fn main() {
 #[cfg(windows)]
 mod app {
     use crate::blocks;
+    use crate::emu::Emu;
     use crate::find;
     use crate::governor::{self, Hidden, Level, Place};
     use crate::indexer;
@@ -1222,7 +1225,7 @@ keys:
     /// One pane's emulator and the flags its reader threads share with the
     /// UI thread.
     struct Shared {
-        term: Mutex<Term>,
+        term: Mutex<Emu>,
         pending: AtomicBool,
         exited: AtomicBool,
         /// The commands in the output, from shell-integration marks. Taken
@@ -1378,7 +1381,7 @@ keys:
 
         /// The characters of output line `n`, one per column (a wide
         /// character's second half repeats it), if the pane still holds it.
-        fn line_chars(term: &Term, n: u64) -> Option<Vec<(char, bool)>> {
+        fn line_chars(term: &Emu, n: u64) -> Option<Vec<(char, bool)>> {
             let history = term.scrollback();
             let screen = term.screen();
             let scrolled = history.scrolled_lines();
@@ -1819,7 +1822,7 @@ keys:
             let (rows, cols) = (rect.rows.max(1), rect.cols.max(1));
             let shell_args: Vec<&str> = args.shell[1..].iter().map(String::as_str).collect();
             let shared = Arc::new(Shared {
-                term: Mutex::new({
+                term: Mutex::new(Emu::Local({
                     let mut t = Term::with_history(rows, cols, args.history);
                     if args.pipe {
                         // No tty turns LF into CR LF on a pipe: new line mode
@@ -1828,7 +1831,7 @@ keys:
                     }
                     t.feed(self.logs.banner().as_bytes());
                     t
-                }),
+                })),
                 pending: AtomicBool::new(true),
                 exited: AtomicBool::new(false),
                 blocks: Mutex::new(blocks::Blocks::default()),
