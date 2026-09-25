@@ -163,7 +163,9 @@ options:
   --no-isolate  run every pane's program, parser and log in this process.
                 By default each pane has a pane host process of its own
                 (design 8.8a): a crash there restarts that pane in ~0.1 s
-                and leaves the window and the other panes running
+                and leaves the window and the other panes running. With
+                --no-log panes are not isolated: they scroll back through
+                their log
   --shell-integration S  on (default): cmd.exe marks its prompts and commands
                 (OSC 133, through PROMPT), so Ctrl+Up/Down and Ctrl+Shift+O
                 work; other shells mark them themselves if set up to; off
@@ -2091,7 +2093,9 @@ keys:
                 let w = self.waker.clone();
                 Arc::new(move || w.wake())
             };
-            if args.isolate {
+            // An isolated pane scrolls back through its log; without logs a
+            // pane stays in this process, where its history is kept.
+            if args.isolate && self.logs.store.is_some() {
                 let gen = self
                     .logs
                     .store

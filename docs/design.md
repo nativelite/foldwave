@@ -1768,6 +1768,10 @@ take the ship down.
       indexer. Hosts build signatures on the CPU. Open.
     - **On by default since 2026-09-25** (founder decision, §11 row 11);
       `--no-isolate` turns it off.
+    - Not with `--no-log`: an isolated pane keeps no history of its own and
+      scrolls back through its log, so without logs a pane stays in the
+      window's process. (Found right after switching the default: with
+      `--no-log`, Ctrl+Up could not move an isolated pane's view.)
 
 
 ### 8.9 Platform notes
