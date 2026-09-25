@@ -111,7 +111,12 @@ pub fn run(args: &Args) -> io::Result<i32> {
     loop {
         {
             let mut ready = signal.0.lock().unwrap();
-            while !*ready && !shared.exited.load(Ordering::Acquire) {
+            // Pending output (set before this loop first ran, too) or an
+            // exit ends the wait as well as a wake.
+            while !*ready
+                && !shared.pending.load(Ordering::Acquire)
+                && !shared.exited.load(Ordering::Acquire)
+            {
                 ready = signal
                     .1
                     .wait_timeout(ready, Duration::from_millis(250))
@@ -125,6 +130,9 @@ pub fn run(args: &Args) -> io::Result<i32> {
         if since < UPDATE_EVERY {
             std::thread::sleep(UPDATE_EVERY - since);
         }
+        // Readers wake this loop only when they set `pending`; clear it
+        // before reading the screen, so output after this read wakes it again.
+        shared.pending.store(false, Ordering::Release);
         let update = {
             let term = shared.term.lock().unwrap();
             match &*term {

@@ -71,6 +71,7 @@ fn main() {
 mod app {
     use crate::blocks;
     use crate::emu::Emu;
+    use crate::wire;
 
     mod host;
     use crate::find;
@@ -158,6 +159,9 @@ options:
                 logs, catching up from its log when shown again: always
                 (default), busy (only while other programs keep the CPU
                 nearly full), or never. Without a log it keeps parsing
+  --isolate     run each pane's program, parser and log in a pane host
+                process of its own (design 8.8a): a crash there ends that
+                pane, not the window
   --shell-integration S  on (default): cmd.exe marks its prompts and commands
                 (OSC 133, through PROMPT), so Ctrl+Up/Down and Ctrl+Shift+O
                 work; other shells mark them themselves if set up to; off
@@ -211,6 +215,8 @@ keys:
         /// Run as a pane host (`app::host`), for a window started with
         /// `--isolate`: its screen size, log folder, generation size, pane id.
         pane_host: bool,
+        /// Each pane's program and parser in a pane host process.
+        isolate: bool,
         host_size: (u16, u16),
         host_log: Option<String>,
         host_gen: u64,
@@ -243,6 +249,7 @@ keys:
             gpu_index: true,
             shell_integration: true,
             pane_host: false,
+            isolate: false,
             host_size: (24, 80),
             host_log: None,
             host_gen: 256 << 20,
@@ -337,6 +344,10 @@ keys:
                 }
                 "--pane-host" => {
                     a.pane_host = true;
+                    i += 1;
+                }
+                "--isolate" => {
+                    a.isolate = true;
                     i += 1;
                 }
                 "--host-size" => {
@@ -505,6 +516,11 @@ keys:
             child: std::process::Child,
             stdin: Option<std::process::ChildStdin>,
         },
+        /// `--isolate`: a pane host process runs the program (`app::host`).
+        Host {
+            child: std::process::Child,
+            stdin: Option<std::process::ChildStdin>,
+        },
     }
 
     impl Session {
@@ -515,12 +531,22 @@ keys:
                     Some(s) => io::Write::write_all(s, bytes),
                     None => Ok(()),
                 },
+                Session::Host { stdin, .. } => match stdin {
+                    Some(s) => wire::ToHost::Input(bytes.to_vec()).write(s),
+                    None => Ok(()),
+                },
             }
         }
 
         fn resize(&mut self, rows: u16, cols: u16) {
-            if let Session::Console(p) = self {
-                let _ = p.resize(rows, cols);
+            match self {
+                Session::Console(p) => {
+                    let _ = p.resize(rows, cols);
+                }
+                Session::Host { stdin: Some(s), .. } => {
+                    let _ = wire::ToHost::Resize { rows, cols }.write(s);
+                }
+                _ => {}
             }
         }
 
@@ -532,13 +558,23 @@ keys:
                 Session::Pipe { child, .. } => {
                     let _ = child.kill();
                 }
+                Session::Host { child, stdin } => {
+                    // Closing its input tells the host to take its program
+                    // down; it gets a moment before it is killed.
+                    drop(stdin.take());
+                    let until = Instant::now() + Duration::from_secs(1);
+                    while Instant::now() < until && matches!(child.try_wait(), Ok(None)) {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    let _ = child.kill();
+                }
             }
         }
 
         fn wait(&mut self) -> i32 {
             match self {
                 Session::Console(p) => p.wait().unwrap_or(0),
-                Session::Pipe { child, .. } => {
+                Session::Pipe { child, .. } | Session::Host { child, .. } => {
                     child.wait().ok().and_then(|s| s.code()).unwrap_or(0)
                 }
             }
@@ -1839,7 +1875,7 @@ keys:
             };
             let running = match &mut *session.lock().unwrap() {
                 Session::Console(p) => matches!(p.try_wait(), Ok(None)),
-                Session::Pipe { .. } => false,
+                Session::Pipe { .. } | Session::Host { .. } => false,
             };
             if !running {
                 shared.exited.store(true, Ordering::Release);
@@ -1865,7 +1901,6 @@ keys:
         fn spawn(&self, id: PaneId, rect: Rect) -> io::Result<Pane> {
             let args = self.args;
             let (rows, cols) = (rect.rows.max(1), rect.cols.max(1));
-            let shell_args: Vec<&str> = args.shell[1..].iter().map(String::as_str).collect();
             let shared = Arc::new(Shared {
                 term: Mutex::new(Emu::Local({
                     let mut t = Term::with_history(rows, cols, args.history);
@@ -1889,6 +1924,8 @@ keys:
                 want: AtomicBool::new(false),
             });
             let (log, pane_dir) = match &self.logs.store {
+                // The pane host logs; this window only reads the logs.
+                Some(store) if args.isolate => (None, Some(store.session.pane_dir(id))),
                 Some(store) => {
                     let dir = store.session.pane_dir(id);
                     match start_logger(dir.clone(), id, self.gpu.clone()) {
@@ -1915,6 +1952,37 @@ keys:
                 let w = self.waker.clone();
                 Arc::new(move || w.wake())
             };
+            if args.isolate {
+                let gen = self
+                    .logs
+                    .store
+                    .as_ref()
+                    .map_or(256 << 20, |st| st.gen_limit.load(Ordering::Acquire));
+                let session = start_host(
+                    args,
+                    id,
+                    rows,
+                    cols,
+                    &shared,
+                    pane_dir.as_deref(),
+                    gen,
+                    &self.logs,
+                    wake,
+                )?;
+                return Ok(Pane {
+                    id,
+                    shared,
+                    session,
+                    log: None,
+                    pane_dir,
+                    rect,
+                    back: 0,
+                    seen_scrolled: 0,
+                    deep: None,
+                    hidden: false,
+                    find_view: None,
+                });
+            }
             let session = start_session(
                 args,
                 rows,
@@ -1939,6 +2007,78 @@ keys:
                 find_view: None,
             })
         }
+    }
+
+    /// Start a pane host for pane `id` and a thread that applies what it
+    /// sends to the pane's mirror.
+    #[allow(clippy::too_many_arguments)]
+    fn start_host(
+        args: &Args,
+        id: PaneId,
+        rows: usize,
+        cols: usize,
+        shared: &Arc<Shared>,
+        pane_dir: Option<&Path>,
+        gen: u64,
+        logs: &Logs,
+        wake: Wake,
+    ) -> io::Result<Arc<Mutex<Session>>> {
+        use std::process::{Command, Stdio};
+        *shared.term.lock().unwrap() = Emu::Remote(wire::Mirror::new(rows, cols, args.history));
+        let mut cmd = Command::new(std::env::current_exe()?);
+        cmd.arg("--pane-host")
+            .args(["--host-size", &format!("{rows}x{cols}")])
+            .args(["--history", &args.history.to_string()])
+            .args(["--host-id", &id.to_string()])
+            .args(["--host-gen", &gen.to_string()]);
+        if args.pipe {
+            cmd.arg("--pipe");
+        }
+        if !args.shell_integration {
+            cmd.args(["--shell-integration", "off"]);
+        }
+        if let Some(dll) = &args.conpty {
+            cmd.args(["--conpty", dll]);
+        }
+        if let Some(dir) = pane_dir {
+            cmd.arg("--host-log").arg(dir);
+        }
+        cmd.arg("--").args(&args.shell);
+        cmd.env("FWTERM_BANNER", logs.banner());
+        let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+        let mut out = child.stdout.take().expect("piped");
+        let stdin = child.stdin.take();
+        let shared = shared.clone();
+        std::thread::spawn(move || {
+            let mut out = io::BufReader::new(&mut out);
+            loop {
+                match wire::FromHost::read(&mut out) {
+                    Ok(wire::FromHost::Update(u)) => {
+                        if let Emu::Remote(m) = &mut *shared.term.lock().unwrap() {
+                            m.apply(&u);
+                        }
+                    }
+                    Ok(wire::FromHost::Mark { kind, line, exit }) => {
+                        let kind = match kind {
+                            b'A' => ansi::MarkKind::PromptStart,
+                            b'B' => ansi::MarkKind::CommandStart,
+                            b'C' => ansi::MarkKind::OutputStart,
+                            _ => ansi::MarkKind::CommandEnd,
+                        };
+                        shared.blocks.lock().unwrap().mark(kind, line, exit);
+                    }
+                    Ok(wire::FromHost::Exited(_)) | Err(_) => {
+                        // The program ended, or the host did.
+                        shared.exited.store(true, Ordering::Release);
+                        wake();
+                        return;
+                    }
+                }
+                shared.pending.store(true, Ordering::Release);
+                wake();
+            }
+        });
+        Ok(Arc::new(Mutex::new(Session::Host { child, stdin })))
     }
 
     /// Start the pane's program in its lane, with reader threads feeding
