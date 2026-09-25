@@ -2,7 +2,8 @@
 
 use fwbench::flood::Transport;
 use fwbench::{
-    compose, disk, echo, emit, flood, gpu, history, noise, parse as e4, read, replay, report, Run,
+    compose, disk, echo, emit, flood, gpu, history, hostipc, noise, parse as e4, read, replay,
+    report, Run,
 };
 use std::io::{self, Write};
 use std::time::Duration;
@@ -60,6 +61,9 @@ modes:
                 must equal the one-thread one
   gpuindex-load GPU-only load: upload --mib MiB (default 64) and build its
                 signatures, again and again, for --seconds (default 10)
+  hostipc       what a process boundary costs (design 8.8a): a 64-byte
+                message to a child and back over pipes, --samples times
+                (default 200), and full-screen frames streamed from it
   read          read rate of --path DIR, unbuffered and buffered, with the CPU
                 cost per GiB; says whether the directory is NTFS-compressed.
                 --flush-mib N (default 0) writes N MiB of throwaway data first
@@ -111,6 +115,8 @@ enum Mode {
     GpuScan,
     GpuIndex,
     GpuIndexLoad,
+    HostIpc,
+    IpcChild,
     Read,
     Compose,
     Replay,
@@ -369,6 +375,14 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             }
             "gpuindex" => {
                 mode = Some(Mode::GpuIndex);
+                i += 1;
+            }
+            "hostipc" => {
+                mode = Some(Mode::HostIpc);
+                i += 1;
+            }
+            "--ipc-child" => {
+                mode = Some(Mode::IpcChild);
                 i += 1;
             }
             "gpuindex-load" => {
@@ -831,6 +845,27 @@ fn run(args: &Args) -> i32 {
         return 0;
     }
 
+    if args.mode == Mode::IpcChild {
+        return i32::from(hostipc::child().is_err());
+    }
+    if args.mode == Mode::HostIpc {
+        let exe = match std::env::current_exe() {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("fwbench: hostipc: {e}");
+                return 1;
+            }
+        };
+        match hostipc::run(&exe, args.samples) {
+            Ok(r) => print!("{}", hostipc::render(&r)),
+            Err(e) => {
+                eprintln!("fwbench: hostipc failed: {e}");
+                return 1;
+            }
+        }
+        return 0;
+    }
+
     if args.mode == Mode::GpuIndexLoad {
         let run = Duration::from_secs(args.render.seconds.max(1));
         match gpu::index_load(args.mib as usize, run) {
@@ -905,6 +940,8 @@ fn run(args: &Args) -> i32 {
         | Mode::GpuScan
         | Mode::GpuIndex
         | Mode::GpuIndexLoad
+        | Mode::HostIpc
+        | Mode::IpcChild
         | Mode::Read
         | Mode::Compose
         | Mode::Replay

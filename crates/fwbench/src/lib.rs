@@ -37,6 +37,7 @@ pub mod fsm;
 pub mod glyphs;
 pub mod gpu;
 pub mod history;
+pub mod hostipc;
 pub mod noise;
 pub mod parse;
 pub mod read;

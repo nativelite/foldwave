@@ -1683,6 +1683,21 @@ take the ship down.
   M0 harness measures whether shared-memory screen snapshots keep that inside
   the latency target. If not, parsing moves back in-process behind panic
   isolation, and that decision gets written down.
+  - **Measured 2026-09-25 (`fwbench hostipc`, 3 runs): the hop fits easily,
+    through plain pipes; shared memory is not needed.**
+    - A 64-byte message to a child process and back: p50 0.01 ms, p99
+      0.02 ms, max 0.15–0.22 ms over 20,000 round trips. A key crosses the
+      boundary once each way; against a key echo of ~6–7 ms (§4, fwprobe)
+      that is under 0.3 %.
+    - Full-screen frames (211 KiB: a 2400x1300 pane of 12-byte cells)
+      streamed from the child: 17,483–17,702 a second (3.6 GiB/s) on one
+      pipe. 16 panes at 140 fps need 2,240, and a host sends only changed
+      rows.
+    - So the split can keep latency parity with Windows Terminal. What it
+      costs is engineering: the window keeps a display-only copy of each
+      pane (screen, history lines for scrollback, selection, blocks), fed by
+      the host with changed rows and lines leaving the screen, while the log
+      stays readable from disk as now.
 
 ### 8.9 Platform notes
 - **Windows:** console apps need ConPTY, so a console host always sits between
