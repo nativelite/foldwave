@@ -89,6 +89,7 @@ pub fn run(args: &Args) -> io::Result<i32> {
     {
         let (session, shared, wake) = (session.clone(), shared.clone(), wake.clone());
         let out = out.clone();
+        let (log_tx, log_dir) = (log.as_ref().map(|l| l.tx.clone()), args.host_log.clone());
         std::thread::spawn(move || {
             let mut input = io::stdin().lock();
             loop {
@@ -104,6 +105,31 @@ pub fn run(args: &Args) -> io::Result<i32> {
                             .resize(rows.max(1) as usize, cols.max(1) as usize);
                         session.lock().unwrap().resize(rows, cols);
                         wake();
+                    }
+                    // Hidden: only log. Shown: catch up from the log, then
+                    // parse live again (as the window does for its own panes).
+                    Ok(ToHost::Shed(true)) if log_tx.is_some() => {
+                        let _term = shared.term.lock().unwrap();
+                        let at = shared.gen_bytes.load(Ordering::Acquire);
+                        shared.paused_at.store(at, Ordering::Release);
+                        shared.parsing.store(false, Ordering::Release);
+                    }
+                    Ok(ToHost::Shed(false)) => {
+                        let parsing = shared.parsing.load(Ordering::Acquire);
+                        if let (false, Some(tx), Some(dir)) = (parsing, &log_tx, &log_dir) {
+                            if !shared.catching_up.swap(true, Ordering::AcqRel) {
+                                let (shared, tx, dir, wake) =
+                                    (shared.clone(), tx.clone(), PathBuf::from(dir), wake.clone());
+                                std::thread::spawn(move || {
+                                    if catch_up(&shared, &tx, &dir, &wake).is_err() {
+                                        shared.parsing.store(true, Ordering::Release);
+                                    }
+                                    shared.catching_up.store(false, Ordering::Release);
+                                    shared.pending.store(true, Ordering::Release);
+                                    wake();
+                                });
+                            }
+                        }
                     }
                     Ok(ToHost::Shed(_)) => {}
                     Ok(ToHost::History { first, count }) => {

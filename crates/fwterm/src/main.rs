@@ -553,6 +553,14 @@ keys:
             }
         }
 
+        /// Tell a pane host its pane is hidden (shed: only log) or shown.
+        fn shed(&mut self, on: bool) -> bool {
+            match self {
+                Session::Host { stdin: Some(s), .. } => wire::ToHost::Shed(on).write(s).is_ok(),
+                _ => false,
+            }
+        }
+
         /// Ask a pane host for history lines (see [`Pane::history_for`]).
         fn ask_history(&mut self, first: u64, count: u32) -> io::Result<()> {
             match self {
@@ -1607,7 +1615,11 @@ keys:
             }
             let (shared, tx, dir) = (self.shared.clone(), log.tx.clone(), dir.clone());
             std::thread::spawn(move || {
-                if let Err(e) = catch_up(&shared, &tx, &dir, &waker) {
+                let wake: Wake = {
+                    let w = waker.clone();
+                    Arc::new(move || w.wake())
+                };
+                if let Err(e) = catch_up(&shared, &tx, &dir, &wake) {
                     // Live again regardless, with the gap said out loud.
                     let mut term = shared.term.lock().unwrap();
                     term.feed(format!("\r\n{RED}[fwterm: output while hidden could not be replayed: {e}]{RESET}\r\n").as_bytes());
@@ -2414,7 +2426,7 @@ keys:
         shared: &Shared,
         tx: &SyncSender<LogMsg>,
         pane_dir: &Path,
-        waker: &Waker,
+        wake: &Wake,
     ) -> io::Result<()> {
         let current = || {
             logstore::generations(pane_dir)
@@ -2437,7 +2449,7 @@ keys:
                 at += n as u64;
                 shared.paused_at.store(at, Ordering::Release);
                 shared.pending.store(true, Ordering::Release);
-                waker.wake();
+                wake();
             }
             let mut term = shared.term.lock().unwrap();
             let logged = shared.gen_bytes.load(Ordering::Acquire);
@@ -3127,6 +3139,16 @@ keys:
             // Hidden panes stop parsing when the governor says so, and catch
             // up from their logs when shown or when it no longer does.
             for p in &panes {
+                // An isolated pane's host shed and catches up itself.
+                if matches!(&*p.session.lock().unwrap(), Session::Host { .. }) {
+                    let logged = p.pane_dir.is_some();
+                    let keep = governor::keep_parsing(p.hidden, logged, args.hidden, level);
+                    let parsing = p.shared.parsing.load(Ordering::Acquire);
+                    if keep != parsing && p.session.lock().unwrap().shed(!keep) {
+                        p.shared.parsing.store(keep, Ordering::Release);
+                    }
+                    continue;
+                }
                 let keep = governor::keep_parsing(p.hidden, p.log.is_some(), args.hidden, level);
                 let parsing = p.shared.parsing.load(Ordering::Acquire);
                 if !keep && parsing && !p.shared.catching_up.load(Ordering::Acquire) {

@@ -1755,9 +1755,17 @@ take the ship down.
     - Four kills in a row: 3 restarts, then the pane closed.
   - **Still open:**
     - The crashed program itself is not recovered: a console-lane program
-      dies with its pseudoconsole, and a pipe-lane one is left running (no
-      job object yet).
-    - Hidden-pane shedding and GPU signatures are not wired into hosts.
+      dies with its pseudoconsole, and a pipe-lane one now dies with the
+      process that started it (`resmon::job`, a kill-on-close job; checked:
+      a killed host's `ping` was gone 7 ms later).
+    - Hidden-pane shedding now works in hosts (the window sends
+      `ToHost::Shed`; the host pauses, then catches up from its log when
+      shown). 4 isolated panes flooding 1 GiB each, one shown: 22.0 CPU-s for
+      all fwterm processes shedding, against 32.6–33.7 without (about -33 %).
+      The 2,000,000-line catch-up test ends exactly on its last line.
+    - GPU signatures are not built for hosts' logs: each host would need its
+      own CUDA context, or would have to send its blocks to the window's
+      indexer. Hosts build signatures on the CPU. Open.
     - `--isolate` is opt-in; making it the default is the founder's call,
       given the numbers above (throughput and latency at parity, ~9 % more
       CPU for one pane).
