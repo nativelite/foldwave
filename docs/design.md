@@ -1811,8 +1811,22 @@ take the ship down.
       fps; with `--host-signs gpu` window 3.95–4.38, total 17.92–18.53,
       146.9–147.1 fps. On this quieter run the window's path cost about 3 %,
       not 9 %: the gap varies with load, and never favours the window's
-      path. Making that path cheaper (it copies each block out of the log
-      and stages it again) stays possible later.
+      path.
+    - **The window's path made cheap (2026-09-27).** Per 1 MiB block the
+      fetcher paid 0.65 ms opening the log (it reads every record header of
+      the live segment) plus 0.37 ms for a fresh zeroed buffer, the read and
+      a 1 MiB memmove, then a copy into the pinned buffer: more than the
+      0.94 ms of signing the block on the CPU. Now the fetcher gathers
+      announcements for up to 100 ms (or 32 blocks) and opens each log once
+      per gathering, and hands the indexer the open reader: the indexer
+      reads block and lead in one call straight into its pinned launch
+      buffer, no buffer or copy in between. Same machine, 3 GiB, 5 runs
+      each, medians: `--host-signs gpu` window 2.00 CPU-s (1.75–2.08;
+      4.20 before), total 15.66 (15.23–16.00) against 17.86 (17.50–18.27)
+      for `self`, about −12 %; 146.7 fps against 149.3. Sealed generations
+      stay complete; the tail unsigned at close grew to about 70 blocks (the
+      100 ms gather), rebuilt when the log opens. The default stays `self`
+      until the founder rules on switching it.
     - **On by default since 2026-09-25** (founder decision, §11 row 11);
       `--no-isolate` turns it off.
     - Not with `--no-log`: an isolated pane keeps no history of its own and

@@ -15,8 +15,9 @@
 //!
 //! A pane host's logger (design §8.8a) runs in another process, so its
 //! blocks reach the indexer another way: the host announces each block once
-//! it is durable, and a [`fetcher`](Indexer::fetcher) thread here reads it
-//! from the log and queues it like any other.
+//! it is durable, and a [`fetcher`](Indexer::fetcher) thread here opens the
+//! log and queues the block; the indexer reads it straight into its launch
+//! buffer.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -78,6 +79,34 @@ pub struct Job<R> {
     pub bytes: Vec<u8>,
 }
 
+/// What the indexer builds a signature from.
+enum Work<R> {
+    /// A block a logger here cut, bytes in hand.
+    Staged(Job<R>),
+    /// A block of a pane host's log, read straight into the launch's pinned
+    /// buffer, lead included: no copy in between (design §8.8a).
+    Log {
+        reply: R,
+        generation: u32,
+        block: u64,
+        log: Arc<panelog::ByteReader>,
+    },
+}
+
+impl<R> Work<R> {
+    fn target(&self) -> (&R, u32, u64) {
+        match self {
+            Work::Staged(j) => (&j.reply, j.generation, j.block),
+            Work::Log {
+                reply,
+                generation,
+                block,
+                ..
+            } => (reply, *generation, *block),
+        }
+    }
+}
+
 /// Blocks the indexer may hold before loggers build signatures themselves:
 /// 128 MiB of memory at most (a batch gathering, a batch in flight).
 const QUEUE: usize = 128;
@@ -89,6 +118,11 @@ const MIN_BATCH: usize = 32;
 /// opened), and bigger launches cost the CPU less: 0.31 CPU-s per GiB at
 /// 4 MiB, 0.08 at 64 MiB (design §8.7a).
 const GATHER: Duration = Duration::from_millis(400);
+/// How long the fetcher gathers announced blocks before opening their logs:
+/// an open reads every record header of the live segment (~0.65 ms for a
+/// 256 MiB generation), about what signing a block on the CPU costs, so it
+/// is paid once per gathering, not once per block.
+const FETCH_GATHER: Duration = Duration::from_millis(100);
 
 /// Counts of signatures built each way, for `--stats`.
 #[derive(Debug, Default)]
@@ -100,7 +134,7 @@ pub struct Counts {
 
 /// The loggers' side of the indexer.
 pub struct Indexer<R> {
-    tx: SyncSender<Job<R>>,
+    tx: SyncSender<Work<R>>,
     pub counts: Arc<Counts>,
 }
 
@@ -118,7 +152,7 @@ impl<R: Send + 'static> Indexer<R> {
     /// signature to its logger. `None` when there is no CUDA device or the
     /// kernel will not load: every logger then builds its own.
     pub fn start(deliver: impl Fn(&R, u32, u64, Vec<u8>) + Send + 'static) -> Option<Indexer<R>> {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Job<R>>(QUEUE);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Work<R>>(QUEUE);
         let (ready_tx, ready) = std::sync::mpsc::channel();
         let counts = Arc::new(Counts::default());
         let c = counts.clone();
@@ -130,9 +164,17 @@ impl<R: Send + 'static> Indexer<R> {
     /// Queue a block without waiting; gives it back when the queue is full
     /// (or the indexer has stopped), and the caller builds it itself.
     pub fn submit(&self, job: Job<R>) -> Result<(), Job<R>> {
-        match self.tx.try_send(job) {
+        match self.try_send(Work::Staged(job)) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(j)) | Err(TrySendError::Disconnected(j)) => Err(j),
+            Err(Work::Staged(j)) => Err(j),
+            Err(Work::Log { .. }) => unreachable!("sent a staged block"),
+        }
+    }
+
+    fn try_send(&self, work: Work<R>) -> Result<(), Work<R>> {
+        match self.tx.try_send(work) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(w)) | Err(TrySendError::Disconnected(w)) => Err(w),
         }
     }
 }
@@ -161,34 +203,50 @@ impl<R: Clone + Send + 'static> Indexer<R> {
         let ix = self.clone();
         std::thread::spawn(move || {
             while let Ok(first) = rx.recv() {
-                // Everything announced so far, with one open per log.
+                // Gather announcements for a while, then open each log once.
                 let mut todo = vec![first];
+                let until = Instant::now() + FETCH_GATHER;
+                while todo.len() < MIN_BATCH {
+                    let now = Instant::now();
+                    if now >= until {
+                        break;
+                    }
+                    match rx.recv_timeout(until - now) {
+                        Ok(r) => todo.push(r),
+                        Err(_) => break,
+                    }
+                }
                 todo.extend(rx.try_iter());
-                let mut logs: Vec<(PathBuf, Option<panelog::ByteReader>)> = Vec::new();
+                let mut logs: Vec<(PathBuf, Option<Arc<panelog::ByteReader>>)> = Vec::new();
                 for r in todo {
                     let at = match logs.iter().position(|(d, _)| *d == r.dir) {
                         Some(k) => k,
                         None => {
-                            logs.push((r.dir.clone(), panelog::ByteReader::open(&r.dir).ok()));
+                            let log = panelog::ByteReader::open(&r.dir).ok().map(Arc::new);
+                            logs.push((r.dir.clone(), log));
                             logs.len() - 1
                         }
                     };
                     let Some(log) = &logs[at].1 else { continue };
-                    let Some((lead, bytes)) = read_block(log, r.block) else {
-                        continue;
-                    };
-                    let local = match lead {
-                        None => Some(panelog::signature(None, &bytes)),
-                        Some(lead) => ix
-                            .submit(Job {
-                                reply: r.reply.clone(),
-                                generation: r.generation,
-                                block: r.block,
-                                lead,
-                                bytes,
-                            })
-                            .err()
-                            .map(|j| panelog::signature(Some(j.lead), &j.bytes)),
+                    if (r.block + 1) * BLOCK as u64 > log.len() {
+                        continue; // not in the log: panelog rebuilds it
+                    }
+                    let local = if r.block == 0 {
+                        // No bytes before it, so not in a GPU launch.
+                        read_block(log, 0).map(|(lead, bytes)| panelog::signature(lead, &bytes))
+                    } else {
+                        let work = Work::Log {
+                            reply: r.reply.clone(),
+                            generation: r.generation,
+                            block: r.block,
+                            log: log.clone(),
+                        };
+                        match ix.try_send(work) {
+                            Ok(()) => None,
+                            // The GPU's queue is full: build it here.
+                            Err(_) => read_block(log, r.block)
+                                .map(|(lead, bytes)| panelog::signature(lead, &bytes)),
+                        }
                     };
                     if let Some(sig) = local {
                         ix.counts.cpu.fetch_add(1, Ordering::Relaxed);
@@ -209,15 +267,15 @@ fn read_block(log: &panelog::ByteReader, block: u64) -> Option<(Option<[u8; 2]>,
         log.read_exact_at(0, &mut bytes).ok()?;
         return Some((None, bytes));
     }
-    let mut buf = vec![0u8; BLOCK + 2];
-    log.read_exact_at(start - 2, &mut buf).ok()?;
-    let lead = [buf[0], buf[1]];
-    buf.drain(..2);
-    Some((Some(lead), buf))
+    let mut lead = [0u8; 2];
+    log.read_exact_at(start - 2, &mut lead).ok()?;
+    let mut bytes = vec![0u8; BLOCK];
+    log.read_exact_at(start, &mut bytes).ok()?;
+    Some((Some(lead), bytes))
 }
 
 fn run<R>(
-    rx: Receiver<Job<R>>,
+    rx: Receiver<Work<R>>,
     deliver: impl Fn(&R, u32, u64, Vec<u8>),
     ready: std::sync::mpsc::Sender<bool>,
     counts: Arc<Counts>,
@@ -250,7 +308,7 @@ fn run<R>(
     };
     let _ = ready.send(true);
     let mut sigs = vec![0u8; MAX_BATCH * fwcuda::SIG_BYTES];
-    let mut batch: Vec<Job<R>> = Vec::with_capacity(MAX_BATCH);
+    let mut batch: Vec<Work<R>> = Vec::with_capacity(MAX_BATCH);
     loop {
         // Wait for work, then gather more for up to GATHER or a full batch.
         match rx.recv() {
@@ -275,13 +333,30 @@ fn run<R>(
                 }
             }
         }
-        let n = batch.len();
         {
+            // Fill the pinned buffer; a host's block that cannot be read is
+            // left out (panelog rebuilds its signature when the log opens).
             let h = host.as_mut_slice();
-            for (k, j) in batch.iter().enumerate() {
-                h[k * stride..k * stride + 2].copy_from_slice(&j.lead);
-                h[k * stride + 2..(k + 1) * stride].copy_from_slice(&j.bytes);
-            }
+            let mut k = 0;
+            batch.retain(|w| {
+                let slot = &mut h[k * stride..(k + 1) * stride];
+                let ok = match w {
+                    Work::Staged(j) => {
+                        slot[..2].copy_from_slice(&j.lead);
+                        slot[2..].copy_from_slice(&j.bytes);
+                        true
+                    }
+                    Work::Log { block, log, .. } => {
+                        log.read_exact_at(block * BLOCK as u64 - 2, slot).is_ok()
+                    }
+                };
+                k += ok as usize;
+                ok
+            });
+        }
+        let n = batch.len();
+        if n == 0 {
+            continue;
         }
         let built = (|| -> Result<(), fwcuda::Error> {
             ctx.copy_h2d_prefix(&dev_in, &host.as_slice()[..n * stride])?;
@@ -295,9 +370,10 @@ fn run<R>(
         }
         counts.launches.fetch_add(1, Ordering::Relaxed);
         counts.gpu.fetch_add(n as u64, Ordering::Relaxed);
-        for (k, j) in batch.drain(..).enumerate() {
+        for (k, w) in batch.drain(..).enumerate() {
             let sig = sigs[k * fwcuda::SIG_BYTES..(k + 1) * fwcuda::SIG_BYTES].to_vec();
-            deliver(&j.reply, j.generation, j.block, sig);
+            let (reply, generation, block) = w.target();
+            deliver(reply, generation, block, sig);
         }
     }
 }
