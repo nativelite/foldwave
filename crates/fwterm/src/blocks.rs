@@ -103,6 +103,26 @@ impl Blocks {
         })
     }
 
+    /// Commands that failed (a nonzero exit code) whose command line falls in
+    /// `lines`: that line and the code. A shell that sends no exit code (cmd)
+    /// has none.
+    pub fn failed_in(&self, lines: std::ops::Range<u64>) -> impl Iterator<Item = (u64, i32)> + '_ {
+        // A command line comes before the next prompt, so of the blocks that
+        // start before `lines` only the last can reach into it.
+        let from = self
+            .list
+            .partition_point(|b| b.prompt < lines.start)
+            .saturating_sub(1);
+        self.list[from..]
+            .iter()
+            .take_while(move |b| b.prompt < lines.end)
+            .filter_map(move |b| {
+                let line = b.command.unwrap_or(b.prompt);
+                let code = b.exit.filter(|&c| c != 0)?;
+                lines.contains(&line).then_some((line, code))
+            })
+    }
+
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.list.len()
@@ -114,10 +134,44 @@ impl Blocks {
     }
 }
 
+/// Where a failed command's `exit N` label goes on its command row, `cols`
+/// wide: right-aligned with a blank cell either side, and only where every
+/// cell it needs is `blank`, so it never covers output. The starting column
+/// and the label; `None` when it does not fit.
+pub fn exit_label(
+    code: i32,
+    cols: usize,
+    blank: impl Fn(usize) -> bool,
+) -> Option<(usize, String)> {
+    let label = format!("exit {code}");
+    let n = label.len();
+    if cols < n + 2 {
+        return None;
+    }
+    let start = cols - n - 1;
+    (start - 1..cols).all(blank).then_some((start, label))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use MarkKind::*;
+
+    #[test]
+    fn the_exit_label_sits_right_on_blank_cells_only() {
+        let row = |text: &str, cols: usize| {
+            let chars: Vec<char> = text.chars().collect();
+            move |c: usize| chars.get(c).map_or(true, |&ch| ch == ' ')
+        };
+        // "C:\> type nofile" on a 30-column row: "exit 1" in cols 23..29.
+        assert_eq!(
+            exit_label(1, 30, row("C:\\> type nofile", 30)),
+            Some((23, "exit 1".into()))
+        );
+        // A command reaching into the label's cells: no label.
+        assert_eq!(exit_label(1, 30, row(&"x".repeat(23), 30)), None);
+        assert_eq!(exit_label(-1073741819, 12, row("", 12)), None, "too narrow");
+    }
 
     /// cmd with fwterm's prompt: `D A <prompt> B`, the user's command on the
     /// B line, its output on the lines after, then `D A B` again.
@@ -175,6 +229,27 @@ mod tests {
         let blk = b.get(0).unwrap();
         assert_eq!(blk.output_lines(None), Some(11..20));
         assert_eq!(blk.exit, Some(2));
+    }
+
+    #[test]
+    fn only_failed_commands_in_view_are_reported_on_their_command_line() {
+        let mut b = Blocks::default();
+        // Two-line prompts: the command is typed on the line after `A`.
+        for (prompt, exit) in [(0, Some(0)), (10, Some(2)), (20, None), (30, Some(-1))] {
+            b.mark(PromptStart, prompt, None);
+            b.mark(CommandStart, prompt + 1, None);
+            b.mark(CommandEnd, prompt + 9, exit);
+        }
+        let all: Vec<_> = b.failed_in(0..100).collect();
+        assert_eq!(all, [(11, 2), (31, -1)], "0 and no code are not failures");
+        // A view starting between a prompt and its command line still shows it.
+        assert_eq!(b.failed_in(11..12).collect::<Vec<_>>(), [(11, 2)]);
+        assert_eq!(b.failed_in(12..31).count(), 0);
+        assert_eq!(
+            cmd_session().failed_in(0..100).count(),
+            0,
+            "cmd sends no codes"
+        );
     }
 
     #[test]

@@ -321,6 +321,11 @@ impl Frame {
 
     /// Set one cell (a pane divider, say), damaging its row if it changed.
     /// Returns whether it did; a cell outside the frame is ignored.
+    /// The cell at `(row, col)`, if inside the frame.
+    pub fn cell(&self, row: usize, col: usize) -> Option<CellInstance> {
+        (row < self.rows && col < self.cols).then(|| self.cells[row * self.cols + col])
+    }
+
     pub fn put(&mut self, row: usize, col: usize, cell: CellInstance) -> bool {
         if row >= self.rows || col >= self.cols {
             return false;

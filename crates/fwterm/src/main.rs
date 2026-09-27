@@ -1923,6 +1923,36 @@ keys:
                     pen.atlas,
                     pen.raster,
                 );
+                if !term.in_alternate_screen() {
+                    // Failed commands: `exit N` at the end of the command line.
+                    let blocks = shared.blocks.lock().unwrap();
+                    for (line, code) in blocks.failed_in(top..top + rows as u64) {
+                        let row = r.top + (line - top) as usize;
+                        let blank = |c: usize| {
+                            frame
+                                .cell(row, r.left + c)
+                                .is_some_and(|x| x.glyph == 0 && x.bg == pen.palette.bg)
+                        };
+                        let Some((start, label)) = blocks::exit_label(code, cols, blank) else {
+                            continue;
+                        };
+                        for (i, ch) in label.chars().enumerate() {
+                            let key = GlyphKey {
+                                ch,
+                                style: 0,
+                                part: GlyphPart::Single,
+                            };
+                            let glyph = pen.atlas.slot(key, pen.raster);
+                            let cell = CellInstance {
+                                glyph,
+                                fg: EXIT_FAILED,
+                                bg: pen.palette.bg,
+                                flags: 0,
+                            };
+                            frame.put(row, r.left + start + i, cell);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1937,6 +1967,8 @@ keys:
     /// Divider colours: the lines around the focused pane stand out.
     const DIVIDER: u32 = 0xFF4A_4A4A;
     const DIVIDER_FOCUSED: u32 = 0xFF3A_96DD;
+    /// A failed command's `exit N`.
+    const EXIT_FAILED: u32 = 0xFFD0_5A5A;
 
     /// Draw the dividers of `placement`, those touching the focused pane in
     /// the focus colour.
