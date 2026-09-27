@@ -319,13 +319,36 @@ impl Frame {
         )
     }
 
-    /// Set one cell (a pane divider, say), damaging its row if it changed.
-    /// Returns whether it did; a cell outside the frame is ignored.
+    /// Draw a `rows x cols` view whose cells come from `cell_at` at
+    /// `(top, left)`: a view that is not a screen over its history (a pane
+    /// with folded commands, say). `cursor` and `highlight` are in view
+    /// rows; returns rows newly damaged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_at(
+        &mut self,
+        top: usize,
+        left: usize,
+        rows: usize,
+        cols: usize,
+        cursor: Option<ansi::Cursor>,
+        highlight: Option<Highlight>,
+        cell_at: impl Fn(usize, usize) -> ansi::Cell,
+        palette: &Palette,
+        atlas: &mut Atlas,
+        raster: &mut dyn Rasterizer,
+    ) -> usize {
+        self.paint(
+            top, left, rows, cols, cursor, highlight, cell_at, palette, atlas, raster,
+        )
+    }
+
     /// The cell at `(row, col)`, if inside the frame.
     pub fn cell(&self, row: usize, col: usize) -> Option<CellInstance> {
         (row < self.rows && col < self.cols).then(|| self.cells[row * self.cols + col])
     }
 
+    /// Set one cell (a pane divider, say), damaging its row if it changed.
+    /// Returns whether it did; a cell outside the frame is ignored.
     pub fn put(&mut self, row: usize, col: usize, cell: CellInstance) -> bool {
         if row >= self.rows || col >= self.cols {
             return false;

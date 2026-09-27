@@ -44,6 +44,8 @@ mod emu;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod find;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod fold;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod governor;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod indexer;
@@ -71,6 +73,7 @@ fn main() {
 mod app {
     use crate::blocks;
     use crate::emu::Emu;
+    use crate::fold;
     use crate::wire;
 
     mod host;
@@ -191,6 +194,7 @@ keys:
   Ctrl+Shift+Z      zoom the focused pane to the whole window, or back
   Ctrl+Up/Down      jump to the previous / next command's prompt
   Ctrl+Shift+O      select a command's output (then Ctrl+C copies it)
+  Ctrl+Shift+[ / ]  fold that command's output to one line / unfold
   Ctrl+Shift+F      search every pane's log: type, Enter searches, Enter /
                     Shift+Enter step through hits (newest first), Esc closes
   drag, double-click   select text in a pane / select a word
@@ -1654,6 +1658,11 @@ keys:
         hidden: bool,
         /// Showing a search hit: its line in the pane's logs, and the needle.
         find_view: Option<(u64, String)>,
+        /// Folded commands (Ctrl+Shift+[), and the line each view row showed
+        /// when last drawn with folds in view (a folded row: its first line;
+        /// empty when the view had no folds).
+        folds: fold::Folds,
+        row_lines: Vec<u64>,
         /// When this pane's host was restarted, for the crash-loop guard.
         restarts: Vec<Instant>,
     }
@@ -1694,12 +1703,37 @@ keys:
             let r = self.rect;
             let row = (y.div_euclid(m.cell_h as i32) - r.top as i32).clamp(0, r.rows as i32 - 1);
             let col = (x.div_euclid(m.cell_w as i32) - r.left as i32).clamp(0, r.cols as i32 - 1);
-            // The view as last drawn: its top row is `seen_scrolled - back`.
+            // The view as last drawn: its top row is `seen_scrolled - back`,
+            // or, with folds in view, the rows it drew.
             let top = self.seen_scrolled.saturating_sub(self.back as u64);
+            let line = match self.row_lines.last() {
+                None => top + row as u64,
+                Some(&last) => self.row_lines.get(row as usize).copied().unwrap_or(last),
+            };
             Some(Point {
-                line: top + row as u64,
+                line,
                 col: col as usize,
             })
+        }
+
+        /// The output of the command at the top of the view (at the live
+        /// view, the latest with output), from shell-integration marks,
+        /// without the blank lines a shell leaves before its next prompt (cmd
+        /// prints one after every command). What Ctrl+Shift+O selects and
+        /// Ctrl+Shift+[ folds.
+        fn command_output(&self) -> Option<std::ops::Range<u64>> {
+            let top = self.seen_scrolled.saturating_sub(self.back as u64);
+            let at = if self.back == 0 { u64::MAX } else { top };
+            let term = self.shared.term.lock().unwrap();
+            let mut lines = self.shared.blocks.lock().unwrap().output_at(at)?;
+            let blank = |n: u64| {
+                Pane::line_chars(&term, n, &HashMap::new())
+                    .is_some_and(|l| l.iter().all(|(c, _)| *c == ' '))
+            };
+            while lines.end > lines.start && blank(lines.end - 1) {
+                lines.end -= 1;
+            }
+            (!lines.is_empty()).then_some(lines)
         }
 
         /// For an isolated pane, the lines in `lines` that have left its
@@ -1950,26 +1984,123 @@ keys:
                 self.deep = None;
                 self.back = self.back.min(held);
                 let top = scrolled.saturating_sub(self.back as u64);
-                let highlight = selection
-                    .and_then(|sel| sel.in_view(top, rows, cols))
-                    .map(|(start, end)| Highlight { start, end });
-                frame.update_view_at(
-                    r.top,
-                    r.left,
-                    term.screen(),
-                    history,
-                    self.back,
-                    focused,
-                    highlight,
-                    pen.palette,
-                    pen.atlas,
-                    pen.raster,
-                );
+                let live_end = scrolled + rows as u64;
+                let oldest = scrolled - held as u64;
+                self.folds.forget_before(oldest);
+                // Live, the prompt stays at the bottom and folds let older
+                // lines show above; scrolled back, the view keeps its top.
+                let folded = (!term.in_alternate_screen())
+                    .then(|| match self.back {
+                        0 => self.folds.live_view(live_end, rows, oldest),
+                        _ => self.folds.view(top, rows, live_end),
+                    })
+                    .flatten();
+                if let Some(view) = &folded {
+                    // Folds in view: compose its rows, each a line from the
+                    // screen or history, or a folded command's one line.
+                    let screen = term.screen();
+                    let dim = ansi::Style {
+                        dim: true,
+                        ..Default::default()
+                    };
+                    let cells: Vec<Vec<ansi::Cell>> = view
+                        .iter()
+                        .map(|row| match *row {
+                            fold::Row::Line(l) if l >= scrolled => (0..cols)
+                                .map(|c| screen.cell((l - scrolled) as usize, c))
+                                .collect(),
+                            fold::Row::Line(l) => {
+                                let mut out = Vec::new();
+                                history.history_row((scrolled - 1 - l) as usize, &mut out);
+                                out
+                            }
+                            fold::Row::Folded { lines, .. } => fold::summary(lines)
+                                .chars()
+                                .map(|ch| ansi::Cell {
+                                    ch,
+                                    style: dim,
+                                    ..Default::default()
+                                })
+                                .collect(),
+                        })
+                        .collect();
+                    let at = screen.cursor();
+                    let cursor = focused
+                        .then(|| {
+                            view.iter()
+                                .position(|&x| x == fold::Row::Line(scrolled + at.row as u64))
+                        })
+                        .flatten()
+                        .map(|row| ansi::Cursor::new(row, at.col));
+                    let highlight = selection
+                        .and_then(|sel| {
+                            let (a, b) = sel.ordered();
+                            fold::highlight(view, cols, (a.line, a.col), (b.line, b.col))
+                        })
+                        .map(|(start, end)| Highlight { start, end });
+                    frame.paint_at(
+                        r.top,
+                        r.left,
+                        rows,
+                        cols,
+                        cursor,
+                        highlight,
+                        |row, c| {
+                            cells
+                                .get(row)
+                                .and_then(|l| l.get(c))
+                                .copied()
+                                .unwrap_or_default()
+                        },
+                        pen.palette,
+                        pen.atlas,
+                        pen.raster,
+                    );
+                    self.row_lines = view
+                        .iter()
+                        .map(|x| match *x {
+                            fold::Row::Line(l) => l,
+                            fold::Row::Folded { first, .. } => first,
+                        })
+                        .collect();
+                } else {
+                    self.row_lines.clear();
+                    let highlight = selection
+                        .and_then(|sel| sel.in_view(top, rows, cols))
+                        .map(|(start, end)| Highlight { start, end });
+                    frame.update_view_at(
+                        r.top,
+                        r.left,
+                        term.screen(),
+                        history,
+                        self.back,
+                        focused,
+                        highlight,
+                        pen.palette,
+                        pen.atlas,
+                        pen.raster,
+                    );
+                }
                 if !term.in_alternate_screen() {
                     // Failed commands: `exit N` at the end of the command line.
+                    let view_row = |line: u64| match &folded {
+                        Some(view) => view.iter().position(|&x| x == fold::Row::Line(line)),
+                        None => {
+                            (line >= top && line < top + rows as u64).then(|| (line - top) as usize)
+                        }
+                    };
                     let blocks = shared.blocks.lock().unwrap();
-                    for (line, code) in blocks.failed_in(top..top + rows as u64) {
-                        let row = r.top + (line - top) as usize;
+                    // A live view with folds can start above `top`.
+                    let first = match folded.as_ref().and_then(|v| v.first()) {
+                        Some(&fold::Row::Line(l)) => l,
+                        Some(&fold::Row::Folded { first, .. }) => first,
+                        None => top,
+                    };
+                    for (line, code) in blocks.failed_in(first..live_end) {
+                        let Some(row) = view_row(line) else {
+                            continue;
+                        };
+                        let row = r.top + row;
                         let blank = |c: usize| {
                             frame
                                 .cell(row, r.left + c)
@@ -2414,6 +2545,8 @@ keys:
                     deep: None,
                     hidden: false,
                     find_view: None,
+                    folds: fold::Folds::default(),
+                    row_lines: Vec::new(),
                     restarts: Vec::new(),
                 });
             }
@@ -2439,6 +2572,8 @@ keys:
                 deep: None,
                 hidden: false,
                 find_view: None,
+                folds: fold::Folds::default(),
+                row_lines: Vec::new(),
                 restarts: Vec::new(),
             })
         }
@@ -3178,27 +3313,28 @@ keys:
                         // Ctrl+Shift+O: select the output of the command at
                         // the top of the view (at the live view, the latest
                         // with output), from shell-integration marks.
+                        // Ctrl+Shift+[ / Ctrl+Shift+]: fold that same
+                        // command's output to one line, or unfold (at the
+                        // live view, the latest fold; else the one at the top).
+                        if (vk == 0xDB || vk == 0xDD) && ctrl && shift {
+                            let p = &mut panes[fi];
+                            if vk == 0xDB {
+                                if let Some(lines) = p.command_output() {
+                                    p.folds.fold(lines);
+                                }
+                            } else {
+                                let top = p.seen_scrolled.saturating_sub(p.back as u64);
+                                p.folds.unfold((p.back > 0).then_some(top));
+                            }
+                            p.shared.pending.store(true, Ordering::Release);
+                            drop_char = true;
+                            continue;
+                        }
                         if vk == 0x4F && ctrl && shift {
                             let p = &panes[fi];
                             let top = p.seen_scrolled.saturating_sub(p.back as u64);
-                            let at = if p.back == 0 { u64::MAX } else { top };
-                            let term = p.shared.term.lock().unwrap();
-                            let cols = term.screen().cols();
-                            let mut out = p.shared.blocks.lock().unwrap().output_at(at);
-                            // Not the blank lines a shell leaves before its
-                            // next prompt (cmd prints one after every command).
-                            if let Some(lines) = out.as_mut() {
-                                let blank = |n: u64| {
-                                    Pane::line_chars(&term, n, &HashMap::new())
-                                        .is_some_and(|l| l.iter().all(|(c, _)| *c == ' '))
-                                };
-                                while lines.end > lines.start && blank(lines.end - 1) {
-                                    lines.end -= 1;
-                                }
-                            }
-                            let out = out.filter(|l| !l.is_empty());
-                            drop(term);
-                            if let Some(lines) = out {
+                            let cols = p.shared.term.lock().unwrap().screen().cols();
+                            if let Some(lines) = p.command_output() {
                                 let sel = Selection {
                                     anchor: Point {
                                         line: lines.start,

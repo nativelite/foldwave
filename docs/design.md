@@ -1411,7 +1411,19 @@ measure it.
     / `next_prompt`, across generations) put the prompt at the top of the view
     rebuilt from the log; Ctrl+Up / Ctrl+Down keep stepping there. Lines line
     up approximately, as scrolling back into the log does.
-  - Not yet: folding; exit codes in the view rebuilt from the log.
+  - Folding (2026-09-27; keys and look chosen by the founder): Ctrl+Shift+[
+    folds the command Ctrl+Shift+O would select (at the top of the view, or
+    the latest at the live view) to one dim line, `▸ 1,234 lines folded`;
+    the command line above it keeps its `exit N` (the founder's sketch put
+    the code on the folded line). Ctrl+Shift+] unfolds (the latest at the
+    live view, else the one at the top). Folds are per pane and change only
+    what is drawn ([`fold.rs`](../crates/fwterm/src/fold.rs)): copy and
+    search see every line. At the live view the prompt stays at the bottom
+    and older lines show above a fold; scrolled back, the view keeps its top.
+    Clicks and selections map through the folded rows; a fold a selection
+    reaches is highlighted whole. Not in full-screen programs or the view
+    rebuilt from the log; folds of lines memory no longer holds are dropped.
+  - Not yet: exit codes in the view rebuilt from the log.
 - **Status:** agent session state from transcripts (`agsess`), shown per pane.
 - **Resource accounting per pane:** CPU, memory, disk and GPU share, and the
   job/cgroup limits and compile pool from atrium.
