@@ -1640,6 +1640,14 @@ only.
     panes flooding 1 GiB each, 2400x1300, 3 runs: 115.2–132.6 fps, gap p99
     18–30 ms, against 39.1–43.2 fps and ~35 ms before; in-process the same
     load ran at 116.3 fps.
+  - **The GPU index does not slow frames; the governor does, by design
+    (2026-09-27).** 16 in-process panes flooding 1 GiB each drew ~40 fps
+    with `--gpu-index on` against ~120 off. With `--governor off`, GPU on
+    drew 115.5–121.7 fps (3 runs) against 41.0–45.2 with it on (3 runs).
+    Moving signing to the GPU lowers fwterm's share of a full machine, so the
+    16 `fwbench --emit` writers, which are other programs, pass half of it
+    and the frame cap engages. That is the rule above working, so nothing
+    changed; §8.7a's "frames unchanged" holds.
 - **A RAM budget per pane: deferred, on data.** 16 flooding panes with
   10,000-line histories peak at 119 MiB (compact lines, §8.3). The reference
   machine has 63.8 GB, 48.5 GB of it free. There is nothing to budget yet;
