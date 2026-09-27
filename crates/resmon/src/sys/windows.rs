@@ -128,6 +128,7 @@ extern "system" {
         user: *mut FileTime,
     ) -> Bool;
     fn GetProcessIoCounters(handle: Handle, counters: *mut IoCounters) -> Bool;
+    fn GetExitCodeProcess(handle: Handle, code: *mut u32) -> Bool;
     fn K32GetProcessMemoryInfo(
         handle: Handle,
         counters: *mut ProcessMemoryCountersEx,
@@ -345,6 +346,39 @@ pub fn fixed_volumes() -> Vec<PathBuf> {
             kind == DRIVE_FIXED
         })
         .collect()
+}
+
+/// A process's CPU time and whether it has ended, through a handle of our own.
+pub struct ProcClock(OwnedHandle);
+
+// SAFETY: a process handle may be used and closed from any thread; the clock
+// only queries it.
+unsafe impl Send for ProcClock {}
+
+/// A clock for `child`: opened by its id while `child` is not yet reaped, so
+/// the id cannot name another process.
+pub fn proc_clock(child: &std::process::Child) -> io::Result<ProcClock> {
+    OwnedHandle::open(child.id())
+        .map(ProcClock)
+        .ok_or_else(io::Error::last_os_error)
+}
+
+/// Kernel plus user nanoseconds so far, and whether the process has exited.
+pub fn proc_clock_read(clock: &ProcClock) -> io::Result<(u64, bool)> {
+    const STILL_ACTIVE: u32 = 259;
+    let h = (clock.0).0;
+    let (mut c, mut e, mut k, mut u) = Default::default();
+    // SAFETY: `h` is a live process handle we own; valid out-pointers.
+    if unsafe { GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let _: (FileTime, FileTime) = (c, e);
+    let mut code = 0u32;
+    // SAFETY: as above.
+    if unsafe { GetExitCodeProcess(h, &mut code) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((k.nanos() + u.nanos(), code != STILL_ACTIVE))
 }
 
 /// An owned process handle, closed on drop.

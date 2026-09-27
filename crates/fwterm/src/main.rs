@@ -2097,6 +2097,8 @@ keys:
         fetch: Option<Fetch>,
         waker: Waker,
         activity: Arc<Activity>,
+        /// The pane hosts' CPU time, counted as fwterm's own by the governor.
+        hosts: Arc<Mutex<governor::Family>>,
     }
 
     /// Restarts a crashed host at most this often before its pane closes.
@@ -2143,6 +2145,7 @@ keys:
                 gen,
                 self.logs,
                 self.fetch.as_ref(),
+                &self.hosts,
                 wake,
                 &note,
             ) {
@@ -2234,6 +2237,7 @@ keys:
                     gen,
                     &self.logs,
                     self.fetch.as_ref(),
+                    &self.hosts,
                     wake,
                     "",
                 )?;
@@ -2293,6 +2297,7 @@ keys:
         gen: u64,
         logs: &Logs,
         fetch: Option<&Fetch>,
+        hosts: &Mutex<governor::Family>,
         wake: Wake,
         note: &str,
     ) -> io::Result<Arc<Mutex<Session>>> {
@@ -2324,6 +2329,9 @@ keys:
         cmd.arg("--").args(&args.shell);
         cmd.env("FWTERM_BANNER", format!("{}{note}", logs.banner()));
         let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+        if let Ok(clock) = resmon::cpu::ProcessClock::of(&child) {
+            hosts.lock().unwrap().add(clock);
+        }
         let mut out = child.stdout.take().expect("piped");
         let stdin = child.stdin.take();
         let session = Arc::new(Mutex::new(Session::Host { child, stdin }));
@@ -2509,18 +2517,24 @@ keys:
     const PRESSURE_EVERY: Duration = Duration::from_millis(500);
 
     /// Watch how busy other programs keep the machine; the flag is true while
-    /// it is [`Level::Busy`].
-    fn start_pressure_watch() -> Arc<AtomicBool> {
+    /// it is [`Level::Busy`]. fwterm's own time is the window's plus its pane
+    /// hosts' (`hosts`).
+    fn start_pressure_watch(hosts: Arc<Mutex<governor::Family>>) -> Arc<AtomicBool> {
         let busy = Arc::new(AtomicBool::new(false));
         let flag = busy.clone();
         std::thread::spawn(move || {
-            let Ok(mut before) = resmon::cpu::times() else {
+            let own = || {
+                let mut t = resmon::cpu::times().ok()?;
+                t.process += hosts.lock().unwrap().cpu_ns();
+                Some(t)
+            };
+            let Some(mut before) = own() else {
                 return;
             };
             let mut level = Level::Calm;
             loop {
                 std::thread::sleep(PRESSURE_EVERY);
-                let Ok(now) = resmon::cpu::times() else {
+                let Some(now) = own() else {
                     return;
                 };
                 level = governor::next(level, resmon::cpu::load(&before, &now));
@@ -2737,8 +2751,9 @@ keys:
         if !place.is_empty() {
             let _ = resmon::cpu::place_current_thread(&place);
         }
+        let hosts = Arc::new(Mutex::new(governor::Family::default()));
         let busy = if args.governor {
-            start_pressure_watch()
+            start_pressure_watch(hosts.clone())
         } else {
             Arc::new(AtomicBool::new(false))
         };
@@ -2757,6 +2772,7 @@ keys:
             gpu,
             waker: surface.window().waker(),
             activity: activity.clone(),
+            hosts,
         };
         let ids: Vec<PaneId> = (0..args.panes).collect();
         let mut layout = Layout::grid(&ids);

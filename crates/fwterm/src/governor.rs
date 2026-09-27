@@ -13,7 +13,7 @@
 //!   are drawn at most [`BUSY_FPS`] times a second, except just after input:
 //!   the focused pane's echo is never slowed.
 
-use resmon::cpu::{Cpu, Load};
+use resmon::cpu::{Cpu, Load, ProcessClock};
 use std::time::Duration;
 
 /// Where pane readers and the UI thread run.
@@ -78,6 +78,41 @@ pub fn next(level: Level, load: Load) -> Level {
         Level::Calm if load.machine >= BUSY_MACHINE && others >= BUSY_OTHERS => Level::Busy,
         Level::Busy if load.machine < CALM_MACHINE || others < CALM_OTHERS => Level::Calm,
         l => l,
+    }
+}
+
+/// The CPU time of fwterm's pane hosts (design §8.8a), to count with the
+/// window's as fwterm's own. Their programs are not in it: an agent in a
+/// pane is another program, the pressure the governor is for.
+#[derive(Default)]
+pub struct Family {
+    live: Vec<ProcessClock>,
+    /// CPU time of hosts that have exited.
+    retired: u64,
+}
+
+impl Family {
+    /// Count a host started just now.
+    pub fn add(&mut self, clock: ProcessClock) {
+        self.cpu_ns(); // let go of hosts that have ended
+        self.live.push(clock);
+    }
+
+    /// The hosts' CPU time so far, in nanoseconds.
+    pub fn cpu_ns(&mut self) -> u64 {
+        let (mut live, retired) = (0, &mut self.retired);
+        self.live.retain(|c| match c.read() {
+            Ok(t) if t.exited => {
+                *retired += t.cpu_ns;
+                false
+            }
+            Ok(t) => {
+                live += t.cpu_ns;
+                true
+            }
+            Err(_) => false,
+        });
+        self.retired + live
     }
 }
 
@@ -176,6 +211,28 @@ mod tests {
             Level::Calm,
             "fwterm's own"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_family_counts_its_hosts_time_and_keeps_it_after_they_exit() {
+        let burn = || {
+            std::process::Command::new("cmd")
+                .args(["/c", "for /L %i in (1,1,200000) do @rem"])
+                .spawn()
+                .unwrap()
+        };
+        let (mut a, mut b) = (burn(), burn());
+        let mut family = Family::default();
+        family.add(ProcessClock::of(&a).unwrap());
+        family.add(ProcessClock::of(&b).unwrap());
+        a.wait().unwrap();
+        let one = family.cpu_ns();
+        b.wait().unwrap();
+        let both = family.cpu_ns();
+        assert!(one > 0 && both >= one, "{one} then {both}");
+        assert!(family.live.is_empty(), "exited hosts are let go");
+        assert_eq!(family.cpu_ns(), both, "and their time stays counted");
     }
 
     #[test]

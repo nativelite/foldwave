@@ -91,6 +91,33 @@ pub fn load(before: &Times, after: &Times) -> Load {
     }
 }
 
+/// Another process's CPU time, read on demand through a handle of its own:
+/// for a process that works for this one (a child it started), so its time
+/// can count as this program's.
+pub struct ProcessClock(crate::sys::ProcClock);
+
+/// One reading of a [`ProcessClock`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessTime {
+    /// Kernel plus user time so far, in nanoseconds; final once `exited`.
+    pub cpu_ns: u64,
+    /// The process has ended.
+    pub exited: bool,
+}
+
+impl ProcessClock {
+    /// A clock for `child`, while it is still this process's to query.
+    pub fn of(child: &std::process::Child) -> io::Result<ProcessClock> {
+        crate::sys::proc_clock(child).map(ProcessClock)
+    }
+
+    /// Read it now.
+    pub fn read(&self) -> io::Result<ProcessTime> {
+        let (cpu_ns, exited) = crate::sys::proc_clock_read(&self.0)?;
+        Ok(ProcessTime { cpu_ns, exited })
+    }
+}
+
 /// Let the calling thread run only on `ids` (from [`topology`]); an empty
 /// list lets it run anywhere again.
 pub fn place_current_thread(ids: &[u32]) -> io::Result<()> {
@@ -131,6 +158,27 @@ mod tests {
                 core: 9,
                 efficiency_class: 0
             }
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_process_clock_reads_a_childs_cpu_time_until_and_after_it_exits() {
+        // cmd counting to 300,000 burns a few hundred ms of CPU.
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "for /L %i in (1,1,300000) do @rem"])
+            .spawn()
+            .unwrap();
+        let clock = ProcessClock::of(&child).unwrap();
+        assert!(!clock.read().unwrap().exited, "still running");
+        child.wait().unwrap();
+        let done = clock.read().unwrap();
+        assert!(done.exited);
+        assert!(done.cpu_ns > 0, "it used the CPU");
+        assert_eq!(
+            clock.read().unwrap().cpu_ns,
+            done.cpu_ns,
+            "final once exited"
         );
     }
 

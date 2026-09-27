@@ -1631,6 +1631,15 @@ only.
     flood is parsing, about 0.7 of a core per flooding pane. The levers that
     give CPU back are parsing less (the hidden-pane path, §8.2) and moving work
     to the GPU (§8.7b), not drawing less.
+  - **Pane hosts count as fwterm (fixed 2026-09-27).** "Its own" load was the
+    window process only, so once panes ran in pane hosts by default (§8.8a) a
+    flood in them read as other programs and capped frames at 30 fps. The
+    governor now adds its hosts' CPU time (`resmon::cpu::ProcessClock` on
+    each host, `governor::Family`); their programs still count as others,
+    since an agent in a pane is the pressure the governor is for. 16 isolated
+    panes flooding 1 GiB each, 2400x1300, 3 runs: 115.2–132.6 fps, gap p99
+    18–30 ms, against 39.1–43.2 fps and ~35 ms before; in-process the same
+    load ran at 116.3 fps.
 - **A RAM budget per pane: deferred, on data.** 16 flooding panes with
   10,000-line histories peak at 119 MiB (compact lines, §8.3). The reference
   machine has 63.8 GB, 48.5 GB of it free. There is nothing to budget yet;

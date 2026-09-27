@@ -52,6 +52,19 @@ pub fn place_current_thread(_ids: &[u32]) -> io::Result<()> {
     unsupported()
 }
 
+/// No process clocks on an unsupported platform.
+pub struct ProcClock;
+
+/// Always fails on an unsupported platform.
+pub fn proc_clock(_child: &std::process::Child) -> io::Result<ProcClock> {
+    unsupported()
+}
+
+/// Always fails on an unsupported platform.
+pub fn proc_clock_read(_clock: &ProcClock) -> io::Result<(u64, bool)> {
+    unsupported()
+}
+
 /// No jobs on an unsupported platform.
 pub struct Job;
 
