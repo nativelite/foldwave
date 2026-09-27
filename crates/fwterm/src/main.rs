@@ -2005,6 +2005,44 @@ keys:
         }
     }
 
+    /// Feed `chunk` to a pane's emulator, and make blocks of the
+    /// shell-integration marks `found` in it (stream offsets, the chunk
+    /// starting at `base`): the emulator is fed up to each mark, and the line
+    /// its cursor is on there is where the block boundary goes. Live output
+    /// and a hidden pane's catch-up from its log both come through here.
+    fn feed_marked(
+        term: &mut Emu,
+        shared: &Shared,
+        chunk: &[u8],
+        found: &[ansi::ShellMark],
+        base: u64,
+    ) {
+        if found.is_empty() {
+            term.feed(chunk);
+            return;
+        }
+        let n = chunk.len();
+        let mut blocks = shared.blocks.lock().unwrap();
+        let mut at = 0;
+        for m in found {
+            let upto = ((m.offset.saturating_sub(base) as usize).min(n)).max(at);
+            term.feed(&chunk[at..upto]);
+            at = upto;
+            if !term.in_alternate_screen() {
+                let line = term.scrollback().scrolled_lines() + term.screen().cursor().row as u64;
+                blocks.mark(m.kind, line, m.exit_code);
+                if let Some(out) = &shared.marks_out {
+                    out.lock()
+                        .unwrap()
+                        .push((m.kind.letter(), line, m.exit_code));
+                }
+            }
+        }
+        term.feed(&chunk[at..]);
+        let history = term.scrollback();
+        blocks.forget_before(history.scrolled_lines() - history.history_len() as u64);
+    }
+
     /// Move one output stream into a pane's emulator until it ends. The
     /// session, for answering the console host, is held weakly: a closed
     /// pane's session must drop, which closes the pseudoconsole and so ends
@@ -2082,32 +2120,8 @@ keys:
                     scanner.feed(&buf[..n], &mut found);
                     let at_in_chunk =
                         |m: &ansi::ShellMark| (m.offset.saturating_sub(base) as usize).min(n);
-                    if parse && !found.is_empty() {
-                        // Feed up to each mark and note the line the cursor is
-                        // on there: that is where the block boundary goes.
-                        let mut blocks = shared.blocks.lock().unwrap();
-                        let mut at = 0;
-                        for m in &found {
-                            let upto = at_in_chunk(m).max(at);
-                            term.feed(&buf[at..upto]);
-                            at = upto;
-                            if !term.in_alternate_screen() {
-                                let line = term.scrollback().scrolled_lines()
-                                    + term.screen().cursor().row as u64;
-                                blocks.mark(m.kind, line, m.exit_code);
-                                if let Some(out) = &shared.marks_out {
-                                    out.lock()
-                                        .unwrap()
-                                        .push((m.kind.letter(), line, m.exit_code));
-                                }
-                            }
-                        }
-                        term.feed(&buf[at..n]);
-                        let history = term.scrollback();
-                        blocks
-                            .forget_before(history.scrolled_lines() - history.history_len() as u64);
-                    } else if parse {
-                        term.feed(&buf[..n]);
+                    if parse {
+                        feed_marked(&mut term, &shared, &buf[..n], &found, base);
                     }
                     if let Some(log) = &log {
                         let chunk_at = shared.gen_bytes.load(Ordering::Acquire);
@@ -2720,6 +2734,15 @@ keys:
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no log generation"))
         };
         let mut buf = vec![0u8; CATCH_UP_CHUNK];
+        // The commands run while hidden become blocks as they are replayed.
+        let mut scanner = ansi::MarkScanner::new();
+        let mut found = Vec::new();
+        let mut feed = |term: &mut Emu, bytes: &[u8]| {
+            let base = scanner.position();
+            found.clear();
+            scanner.feed(bytes, &mut found);
+            feed_marked(term, shared, bytes, &found, base);
+        };
         loop {
             flush_logger(tx)?;
             let reader = panelog::Reader::open(&current()?)?;
@@ -2731,7 +2754,7 @@ keys:
                 if n == 0 {
                     break;
                 }
-                shared.term.lock().unwrap().feed(&buf[..n]);
+                feed(&mut shared.term.lock().unwrap(), &buf[..n]);
                 at += n as u64;
                 shared.paused_at.store(at, Ordering::Release);
                 shared.pending.store(true, Ordering::Release);
@@ -2752,7 +2775,7 @@ keys:
                 if n == 0 {
                     break;
                 }
-                term.feed(&buf[..n]);
+                feed(&mut term, &buf[..n]);
                 at += n as u64;
             }
             shared.paused_at.store(at, Ordering::Release);
@@ -3698,6 +3721,48 @@ keys:
             assert!(parse(&argv(&["--host-signs", "cpu"])).is_err());
         }
 
+        /// A pane's shared state, paused (hidden and shed) or live.
+        fn test_shared(parsing: bool) -> Arc<Shared> {
+            Arc::new(Shared {
+                term: Mutex::new(Emu::Local(Term::with_history(6, 100, 50))),
+                pending: AtomicBool::new(false),
+                exited: AtomicBool::new(false),
+                blocks: Mutex::new(blocks::Blocks::default()),
+                marks_out: None,
+                history_reply: Mutex::new(None),
+                host_died: AtomicBool::new(false),
+                since_checkpoint: AtomicU64::new(0),
+                gen_bytes: AtomicU64::new(0),
+                parsing: AtomicBool::new(parsing),
+                paused_at: AtomicU64::new(0),
+                catching_up: AtomicBool::new(false),
+                want: AtomicBool::new(false),
+            })
+        }
+
+        #[test]
+        fn commands_run_while_hidden_become_blocks_on_catch_up() {
+            let root = std::env::temp_dir().join("fwterm-hidden-marks");
+            let _ = std::fs::remove_dir_all(&root);
+            let tx = start_logger(root.clone(), 0, SignBy::Itself, Default::default()).unwrap();
+            // Two commands while hidden; the second fails (as PowerShell marks it).
+            let out = b"\x1b]133;A\x07> \x1b]133;B\x07ok\r\nfine\r\n\x1b]133;D;0\x07\
+                        \x1b]133;A\x07> \x1b]133;B\x07bad\r\noops\r\n\x1b]133;D;3\x07\
+                        \x1b]133;A\x07> ";
+            tx.send(LogMsg::Data(out.to_vec(), 1)).unwrap();
+            let shared = test_shared(false);
+            shared.gen_bytes.store(out.len() as u64, Ordering::Release);
+            let wake: Wake = Arc::new(|| {});
+            catch_up(&shared, &tx, &root, &wake).unwrap();
+            assert!(shared.parsing.load(Ordering::Acquire), "live again");
+            let blocks = shared.blocks.lock().unwrap();
+            assert_eq!(blocks.len(), 3, "every prompt replayed became a block");
+            assert_eq!(blocks.failed_in(0..100).collect::<Vec<_>>(), [(2, 3)]);
+            drop(blocks);
+            drop(tx);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
         #[test]
         fn a_pane_whose_log_stops_says_so_once_and_goes_live() {
             let root = std::env::temp_dir().join("fwterm-log-stops");
@@ -3711,21 +3776,7 @@ keys:
                 health: health.clone(),
             };
             // A hidden, shed pane: its emulator waits on the log.
-            let shared = Arc::new(Shared {
-                term: Mutex::new(Emu::Local(Term::with_history(6, 100, 50))),
-                pending: AtomicBool::new(false),
-                exited: AtomicBool::new(false),
-                blocks: Mutex::new(blocks::Blocks::default()),
-                marks_out: None,
-                history_reply: Mutex::new(None),
-                host_died: AtomicBool::new(false),
-                since_checkpoint: AtomicU64::new(0),
-                gen_bytes: AtomicU64::new(0),
-                parsing: AtomicBool::new(false),
-                paused_at: AtomicU64::new(0),
-                catching_up: AtomicBool::new(false),
-                want: AtomicBool::new(false),
-            });
+            let shared = test_shared(false);
             let activity = Arc::new(Activity {
                 epoch: Instant::now(),
                 first_output: AtomicU64::new(u64::MAX),

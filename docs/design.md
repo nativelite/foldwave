@@ -1402,10 +1402,12 @@ measure it.
     covers output, and not in full-screen programs. Successful commands show
     nothing. cmd sends no exit codes, so its panes show none; PowerShell and
     shells that send `133;D;<code>` do.
-  - Not yet: folding; marks from a pane while it is hidden and shed (its
-    emulator is paused, so there are no lines to attach them to; the log still
-    has them); jumping into history that only the log holds; exit codes in the
-    view rebuilt from the log.
+  - Commands run while a pane is hidden and shed become blocks when it is
+    shown (2026-09-27): catch-up scans the output it replays from the log for
+    marks and makes blocks of them as the live reader does (`feed_marked`),
+    so Ctrl+Up, Ctrl+Shift+O and exit codes cover them.
+  - Not yet: folding; jumping into history that only the log holds; exit
+    codes in the view rebuilt from the log.
 - **Status:** agent session state from transcripts (`agsess`), shown per pane.
 - **Resource accounting per pane:** CPU, memory, disk and GPU share, and the
   job/cgroup limits and compile pool from atrium.
