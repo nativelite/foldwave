@@ -1652,6 +1652,12 @@ only.
   10,000-line histories peak at 119 MiB (compact lines, §8.3). The reference
   machine has 63.8 GB, 48.5 GB of it free. There is nothing to budget yet;
   history size stays fixed per pane.
+  - **Kept deferred (founder, 2026-09-27).** The design already bounds memory
+    without a budget: history is fixed per pane, older output lives in the
+    log on disk, and a hidden pane stops parsing (below), so its in-memory
+    history stops growing while it is not needed. Hiding does not free what a
+    pane already holds; that is not measured. Revisit when a real session
+    (E3) shows memory pressure.
 - **Hidden panes shed their parsing (built 2026-09-24).** Zoom
   (Ctrl+Shift+Z, `--zoom`) shows one pane and hides the rest; a hidden pane
   keeps its size, program and emulator. §8.2 says a hidden pane keeps no live
