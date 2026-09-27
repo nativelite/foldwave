@@ -159,18 +159,18 @@ mod tests {
 
     #[test]
     fn the_exit_label_sits_right_on_blank_cells_only() {
-        let row = |text: &str, cols: usize| {
+        let row = |text: &str| {
             let chars: Vec<char> = text.chars().collect();
             move |c: usize| chars.get(c).map_or(true, |&ch| ch == ' ')
         };
         // "C:\> type nofile" on a 30-column row: "exit 1" in cols 23..29.
         assert_eq!(
-            exit_label(1, 30, row("C:\\> type nofile", 30)),
+            exit_label(1, 30, row("C:\\> type nofile")),
             Some((23, "exit 1".into()))
         );
         // A command reaching into the label's cells: no label.
-        assert_eq!(exit_label(1, 30, row(&"x".repeat(23), 30)), None);
-        assert_eq!(exit_label(-1073741819, 12, row("", 12)), None, "too narrow");
+        assert_eq!(exit_label(1, 30, row(&"x".repeat(23))), None);
+        assert_eq!(exit_label(-1073741819, 12, row("")), None, "too narrow");
     }
 
     /// cmd with fwterm's prompt: `D A <prompt> B`, the user's command on the

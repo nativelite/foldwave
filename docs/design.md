@@ -1396,10 +1396,16 @@ measure it.
     lines a shell leaves before its next prompt. Checked in a window: after a
     40-line command and a one-line command, Ctrl+Shift+O copied exactly
     `second`; two Ctrl+Up then Ctrl+Shift+O copied exactly `out 1`..`out 40`.
+  - Exit codes (2026-09-27; how they look is a proposal, not a founder
+    decision): a failed command (nonzero code) shows a red `exit N` at the
+    right end of its command line, drawn only over blank cells so it never
+    covers output, and not in full-screen programs. Successful commands show
+    nothing. cmd sends no exit codes, so its panes show none; PowerShell and
+    shells that send `133;D;<code>` do.
   - Not yet: folding; marks from a pane while it is hidden and shed (its
     emulator is paused, so there are no lines to attach them to; the log still
-    has them); jumping into history that only the log holds; showing exit
-    codes.
+    has them); jumping into history that only the log holds; exit codes in the
+    view rebuilt from the log.
 - **Status:** agent session state from transcripts (`agsess`), shown per pane.
 - **Resource accounting per pane:** CPU, memory, disk and GPU share, and the
   job/cgroup limits and compile pool from atrium.
