@@ -172,6 +172,10 @@ options:
   --gpu-index G on (default): build the logs' search signatures on the GPU
                 (NVIDIA, through its driver), off the loggers' threads; off:
                 on each pane's logger thread. Without CUDA it is off
+  --host-signs S  who builds a pane host's search signatures: self (default:
+                its own logger thread) or gpu (the window's GPU indexer,
+                which reads each block back from the log; measured about
+                9 % more CPU in total)
   --governor G  on (default): while other programs keep the CPU nearly
                 full, draw at most 30 frames a second except just after
                 input; off: always draw at the display's rate
@@ -215,6 +219,9 @@ keys:
         place: Place,
         governor: bool,
         gpu_index: bool,
+        /// The window's GPU indexer signs pane hosts' logs too; otherwise
+        /// each host signs its own (cheaper, design §8.8a).
+        host_signs_gpu: bool,
         shell_integration: bool,
         /// Run as a pane host (`app::host`), for a window started with
         /// `--isolate`: its screen size, log folder, generation size, pane id.
@@ -253,6 +260,7 @@ keys:
             place: Place::Off,
             governor: true,
             gpu_index: true,
+            host_signs_gpu: false,
             shell_integration: true,
             pane_host: false,
             isolate: true,
@@ -395,6 +403,14 @@ keys:
                         "on" => true,
                         "off" => false,
                         _ => return Err(format!("bad --gpu-index {v:?}")),
+                    };
+                }
+                "--host-signs" => {
+                    let v = value(&mut i, "--host-signs")?;
+                    a.host_signs_gpu = match v.as_str() {
+                        "self" => false,
+                        "gpu" => true,
+                        _ => return Err(format!("bad --host-signs {v:?}")),
                     };
                 }
                 "--governor" => {
@@ -2736,6 +2752,7 @@ keys:
             place: place.clone(),
             fetch: gpu
                 .as_ref()
+                .filter(|_| args.host_signs_gpu)
                 .map(|g| g.fetcher(|r: &SigReply, g, b, sig| r(g, b, sig))),
             gpu,
             waker: surface.window().waker(),
@@ -3544,6 +3561,19 @@ keys:
                 (h.host_id, h.shell.as_slice()),
                 (3, &["cmd".to_string()][..])
             );
+            // Hosts sign their own logs unless the window is told to.
+            assert!(!parse(&argv(&[])).unwrap().host_signs_gpu);
+            assert!(
+                !parse(&argv(&["--host-signs", "self"]))
+                    .unwrap()
+                    .host_signs_gpu
+            );
+            assert!(
+                parse(&argv(&["--host-signs", "gpu"]))
+                    .unwrap()
+                    .host_signs_gpu
+            );
+            assert!(parse(&argv(&["--host-signs", "cpu"])).is_err());
         }
 
         #[test]
