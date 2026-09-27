@@ -1570,6 +1570,46 @@ Output: a table saying what share of a pinned CPU foldwave is responsible for,
 and which stage is worth moving. Until E3 runs, the *measure* rows above stay
 proposals.
 
+**E3 first run (2026-09-27): the terminal is ~0.5 % of a real session.**
+An atrium fleet of 8 Claude Code agents (sonnet, automode), each in a
+throwaway worktree of a nativelite package (panelog, vterm, ansi, pty, glyphs,
+uwidth, json, otp), ran its package's `python dev.py check`, checked the README
+against the source and wrote notes (all 8 checks passed; ~5 min each run).
+Run A: fwterm (defaults: pane host, logs) hosts `atrium fleet up`. Run B: a
+Windows Terminal window hosts it. CPU is each process's growth over the run,
+sampled every 5 s; machine busy from `GetSystemTimes`; 16 logical CPUs.
+
+| | A: in fwterm | B: in Windows Terminal |
+| --- | --- | --- |
+| wall, machine busy | 309 s, 2,590 CPU-s (52 %) | 324 s, 2,483 CPU-s (48 %) |
+| agents (claude + node) | 290 CPU-s (11.2 %) | 274 (11.0 %) |
+| atrium (draws the 8 panes) | 60 (2.3 %) | 56 (2.3 %) |
+| **outer terminal** | **fwterm 14.7 (0.6 %): window 9.0, pane host 5.7** | **Windows Terminal 13.5 (0.5 %)** |
+| shells, console hosts | 57, 28 | 50, 50 |
+| Microsoft Defender (`MsMpEng`) | not separated (see below) | 355 (14.3 %) |
+| short-lived processes between samples (builds, one-shot tools) | not separated | ~1,054 (~42 %) |
+
+- fwterm costs what Windows Terminal costs for this session, about 0.05 of a
+  core, and 5.5 % of what the agents themselves use. Its frames followed
+  atrium's output: 5,729 frames over 290 s. The GPU indexer signed nothing:
+  the pane host signs its own log (§8.8a), and the log grew by well under
+  1 MiB/s.
+- So in a real agentic session no foldwave stage is worth moving for CPU: the
+  whole terminal is ~0.5 % of the busy machine. The §8.7b *measure* rows
+  matter under floods (§4 throughput), not here, and E3's per-stage split
+  inside fwterm is moot at this share; it is not measured.
+- What does load the machine: builds and one-shot tools (~42 %, mostly
+  between samples), Defender scanning the worktrees and build output (~14 %),
+  the agents (~11 %), background services (`svchost`, a vendor
+  `GameManagerService3` at 138 CPU-s, `PresentMonService` at 68).
+- atrium's own drawing is ~4× the outer terminal's; that is atrium's cost,
+  relevant when it adopts the engine crates (M2).
+- Limits: one run each, on the founder's machine with its services running;
+  the recorder's own WMI polling shows as `WmiPrvSE` (~42 CPU-s in B). Run A's
+  "other" row was spoiled by the idle process (pid 0), which the recorder then
+  excluded, so A's Defender and short-lived rows are not separated; the rows
+  shown for A are unaffected.
+
 ### 8.8 The resource governor
 **CPU pressure is the first input, not one of many.** On an agentic machine the
 agents have already taken the CPU (§8.7b, measured). The governor's primary job
