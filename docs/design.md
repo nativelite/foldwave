@@ -1406,8 +1406,12 @@ measure it.
     shown (2026-09-27): catch-up scans the output it replays from the log for
     marks and makes blocks of them as the live reader does (`feed_marked`),
     so Ctrl+Up, Ctrl+Shift+O and exit codes cover them.
-  - Not yet: folding; jumping into history that only the log holds; exit
-    codes in the view rebuilt from the log.
+  - Ctrl+Up past the oldest prompt memory holds continues in the logs
+    (2026-09-27): the prompt marks each generation keeps (`Deep::prev_prompt`
+    / `next_prompt`, across generations) put the prompt at the top of the view
+    rebuilt from the log; Ctrl+Up / Ctrl+Down keep stepping there. Lines line
+    up approximately, as scrolling back into the log does.
+  - Not yet: folding; exit codes in the view rebuilt from the log.
 - **Status:** agent session state from transcripts (`agsess`), shown per pane.
 - **Resource accounting per pane:** CPU, memory, disk and GPU share, and the
   job/cgroup limits and compile pool from atrium.

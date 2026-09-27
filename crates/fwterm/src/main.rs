@@ -1454,6 +1454,48 @@ keys:
             })
         }
 
+        /// The last prompt (a shell's `A` mark) on a line before `line`, in
+        /// the logs' line numbers.
+        fn prev_prompt(&self, line: u64) -> Option<u64> {
+            for (reader, start) in self.gens.iter().rev() {
+                if *start >= line {
+                    continue;
+                }
+                let local = line - start;
+                let before = if local >= reader.line_count() {
+                    reader.len()
+                } else {
+                    reader.line_start(local).ok()?
+                };
+                if before == 0 {
+                    continue;
+                }
+                if let Ok(Some(m)) = reader.last_mark_before(before - 1, |m| m.kind == b'A') {
+                    return reader.line_of(m.offset).ok().map(|l| start + l);
+                }
+            }
+            None
+        }
+
+        /// The first prompt on a line after `line`, in the logs' line numbers.
+        fn next_prompt(&self, line: u64) -> Option<u64> {
+            for (reader, start) in &self.gens {
+                if start + reader.line_count() <= line + 1 {
+                    continue;
+                }
+                let from = if line < *start {
+                    0
+                } else {
+                    reader.line_start(line - start + 1).ok()?
+                };
+                let marks = reader.marks_in(from..reader.len()).ok()?;
+                if let Some(m) = marks.iter().find(|m| m.kind == b'A') {
+                    return reader.line_of(m.offset).ok().map(|l| start + l);
+                }
+            }
+            None
+        }
+
         /// Rebuild the screen as it was when the logs reached line `end`:
         /// restore the nearest checkpoint before it in its generation, replay
         /// the rest.
@@ -3200,16 +3242,48 @@ keys:
                             // Ctrl+Up / Ctrl+Down: the previous / next prompt
                             // at the top of the view.
                             0x26 | 0x28 if ctrl && !shift => {
-                                let top = pane.seen_scrolled.saturating_sub(pane.back as u64);
-                                let blocks = pane.shared.blocks.lock().unwrap();
-                                let to = if vk == 0x26 {
-                                    blocks.prev_prompt(top)
-                                } else {
-                                    blocks.next_prompt(top)
-                                };
-                                drop(blocks);
+                                let up = vk == 0x26;
+                                let held =
+                                    pane.shared.term.lock().unwrap().scrollback().history_len();
+                                let in_log = pane.deep.is_some() && pane.back > held;
+                                let to = (!in_log)
+                                    .then(|| {
+                                        let top =
+                                            pane.seen_scrolled.saturating_sub(pane.back as u64);
+                                        let blocks = pane.shared.blocks.lock().unwrap();
+                                        if up {
+                                            blocks.prev_prompt(top)
+                                        } else {
+                                            blocks.next_prompt(top)
+                                        }
+                                    })
+                                    .flatten();
                                 if let Some(line) = to {
                                     pane.back = pane.seen_scrolled.saturating_sub(line) as usize;
+                                } else if in_log || up {
+                                    // Past what memory holds: the prompts the
+                                    // logs keep, shown in the view rebuilt
+                                    // from them (lines line up approximately,
+                                    // as scrolling back does).
+                                    if !in_log {
+                                        pane.deep = pane
+                                            .pane_dir
+                                            .as_deref()
+                                            .and_then(|f| Deep::open(f).ok());
+                                    }
+                                    if let Some(d) = pane.deep.as_ref() {
+                                        let rows = pane.rect.rows as u64;
+                                        let top = d.total.saturating_sub(pane.back as u64 + rows);
+                                        let to = if up {
+                                            d.prev_prompt(top)
+                                        } else {
+                                            d.next_prompt(top)
+                                        };
+                                        if let Some(line) = to {
+                                            let back = d.total.saturating_sub(line + rows);
+                                            pane.back = (back as usize).max(held + 1);
+                                        }
+                                    }
                                 }
                             }
                             0x21 if shift => pane.back += page,
@@ -3738,6 +3812,42 @@ keys:
                 catching_up: AtomicBool::new(false),
                 want: AtomicBool::new(false),
             })
+        }
+
+        #[test]
+        fn prompts_are_found_in_the_logs_across_generations() {
+            let root = std::env::temp_dir().join("fwterm-log-prompts");
+            let _ = std::fs::remove_dir_all(&root);
+            let tx = start_logger(root.clone(), 0, SignBy::Itself, Default::default()).unwrap();
+            let prompt = |offset| {
+                LogMsg::Mark(panelog::Mark {
+                    offset,
+                    kind: b'A',
+                    value: -1,
+                    time_ns: 1,
+                })
+            };
+            // Generation 0: prompts on lines 0 and 2. Generation 1 begins on
+            // the line generation 0 ends in (3), with a prompt there.
+            tx.send(LogMsg::Data(b"p0\r\nout\r\np1\r\n".to_vec(), 1))
+                .unwrap();
+            tx.send(prompt(0)).unwrap();
+            tx.send(prompt(9)).unwrap();
+            tx.send(LogMsg::Roll(Vec::new())).unwrap();
+            tx.send(LogMsg::Data(b"q0\r\nmore\r\n".to_vec(), 1))
+                .unwrap();
+            tx.send(prompt(0)).unwrap();
+            flush_logger(&tx).unwrap();
+            let d = Deep::open(&root).unwrap();
+            assert_eq!(d.prev_prompt(d.total), Some(3));
+            assert_eq!(d.prev_prompt(3), Some(2));
+            assert_eq!(d.prev_prompt(2), Some(0));
+            assert_eq!(d.prev_prompt(0), None);
+            assert_eq!(d.next_prompt(0), Some(2));
+            assert_eq!(d.next_prompt(2), Some(3));
+            assert_eq!(d.next_prompt(3), None);
+            drop((d, tx));
+            let _ = std::fs::remove_dir_all(&root);
         }
 
         #[test]
