@@ -656,6 +656,43 @@ keys:
         Flush(std::sync::mpsc::Sender<()>),
         /// A shell-integration mark, at its offset in the current generation.
         Mark(panelog::Mark),
+        /// Fail as a disk error would (tests).
+        #[cfg(test)]
+        Fail(String),
+    }
+
+    /// Why a pane's logger stopped, once it has; and whether the pane has
+    /// said so yet (both of a pipe-lane pane's readers see it).
+    #[derive(Default)]
+    struct LogHealth {
+        error: Mutex<Option<String>>,
+        told: AtomicBool,
+    }
+
+    impl LogHealth {
+        fn fail(&self, what: &str, e: impl std::fmt::Display) {
+            self.error
+                .lock()
+                .unwrap()
+                .get_or_insert(format!("{what}: {e}"));
+        }
+
+        fn failed(&self) -> bool {
+            self.error.lock().unwrap().is_some()
+        }
+    }
+
+    /// What a pane shows when its log stops mid-session.
+    fn log_stopped_note(error: &str, was_paused: bool) -> String {
+        let hidden = if was_paused {
+            " Output while it was hidden may be missing from the screen."
+        } else {
+            ""
+        };
+        format!(
+            "\r\n{RED}[fwterm: this pane's log stopped ({error}). New output is kept \
+             in memory only; earlier output stays searchable.{hidden}]{RESET}\r\n"
+        )
     }
 
     /// How soon after output stops the logger flushes it.
@@ -814,7 +851,15 @@ keys:
     const RETIRE_FOR: Duration = Duration::from_secs(2);
     const BLOCK_BYTES: u64 = panelog::SIG_BLOCK;
 
-    fn start_logger(pane_dir: PathBuf, id: PaneId, sign: SignBy) -> io::Result<SyncSender<LogMsg>> {
+    /// The logger stops at the first write, flush or roll-over that fails,
+    /// and says why in `health`: output it cannot keep must not vanish
+    /// silently.
+    fn start_logger(
+        pane_dir: PathBuf,
+        id: PaneId,
+        sign: SignBy,
+        health: Arc<LogHealth>,
+    ) -> io::Result<SyncSender<LogMsg>> {
         let cfg = panelog::Config {
             pane: u64::from(std::process::id()) << 16 | id as u64,
             ..panelog::Config::default()
@@ -896,8 +941,8 @@ keys:
                 }
                 match msg {
                     Ok(LogMsg::Data(bytes, t)) => {
-                        if writer.append(&bytes, t).is_err() {
-                            return;
+                        if let Err(e) = writer.append(&bytes, t) {
+                            return health.fail("writing", e);
                         }
                         if let Some(s) = signing.as_mut() {
                             s.appended(&bytes, generation, &mut writer);
@@ -913,13 +958,15 @@ keys:
                         dirty = true;
                     }
                     Ok(LogMsg::Roll(blob)) => {
-                        let _ = writer.flush();
+                        if let Err(e) = writer.flush() {
+                            return health.fail("writing", e);
+                        }
                         if let Some(s) = signing.as_mut() {
                             s.announce(generation, &name, &writer);
                         }
                         let (next, next_name) = match open(generation + 1) {
                             Ok(w) => w,
-                            Err(_) => return,
+                            Err(e) => return health.fail("starting a new log generation", e),
                         };
                         name = next_name;
                         let old = std::mem::replace(&mut writer, next);
@@ -942,13 +989,21 @@ keys:
                         dirty = true;
                     }
                     Ok(LogMsg::Flush(done)) => {
-                        let _ = writer.flush();
+                        // Not answered on failure: the one waiting sees the
+                        // logger gone.
+                        if let Err(e) = writer.flush() {
+                            return health.fail("writing", e);
+                        }
                         dirty = false;
                         let _ = done.send(());
                     }
+                    #[cfg(test)]
+                    Ok(LogMsg::Fail(e)) => return health.fail("writing", e),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                         if dirty {
-                            let _ = writer.flush();
+                            if let Err(e) = writer.flush() {
+                                return health.fail("writing", e);
+                            }
                             dirty = false;
                         }
                     }
@@ -983,6 +1038,8 @@ keys:
         gen_limit: Arc<AtomicU64>,
         /// Wakes retention: a generation just filled.
         nudge: SyncSender<()>,
+        /// Set when the logger stops on an error.
+        health: Arc<LogHealth>,
     }
 
     /// The volume and the budget, as retention last measured them.
@@ -1932,6 +1989,7 @@ keys:
         place: Arc<Vec<u32>>,
     ) {
         std::thread::spawn(move || {
+            let mut log = log;
             if !place.is_empty() {
                 let _ = resmon::cpu::place_current_thread(&place);
             }
@@ -1968,8 +2026,21 @@ keys:
                     // The log gets the bytes before the emulator does (design
                     // §8.1), so a parser failure cannot lose them; both see
                     // the same order, under the pane lock.
-                    if let Some(log) = &log {
-                        let _ = log.tx.send(LogMsg::Data(buf[..n].to_vec(), now));
+                    let stopped = log.as_ref().is_some_and(|l| {
+                        let sent = l.tx.send(LogMsg::Data(buf[..n].to_vec(), now)).is_ok();
+                        !sent || l.health.failed()
+                    });
+                    if stopped {
+                        // The log is gone: say so once, and keep the screen
+                        // live, since a paused pane can no longer catch up.
+                        let health = log.take().expect("stopped implies a log").health;
+                        if !health.told.swap(true, Ordering::AcqRel) {
+                            let error = health.error.lock().unwrap().clone();
+                            let error = error.unwrap_or_else(|| "the logger stopped".into());
+                            let paused = !shared.parsing.load(Ordering::Acquire);
+                            term.feed(log_stopped_note(&error, paused).as_bytes());
+                        }
+                        shared.parsing.store(true, Ordering::Release);
                     }
                     // A shed pane's emulator waits; the log has the bytes.
                     let parse = log.is_none() || shared.parsing.load(Ordering::Acquire);
@@ -2194,12 +2265,14 @@ keys:
                 Some(store) => {
                     let dir = store.session.pane_dir(id);
                     let sign = self.gpu.clone().map_or(SignBy::Itself, SignBy::Gpu);
-                    match start_logger(dir.clone(), id, sign) {
+                    let health = Arc::new(LogHealth::default());
+                    match start_logger(dir.clone(), id, sign, health.clone()) {
                         Ok(tx) => (
                             Some(LogLink {
                                 tx,
                                 gen_limit: store.gen_limit.clone(),
                                 nudge: store.nudge.clone(),
+                                health,
                             }),
                             Some(dir),
                         ),
@@ -3332,7 +3405,8 @@ keys:
                     }
                     continue;
                 }
-                let keep = governor::keep_parsing(p.hidden, p.log.is_some(), args.hidden, level);
+                let logged = p.log.as_ref().is_some_and(|l| !l.health.failed());
+                let keep = governor::keep_parsing(p.hidden, logged, args.hidden, level);
                 let parsing = p.shared.parsing.load(Ordering::Acquire);
                 if !keep && parsing && !p.shared.catching_up.load(Ordering::Acquire) {
                     p.pause();
@@ -3593,6 +3667,95 @@ keys:
         }
 
         #[test]
+        fn a_pane_whose_log_stops_says_so_once_and_goes_live() {
+            let root = std::env::temp_dir().join("fwterm-log-stops");
+            let _ = std::fs::remove_dir_all(&root);
+            let health = Arc::new(LogHealth::default());
+            let tx = start_logger(root.clone(), 0, SignBy::Itself, health.clone()).unwrap();
+            let log = LogLink {
+                tx: tx.clone(),
+                gen_limit: Arc::new(AtomicU64::new(u64::MAX)),
+                nudge: std::sync::mpsc::sync_channel(1).0,
+                health: health.clone(),
+            };
+            // A hidden, shed pane: its emulator waits on the log.
+            let shared = Arc::new(Shared {
+                term: Mutex::new(Emu::Local(Term::with_history(6, 100, 50))),
+                pending: AtomicBool::new(false),
+                exited: AtomicBool::new(false),
+                blocks: Mutex::new(blocks::Blocks::default()),
+                marks_out: None,
+                history_reply: Mutex::new(None),
+                host_died: AtomicBool::new(false),
+                since_checkpoint: AtomicU64::new(0),
+                gen_bytes: AtomicU64::new(0),
+                parsing: AtomicBool::new(false),
+                paused_at: AtomicU64::new(0),
+                catching_up: AtomicBool::new(false),
+                want: AtomicBool::new(false),
+            });
+            let activity = Arc::new(Activity {
+                epoch: Instant::now(),
+                first_output: AtomicU64::new(u64::MAX),
+                last_output: AtomicU64::new(0),
+            });
+            let (chunks, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+            let source = Box::new(move |b: &mut [u8]| match rx.recv() {
+                Ok(c) => {
+                    b[..c.len()].copy_from_slice(&c);
+                    Ok(c.len())
+                }
+                Err(_) => Ok(0),
+            });
+            let wake: Wake = Arc::new(|| {});
+            pump(
+                source,
+                None,
+                true,
+                shared.clone(),
+                activity,
+                wake,
+                Some(log),
+                Arc::new(Vec::new()),
+            );
+            let text = |shared: &Shared| -> String {
+                let term = shared.term.lock().unwrap();
+                let s = term.screen();
+                (0..s.rows())
+                    .map(|r| (0..s.cols()).map(|c| s.cell(r, c).ch).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let settle = |cond: &dyn Fn() -> bool| {
+                let until = Instant::now() + Duration::from_secs(5);
+                while !cond() {
+                    assert!(Instant::now() < until, "timed out");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            };
+            chunks.send(b"one\r\n".to_vec()).unwrap();
+            settle(&|| shared.gen_bytes.load(Ordering::Acquire) == 5);
+            assert!(!text(&shared).contains("one"), "paused: only logged");
+            // The disk fails.
+            tx.send(LogMsg::Fail("disk full".into())).unwrap();
+            settle(&|| health.failed());
+            chunks.send(b"two\r\n".to_vec()).unwrap();
+            chunks.send(b"three\r\n".to_vec()).unwrap();
+            drop(chunks);
+            settle(&|| text(&shared).contains("three"));
+            let t = text(&shared);
+            assert_eq!(
+                t.matches("log stopped (writing: disk full)").count(),
+                1,
+                "{t}"
+            );
+            assert!(t.contains("while it was hidden"), "{t}");
+            assert!(t.contains("two"), "live again: {t}");
+            assert!(shared.parsing.load(Ordering::Acquire));
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
         fn a_host_logger_announces_durable_blocks_and_stores_the_window_signatures() {
             let root = std::env::temp_dir().join("fwterm-window-signs");
             let _ = std::fs::remove_dir_all(&root);
@@ -3602,9 +3765,15 @@ keys:
             let announce: Announce = Box::new(move |g, dir: &str, b| {
                 let _ = ann_tx.send((g, dir.to_string(), b));
             });
-            let window =
-                start_logger(remote.clone(), 0, SignBy::Window { announce, sigs }).unwrap();
-            let itself = start_logger(inline.clone(), 0, SignBy::Itself).unwrap();
+            let window = start_logger(
+                remote.clone(),
+                0,
+                SignBy::Window { announce, sigs },
+                Default::default(),
+            )
+            .unwrap();
+            let itself =
+                start_logger(inline.clone(), 0, SignBy::Itself, Default::default()).unwrap();
             let block = BLOCK_BYTES as usize;
             let data: Vec<u8> = (0..3 * block + 500)
                 .map(|i| b"cargo: warning unused \r\n"[i % 24])

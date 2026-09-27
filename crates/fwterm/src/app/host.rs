@@ -74,11 +74,15 @@ pub fn run(args: &Args) -> io::Result<i32> {
         (SignBy::Itself, None)
     };
     let log = match &args.host_log {
-        Some(dir) => Some(LogLink {
-            tx: start_logger(PathBuf::from(dir), args.host_id, sign)?,
-            gen_limit: Arc::new(AtomicU64::new(args.host_gen)),
-            nudge: std::sync::mpsc::sync_channel(1).0,
-        }),
+        Some(dir) => {
+            let health = Arc::new(LogHealth::default());
+            Some(LogLink {
+                tx: start_logger(PathBuf::from(dir), args.host_id, sign, health.clone())?,
+                gen_limit: Arc::new(AtomicU64::new(args.host_gen)),
+                nudge: std::sync::mpsc::sync_channel(1).0,
+                health,
+            })
+        }
         None => None,
     };
     // Output wakes the update loop.
