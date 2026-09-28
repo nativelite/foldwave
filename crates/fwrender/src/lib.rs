@@ -29,6 +29,8 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 mod atlas;
+mod boxdraw;
+mod boxdraw_table;
 mod catalog;
 mod cpu;
 mod font;

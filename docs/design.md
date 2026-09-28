@@ -1135,6 +1135,18 @@ M4, [`logstore.rs`](../crates/fwterm/src/logstore.rs)).**
     share the 9 px `m`. The remaining difference from GDI is weight and
     placement, not blur. Full TrueType hinting (running the fonts' own
     programs) is not needed on this evidence.
+  - **Box drawing in code (2026-09-28):** `fwrender` draws box-drawing lines
+    (U+2500–257F), block elements and shades (U+2580–259F), braille
+    (U+2800–28FF) and the powerline arrows (U+E0B0–E0B3) itself, sized to
+    the cell, instead of taking them from the font, so frames join edge to
+    edge in every font and at every size. Lines are whole-pixel rectangles
+    (light `max(1, (w+4)/8)` px, heavy twice that, double two light lines
+    one light width apart, with each corner and T meeting its own line);
+    arcs, diagonals and arrows go through `glyphs::Canvas` (anti-aliased).
+    The weight of each arm comes from a table generated from the Unicode
+    character names (`tools/gen_boxdraw.py`; `dev.py check` fails if it is
+    stale). Checked with pixel tests and a rendered sample sheet in
+    JetBrains Mono at 18 and 13 px.
   - **Not yet:** CFF/OTF fonts, colour emoji, and looking fonts up by family
     name (Consolas's files are named directly for now).
 

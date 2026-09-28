@@ -13,6 +13,7 @@ every push.
   python dev.py fix                   # cargo fmt (rewrites files)
   python dev.py guard                 # zero-dependency guard
   python dev.py docs                  # docs-only gate: links and tables
+  python dev.py tables                # generated tables are up to date
   python dev.py run -- [args]         # cargo run --release --bin resmon
 """
 
@@ -55,6 +56,10 @@ def docs() -> int:
     return run(PY, "tools/docs_gate.py")
 
 
+def tables() -> int:
+    return run(PY, "tools/gen_boxdraw.py", "--check")
+
+
 def run_bin() -> int:
     extra = sys.argv[2:]
     if extra and extra[0] == "--":
@@ -63,8 +68,9 @@ def run_bin() -> int:
 
 
 def check() -> int:
-    """The gate: dependency guard, then formatting, then the full suite."""
-    return guard() or docs() or fmt() or test()
+    """The gate: dependency guard, docs, generated tables, formatting, then
+    the full suite."""
+    return guard() or docs() or tables() or fmt() or test()
 
 
 COMMANDS = {
@@ -75,6 +81,7 @@ COMMANDS = {
     "fix": fix,
     "guard": guard,
     "docs": docs,
+    "tables": tables,
     "run": run_bin,
 }
 

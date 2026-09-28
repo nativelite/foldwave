@@ -349,6 +349,15 @@ impl Rasterizer for FontRasterizer {
     }
 
     fn rasterize(&mut self, ch: char, style: u8, columns: u32, out: &mut [u8]) {
+        // Box drawing, blocks, braille and powerline arrows are drawn in
+        // code to fill the cell exactly, whatever the font (`boxdraw`).
+        let (w, h) = (
+            (self.metrics.cell_w * columns) as usize,
+            self.metrics.cell_h as usize,
+        );
+        if crate::boxdraw::draw(ch, w, h, out) {
+            return;
+        }
         let FontRasterizer {
             styles,
             fallbacks,
