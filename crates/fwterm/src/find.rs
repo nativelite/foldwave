@@ -6,6 +6,33 @@
 //! first; these helpers order the hits, clean a log line for the search bar,
 //! and find the match on a rebuilt screen row to highlight it.
 
+/// What the search bar looks for: text (ignoring ASCII case), or a regular
+/// expression written `/like this/` ([`find_re`](crate::find_re)).
+#[derive(Debug, Clone)]
+pub enum Query {
+    Text(String),
+    Regex(crate::find_re::Regex),
+}
+
+impl Query {
+    pub fn parse(query: &str) -> Result<Query, crate::find_re::Error> {
+        match query.strip_prefix('/').and_then(|q| q.strip_suffix('/')) {
+            Some(pattern) if !pattern.is_empty() => {
+                crate::find_re::Regex::new(pattern).map(Query::Regex)
+            }
+            _ => Ok(Query::Text(query.to_string())),
+        }
+    }
+
+    /// The first match in a row of characters: its first and last columns.
+    pub fn find_in(&self, row: &[char]) -> Option<(usize, usize)> {
+        match self {
+            Query::Text(needle) => match_in_row(row, needle),
+            Query::Regex(re) => re.find(row),
+        }
+    }
+}
+
 /// One match in one pane's log, or in its memory for a pane without one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hit {
@@ -76,18 +103,18 @@ pub fn clean(raw: &[u8], max: usize) -> String {
     String::from_utf8_lossy(&out).chars().take(max).collect()
 }
 
-/// Hits for `needle` (ignoring ASCII case) in a pane's lines held in memory,
+/// Hits for `query` in a pane's lines held in memory,
 /// for a pane without a log (`--no-log`): `lines` gives each line's number
 /// and characters, oldest first; at most `limit` hits, the newest. Such a
 /// hit has no log folder (`dir` empty) and orders by its line.
 pub fn search_lines(
     pane: usize,
     lines: impl Iterator<Item = (u64, Vec<char>)>,
-    needle: &str,
+    query: &Query,
     limit: usize,
 ) -> Vec<Hit> {
     let mut hits: Vec<Hit> = lines
-        .filter(|(_, row)| match_in_row(row, needle).is_some())
+        .filter(|(_, row)| query.find_in(row).is_some())
         .map(|(line, row)| Hit {
             pane,
             dir: std::path::PathBuf::new(),
@@ -168,7 +195,8 @@ mod tests {
                 .enumerate()
                 .map(|(i, l)| (100 + i as u64, l.chars().collect::<Vec<char>>()))
         };
-        let hits = search_lines(3, rows(), "error", 10);
+        let q = Query::parse("error").unwrap();
+        let hits = search_lines(3, rows(), &q, 10);
         let got: Vec<(u64, &str)> = hits.iter().map(|h| (h.line, h.text.as_str())).collect();
         assert_eq!(
             got,
@@ -182,7 +210,7 @@ mod tests {
             .iter()
             .all(|h| h.pane == 3 && h.dir.as_os_str().is_empty()));
         // Over the limit: the newest are kept.
-        let two: Vec<u64> = search_lines(3, rows(), "error", 2)
+        let two: Vec<u64> = search_lines(3, rows(), &q, 2)
             .iter()
             .map(|h| h.line)
             .collect();
@@ -190,6 +218,18 @@ mod tests {
         let mut h = hits.clone();
         order(&mut h);
         assert_eq!(h[0].line, 104, "newest first");
+    }
+
+    #[test]
+    fn a_query_in_slashes_is_a_regex() {
+        let row: Vec<char> = "test result: 3 failed".chars().collect();
+        let re = Query::parse(r"/\d+ failed/").unwrap();
+        assert!(matches!(re, Query::Regex(_)));
+        assert_eq!(re.find_in(&row), Some((13, 20)));
+        assert!(matches!(Query::parse("/").unwrap(), Query::Text(_)));
+        assert!(matches!(Query::parse("//").unwrap(), Query::Text(_)));
+        assert!(matches!(Query::parse("a/b/").unwrap(), Query::Text(_)));
+        assert!(Query::parse("/(ab/").is_err());
     }
 
     #[test]

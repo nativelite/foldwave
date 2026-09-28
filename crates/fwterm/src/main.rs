@@ -44,6 +44,8 @@ mod emu;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod find;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod find_re;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod fold;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod governor;
@@ -196,7 +198,9 @@ keys:
   Ctrl+Shift+O      select a command's output (then Ctrl+C copies it)
   Ctrl+Shift+[ / ]  fold that command's output to one line / unfold
   Ctrl+Shift+F      search every pane's log: type, Enter searches, Enter /
-                    Shift+Enter step through hits (newest first), Esc closes
+                    Shift+Enter step through hits (newest first), Esc closes;
+                    /pattern/ is a regular expression (. [a-z] \\d \\w \\s
+                    * + ? {m,n} | ( ) ^ $), case ignored like text
   drag, double-click   select text in a pane / select a word
   Ctrl+Shift+C      copy the selection (Ctrl+C too while there is one;
                     otherwise Ctrl+C goes to the program)
@@ -1321,16 +1325,31 @@ keys:
         }
     }
 
-    /// Hits for `needle` (ignoring ASCII case) in every generation of one
-    /// pane's logs, at most `limit` per generation, with lines numbered as
-    /// [`Deep`] numbers them.
-    fn search_pane(id: PaneId, dir: &Path, needle: &str, limit: usize) -> Vec<find::Hit> {
-        let mut hits = Vec::new();
+    /// Lines of a log a regex is tried on, from the index's hits for the
+    /// literal it requires (newest first).
+    const REGEX_CANDIDATES: usize = 20_000;
+    /// How long a regex with no literal may read logs line by line, every
+    /// pane at once; past it, the search reports the newest it covered.
+    const REGEX_SCAN: Duration = Duration::from_secs(5);
+
+    /// Hits for `query` in every generation of one pane's logs, newest
+    /// generation first, at most `limit` per generation, with lines numbered
+    /// as [`Deep`] numbers them; and whether a regex with no literal to look
+    /// up stopped at `deadline` before reading them all.
+    ///
+    /// Text goes to the log's index. A regex tries the lines the index finds
+    /// for a literal it requires (three characters or more, as the index
+    /// needs); without one it reads the lines, newest first.
+    fn search_pane(
+        id: PaneId,
+        dir: &Path,
+        query: &find::Query,
+        limit: usize,
+        deadline: Instant,
+    ) -> (Vec<find::Hit>, bool) {
+        // Every generation with the line it begins on, before reading any.
+        let mut gens = Vec::new();
         let mut start = 0u64;
-        let opts = panelog::SearchOptions {
-            ignore_case: true,
-            limit,
-        };
         for g in logstore::generations(dir) {
             // One retention is deleting cannot be opened: skipped, as Deep does.
             let Ok(r) = panelog::Reader::open(&g) else {
@@ -1341,26 +1360,92 @@ keys:
                 .and_then(|n| n.to_str())
                 .and_then(logstore::gen_stamp)
                 .unwrap_or(0);
-            for offset in r.search(needle.as_bytes(), &opts).unwrap_or_default() {
-                let Ok(local) = r.line_of(offset) else {
-                    continue;
-                };
-                let text = r
-                    .line(local)
-                    .map(|l| find::clean(&l, 240))
-                    .unwrap_or_default();
+            let lines = r.line_count();
+            gens.push((r, start, stamp));
+            start += lines - 1;
+        }
+        let mut hits = Vec::new();
+        let mut cut = false;
+        for (r, start, stamp) in gens.iter().rev() {
+            let mut push = |local: u64, offset: u64, text: String| {
                 hits.push(find::Hit {
                     pane: id,
                     dir: dir.to_path_buf(),
                     line: start + local,
                     text,
-                    generation: stamp,
+                    generation: *stamp,
                     offset,
                 });
+            };
+            let re = match query {
+                find::Query::Text(needle) => {
+                    let opts = panelog::SearchOptions {
+                        ignore_case: true,
+                        limit,
+                    };
+                    for offset in r.search(needle.as_bytes(), &opts).unwrap_or_default() {
+                        let Ok(local) = r.line_of(offset) else {
+                            continue;
+                        };
+                        let text = r.line(local).map(|l| find::clean(&l, 240));
+                        push(local, offset, text.unwrap_or_default());
+                    }
+                    continue;
+                }
+                find::Query::Regex(re) => re,
+            };
+            // A regex: whether line `local` matches, and its text if so.
+            let try_line = |local: u64| -> Option<String> {
+                let text = find::clean(&r.line(local).ok()?, 4096);
+                let chars: Vec<char> = text.chars().collect();
+                re.find(&chars).map(|_| text.chars().take(240).collect())
+            };
+            let mut found = 0;
+            match re.literal().filter(|l| l.len() >= 3) {
+                Some(literal) => {
+                    let opts = panelog::SearchOptions {
+                        ignore_case: true,
+                        limit: REGEX_CANDIDATES,
+                    };
+                    let mut last = None;
+                    for offset in r.search(literal.as_bytes(), &opts).unwrap_or_default() {
+                        let Ok(local) = r.line_of(offset) else {
+                            continue;
+                        };
+                        // Several hits on one line: tried once.
+                        if last.replace(local) == Some(local) {
+                            continue;
+                        }
+                        if let Some(text) = try_line(local) {
+                            push(local, offset, text);
+                            found += 1;
+                            if found == limit {
+                                break;
+                            }
+                        }
+                    }
+                }
+                None => {
+                    for local in (0..r.line_count()).rev() {
+                        if Instant::now() >= deadline {
+                            cut = true;
+                            break;
+                        }
+                        if let Some(text) = try_line(local) {
+                            push(local, r.line_start(local).unwrap_or(0), text);
+                            found += 1;
+                            if found == limit {
+                                break;
+                            }
+                        }
+                    }
+                }
             }
-            start += r.line_count() - 1;
+            if cut {
+                break;
+            }
         }
-        hits
+        (hits, cut)
     }
 
     /// The search bar: what is typed, what was last searched, its hits and
@@ -1371,7 +1456,11 @@ keys:
         searched: String,
         hits: Vec<find::Hit>,
         at: usize,
-        running: Option<std::sync::mpsc::Receiver<(Vec<find::Hit>, Duration)>>,
+        running: Option<std::sync::mpsc::Receiver<(Vec<find::Hit>, Duration, bool)>>,
+        /// A pattern that did not parse, shown instead of results.
+        error: Option<String>,
+        /// Said after the results: a regex search that stopped early.
+        note: Option<String>,
         /// How long the last search took, start to hits.
         took: Option<Duration>,
     }
@@ -1931,6 +2020,7 @@ keys:
             if let Some((line, needle)) = self.find_view.clone().filter(|_| logged) {
                 // A search hit: the log rebuilt a little past its line, the
                 // match highlighted where it landed.
+                let query = find::Query::parse(&needle).ok();
                 if self.deep.as_ref().map_or(true, |d| d.total <= line) {
                     let dir = self.find_dir.as_deref().or(self.pane_dir.as_deref());
                     self.deep = dir.and_then(|f| Deep::open(f).ok());
@@ -1947,7 +2037,7 @@ keys:
                         .filter_map(|row| {
                             let chars: Vec<char> =
                                 (0..s.cols()).map(|c| s.cell(row, c).ch).collect();
-                            find::match_in_row(&chars, &needle).map(|(a, b)| (row, a, b))
+                            query.as_ref()?.find_in(&chars).map(|(a, b)| (row, a, b))
                         })
                         .min_by_key(|&(row, _, _)| row.abs_diff(expect))
                         .map(|(row, a, b)| Highlight {
@@ -2092,7 +2182,7 @@ keys:
                             .flatten()
                             .and_then(|l| {
                                 let chars: Vec<char> = l.into_iter().map(|(c, _)| c).collect();
-                                find::match_in_row(&chars, needle)
+                                find::Query::parse(needle).ok()?.find_in(&chars)
                             })
                             .map(|(a, b)| {
                                 let row = (*line - top) as usize;
@@ -3225,6 +3315,19 @@ keys:
                         Event::Char('\r') => {
                             if f.query.is_empty() {
                             } else if f.query != f.searched {
+                                f.searched = f.query.clone();
+                                f.hits.clear();
+                                f.at = 0;
+                                f.note = None;
+                                let query = match find::Query::parse(&f.query) {
+                                    Ok(q) => q,
+                                    Err(e) => {
+                                        f.error = Some(format!("bad pattern: {e}"));
+                                        layout_dirty = true;
+                                        continue;
+                                    }
+                                };
+                                f.error = None;
                                 // Every pane this session logged, closed
                                 // ones too.
                                 let jobs: Vec<(PaneId, PathBuf)> = match &logs.store {
@@ -3246,38 +3349,42 @@ keys:
                                             let l = Pane::line_chars(&term, n, &none)?;
                                             Some((n, l.into_iter().map(|(c, _)| c).collect()))
                                         });
-                                        find::search_lines(p.id, lines, &f.query, FIND_LIMIT)
+                                        find::search_lines(p.id, lines, &query, FIND_LIMIT)
                                     })
                                     .collect();
                                 let (tx, rx) = std::sync::mpsc::channel();
-                                let (needle, w) = (f.query.clone(), waker.clone());
+                                let w = waker.clone();
                                 std::thread::spawn(move || {
+                                    let deadline = started + REGEX_SCAN;
                                     // Every pane at once: each opens and
                                     // searches its own generations.
-                                    let mut all: Vec<find::Hit> = std::thread::scope(|sc| {
+                                    let (mut all, cut) = std::thread::scope(|sc| {
                                         let handles: Vec<_> = jobs
                                             .iter()
                                             .map(|(id, dir)| {
-                                                let needle = &needle;
+                                                let query = &query;
                                                 sc.spawn(move || {
-                                                    search_pane(*id, dir, needle, FIND_LIMIT)
+                                                    search_pane(
+                                                        *id, dir, query, FIND_LIMIT, deadline,
+                                                    )
                                                 })
                                             })
                                             .collect();
-                                        handles
-                                            .into_iter()
-                                            .flat_map(|h| h.join().unwrap_or_default())
-                                            .collect()
+                                        let mut all: Vec<find::Hit> = Vec::new();
+                                        let mut cut = false;
+                                        for h in handles {
+                                            let (hits, c) = h.join().unwrap_or_default();
+                                            all.extend(hits);
+                                            cut |= c;
+                                        }
+                                        (all, cut)
                                     });
                                     all.extend(memory);
                                     find::order(&mut all);
-                                    let _ = tx.send((all, started.elapsed()));
+                                    let _ = tx.send((all, started.elapsed(), cut));
                                     w.wake();
                                 });
                                 f.running = Some(rx);
-                                f.searched = f.query.clone();
-                                f.hits.clear();
-                                f.at = 0;
                             } else if !f.hits.is_empty() {
                                 let n = f.hits.len();
                                 f.at = if fwrender::win::shift_down() {
@@ -3700,9 +3807,17 @@ keys:
             }
             // Search results, when the search thread has them.
             if let Some(f) = find_bar.as_mut() {
-                if let Some((hits, took)) = f.running.as_ref().and_then(|rx| rx.try_recv().ok()) {
+                if let Some((hits, took, cut)) =
+                    f.running.as_ref().and_then(|rx| rx.try_recv().ok())
+                {
                     f.running = None;
                     f.took = Some(took);
+                    f.note = cut.then(|| {
+                        format!(
+                            "a pattern with no 3-letter literal: the newest {} s of reading",
+                            REGEX_SCAN.as_secs()
+                        )
+                    });
                     *last_search.lock().unwrap() = Some((took, hits.len()));
                     f.hits = hits;
                     f.at = 0;
@@ -3779,6 +3894,9 @@ keys:
             // The search bar, over the window's bottom row.
             if let Some(f) = &find_bar {
                 let status = match (&f.running, f.hits.len()) {
+                    _ if f.searched == f.query && f.error.is_some() => {
+                        f.error.clone().unwrap_or_default()
+                    }
                     (Some(_), _) => "searching every pane's log...".to_string(),
                     (None, 0) if !f.searched.is_empty() && f.searched == f.query => {
                         let ms = f.took.map_or(0.0, |t| t.as_secs_f64() * 1e3);
@@ -3802,6 +3920,10 @@ keys:
                         )
                     }
                     (None, _) => "Enter searches again".into(),
+                };
+                let status = match (&f.note, f.searched == f.query) {
+                    (Some(note), true) => format!("{status}  [{note}]"),
+                    _ => status,
                 };
                 let text: Vec<char> = format!(" find: {}_   {status}", f.query).chars().collect();
                 let row = grid_rows.saturating_sub(1);
@@ -3863,6 +3985,71 @@ keys:
                 .to_string()
         }
 
+        /// Search timing over a real session's logs, every pane at once as
+        /// the app searches (design §4 history target). Run with
+        /// `FWTERM_SEARCH_BENCH=<session folder> cargo test --release -p
+        /// nativelite-fwterm --bin fwterm search_benchmark -- --ignored
+        /// --nocapture`.
+        #[test]
+        #[ignore = "benchmark: needs FWTERM_SEARCH_BENCH, a session folder of logs"]
+        fn search_benchmark() {
+            let Ok(session) = std::env::var("FWTERM_SEARCH_BENCH") else {
+                return;
+            };
+            let panes: Vec<(usize, PathBuf)> = std::fs::read_dir(&session)
+                .unwrap()
+                .filter_map(|e| {
+                    let e = e.ok()?;
+                    let id = e
+                        .file_name()
+                        .to_str()?
+                        .strip_prefix("pane-")?
+                        .parse()
+                        .ok()?;
+                    Some((id, e.path()))
+                })
+                .collect();
+            let queries = [
+                "zqx-marker-7",
+                "absent-needle-000",
+                r"/zqx-marker-\d/",
+                r"/absent-needle-\d{3}/",
+                r"/\d{9}x/",
+            ];
+            const RUNS: usize = 5;
+            for q in queries {
+                let query = find::Query::parse(q).unwrap();
+                let mut ms = Vec::new();
+                let (mut hits, mut cut) = (0, false);
+                for _ in 0..RUNS {
+                    let t = Instant::now();
+                    let deadline = t + REGEX_SCAN;
+                    let results: Vec<(Vec<find::Hit>, bool)> = std::thread::scope(|sc| {
+                        let hs: Vec<_> = panes
+                            .iter()
+                            .map(|(id, dir)| {
+                                let query = &query;
+                                sc.spawn(move || search_pane(*id, dir, query, FIND_LIMIT, deadline))
+                            })
+                            .collect();
+                        hs.into_iter().map(|h| h.join().unwrap()).collect()
+                    });
+                    ms.push(t.elapsed().as_secs_f64() * 1e3);
+                    hits = results.iter().map(|(h, _)| h.len()).sum();
+                    cut = results.iter().any(|(_, c)| *c);
+                }
+                ms.sort_by(f64::total_cmp);
+                let p90 = ms[((ms.len() - 1) as f64 * 0.9).round() as usize];
+                println!(
+                    "{q:<24} median {:>8.1} ms  p90 {:>8.1}  max {:>8.1}  n={RUNS}  hits {hits}{}",
+                    ms[ms.len() / 2],
+                    p90,
+                    ms[ms.len() - 1],
+                    if cut { "  (cut at the deadline)" } else { "" }
+                );
+            }
+        }
+
         #[test]
         fn search_hits_are_numbered_as_the_log_view_numbers_lines() {
             let pane = std::env::temp_dir().join(format!("fwterm-find-{}", std::process::id()));
@@ -3882,8 +4069,25 @@ keys:
                 w.checkpoint(&term.checkpoint().unwrap()).unwrap();
                 w.append(b"L3\r\nL4 NEEDLE B\r\n", 0).unwrap();
             }
-            let mut hits = search_pane(7, &pane, "needle", 100);
-            find::order(&mut hits);
+            let later = Instant::now() + Duration::from_secs(60);
+            let search = |q: &str| {
+                let (mut hits, cut) =
+                    search_pane(7, &pane, &find::Query::parse(q).unwrap(), 100, later);
+                assert!(!cut);
+                find::order(&mut hits);
+                hits
+            };
+            // A regex with a literal (the index finds "needle"), and one
+            // without (every line read): the same two hits.
+            let lines = |hits: Vec<find::Hit>| hits.iter().map(|h| h.line).collect::<Vec<_>>();
+            assert_eq!(lines(search(r"/needle [a-z]$/")), [4, 1]);
+            assert_eq!(lines(search(r"/^l\d \w+ [ab]/")), [4, 1]);
+            assert_eq!(lines(search(r"/needle c/")), Vec::<u64>::new());
+            // Out of time before a no-literal regex reads anything: cut short.
+            let past = Instant::now();
+            let q = find::Query::parse(r"/\w+/").unwrap();
+            assert!(search_pane(7, &pane, &q, 100, past).1);
+            let hits = search("needle");
             let got: Vec<(usize, u64, &str)> = hits
                 .iter()
                 .map(|h| (h.pane, h.line, h.text.as_str()))

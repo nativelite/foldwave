@@ -1013,7 +1013,23 @@ M4, [`logstore.rs`](../crates/fwterm/src/logstore.rs)).**
 - Panes without a log (`--no-log`) are searched in what memory holds (their
   history and screen, 2026-09-27; `find::search_lines`): a hit scrolls the
   pane to put its line a third of the way down, the match highlighted.
-- Not yet: regular expressions.
+- Regular expressions (2026-09-27; founder: a module in fwterm): a query
+  written `/pattern/` ([`find_re.rs`](../crates/fwterm/src/find_re.rs), no
+  dependencies). A Pike VM, so matching is linear in the line and no pattern
+  backtracks exponentially; ASCII case folded as text search does; the
+  leftmost non-empty match. A literal of three or more characters the pattern
+  requires goes to the log's index first, and the regex checks only those
+  lines (up to 20,000 per generation, newest first). A pattern with no such
+  literal reads lines newest first for at most 5 s, every pane at once, and
+  the bar says it stopped early. A bad pattern shows its error in the bar.
+  - Measured 2026-09-27 on 104.0 GiB of logs (16 panes, 416 generations,
+    `search_benchmark`, release, 5 runs each, all panes at once): text
+    `zqx-marker-7` median 284.5 ms (p90 302.1, 16 hits); absent text 275.1
+    (287.3); `/zqx-marker-\d/` 286.8 (296.5, 16 hits); `/absent-needle-\d{3}/`
+    287.4 (296.6); `/\d{9}x/` (no literal) stops at the 5 s deadline. So a
+    regex with a literal meets the < 1 s target like text; one without cannot
+    at this size. The earlier 238–277 ms for text was a different run
+    through the window.
 - A background indexer over data segments: an n-gram (e.g. trigram) index per
   segment for substring search, and a marks index for structure.
 - Queries run across panes and time: "errors in any pane in the last hour",
