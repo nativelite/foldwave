@@ -10,6 +10,8 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hit {
     pub pane: usize,
+    /// The pane's log folder: a closed pane's hits are shown from it.
+    pub dir: std::path::PathBuf,
     /// Line in the pane's logs, counted across its generations (as the log
     /// view counts them).
     pub line: u64,
@@ -97,6 +99,7 @@ mod tests {
     fn hit(pane: usize, generation: u64, offset: u64) -> Hit {
         Hit {
             pane,
+            dir: Default::default(),
             line: 0,
             text: String::new(),
             generation,

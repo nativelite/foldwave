@@ -324,6 +324,29 @@ impl Session {
     pub fn pane_dir(&self, id: usize) -> PathBuf {
         self.dir.join(format!("pane-{id}"))
     }
+
+    /// Every pane this session has logged, open or closed since, by id.
+    /// Pane ids are never reused, so each folder is one pane's.
+    pub fn pane_dirs(&self) -> Vec<(usize, PathBuf)> {
+        let mut out: Vec<(usize, PathBuf)> = fs::read_dir(&self.dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| {
+                let e = e.ok()?;
+                let id = e
+                    .file_name()
+                    .to_str()?
+                    .strip_prefix("pane-")?
+                    .parse()
+                    .ok()?;
+                // A real folder: never a link or junction to somewhere else.
+                let t = e.file_type().ok()?;
+                (t.is_dir() && !t.is_symlink()).then(|| (id, e.path()))
+            })
+            .collect();
+        out.sort_unstable_by_key(|(id, _)| *id);
+        out
+    }
 }
 
 /// Bytes shown to people: `8.7 GB`, `256 MB`.
@@ -525,6 +548,21 @@ mod tests {
         drop(s);
         let dir = fs::read_dir(&root).unwrap().next().unwrap().unwrap().path();
         assert!(!session_live(&dir));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_session_lists_every_pane_it_logged() {
+        let root = scratch("panes");
+        let s = Session::create(&root).unwrap();
+        for id in [10, 2, 0] {
+            fs::create_dir_all(s.pane_dir(id)).unwrap();
+        }
+        fs::write(s.dir.join("pane-7"), b"").unwrap(); // a file, not a pane
+        let ids: Vec<usize> = s.pane_dirs().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, [0, 2, 10]);
+        assert_eq!(s.pane_dirs()[1].1, s.pane_dir(2));
+        drop(s);
         let _ = fs::remove_dir_all(&root);
     }
 

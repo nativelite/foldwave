@@ -1351,6 +1351,7 @@ keys:
                     .unwrap_or_default();
                 hits.push(find::Hit {
                     pane: id,
+                    dir: dir.to_path_buf(),
                     line: start + local,
                     text,
                     generation: stamp,
@@ -1385,6 +1386,7 @@ keys:
     /// Leave the search: every pane back to its live view.
     fn close_find(panes: &mut [Pane]) {
         for p in panes.iter_mut() {
+            p.find_dir = None;
             if p.find_view.take().is_some() {
                 p.deep = None;
                 p.back = 0;
@@ -1402,15 +1404,21 @@ keys:
         zoom: &mut Option<PaneId>,
         focus: &mut PaneId,
     ) {
-        if zoom.is_some() && *zoom != Some(hit.pane) {
+        // A pane closed since: its log is shown in the focused pane.
+        let open = panes.iter().any(|p| p.id == hit.pane);
+        let target = if open { hit.pane } else { *focus };
+        if zoom.is_some() && *zoom != Some(target) {
             *zoom = None;
         }
         for p in panes.iter_mut() {
-            if p.id == hit.pane {
+            if p.id == target {
                 p.find_view = Some((hit.line, needle.to_string()));
+                p.find_dir = (!open).then(|| hit.dir.clone());
+                p.deep = None; // rebuilt from the right log
                 p.shared.pending.store(true, Ordering::Release);
-                *focus = hit.pane;
+                *focus = target;
             } else if p.find_view.take().is_some() {
+                p.find_dir = None;
                 p.deep = None;
                 p.back = 0;
                 p.shared.pending.store(true, Ordering::Release);
@@ -1656,8 +1664,10 @@ keys:
         deep: Option<Deep>,
         /// Behind a zoomed pane: kept, not drawn.
         hidden: bool,
-        /// Showing a search hit: its line in the pane's logs, and the needle.
+        /// Showing a search hit: its line in the pane's logs, and the needle;
+        /// and, for a hit in a pane closed since, that pane's log folder.
         find_view: Option<(u64, String)>,
+        find_dir: Option<PathBuf>,
         /// Folded commands (Ctrl+Shift+[), and the line each view row showed
         /// when last drawn with folds in view (a folded row: its first line;
         /// empty when the view had no folds).
@@ -1919,7 +1929,8 @@ keys:
                 // A search hit: the log rebuilt a little past its line, the
                 // match highlighted where it landed.
                 if self.deep.as_ref().map_or(true, |d| d.total <= line) {
-                    self.deep = self.pane_dir.as_deref().and_then(|f| Deep::open(f).ok());
+                    let dir = self.find_dir.as_deref().or(self.pane_dir.as_deref());
+                    self.deep = dir.and_then(|f| Deep::open(f).ok());
                 }
                 if let Some(d) = self.deep.as_mut() {
                     let end = (line + 1 + rows as u64 / 2).min(d.total);
@@ -2545,6 +2556,7 @@ keys:
                     deep: None,
                     hidden: false,
                     find_view: None,
+                    find_dir: None,
                     folds: fold::Folds::default(),
                     row_lines: Vec::new(),
                     restarts: Vec::new(),
@@ -2572,6 +2584,7 @@ keys:
                 deep: None,
                 hidden: false,
                 find_view: None,
+                find_dir: None,
                 folds: fold::Folds::default(),
                 row_lines: Vec::new(),
                 restarts: Vec::new(),
@@ -3186,10 +3199,12 @@ keys:
                         Event::Char('\r') => {
                             if f.query.is_empty() {
                             } else if f.query != f.searched {
-                                let jobs: Vec<(PaneId, PathBuf)> = panes
-                                    .iter()
-                                    .filter_map(|p| Some((p.id, p.pane_dir.clone()?)))
-                                    .collect();
+                                // Every pane this session logged, closed
+                                // ones too.
+                                let jobs: Vec<(PaneId, PathBuf)> = match &logs.store {
+                                    Some(store) => store.session.pane_dirs(),
+                                    None => Vec::new(),
+                                };
                                 let (tx, rx) = std::sync::mpsc::channel();
                                 let (needle, w) = (f.query.clone(), waker.clone());
                                 std::thread::spawn(move || {
@@ -3729,8 +3744,13 @@ keys:
                     (None, n) if f.searched == f.query => {
                         let h = &f.hits[f.at];
                         let ms = f.took.map_or(0.0, |t| t.as_secs_f64() * 1e3);
+                        let closed = if panes.iter().any(|p| p.id == h.pane) {
+                            ""
+                        } else {
+                            "closed "
+                        };
                         format!(
-                            "{}/{} ({ms:.0} ms) in pane {}: {}",
+                            "{}/{} ({ms:.0} ms) in {closed}pane {}: {}",
                             f.at + 1,
                             n,
                             h.pane + 1,

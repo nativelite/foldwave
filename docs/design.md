@@ -1005,8 +1005,12 @@ M4, [`logstore.rs`](../crates/fwterm/src/logstore.rs)).**
   - The hit shows its pane rebuilt from the log, the marker highlighted.
     Opening and rebuilding that view was not separately timed here (panelog:
     jump to any line p99 0.24 ms at 100 GB, rebuild p99 6.9 ms).
-- Not yet: panes closed earlier in the session, regular expressions,
-  searching panes without a log (`--no-log`).
+- Panes closed earlier in the session are searched too (2026-09-27): a
+  session keeps every pane's log folder (pane ids are never reused), so the
+  search walks them all (`Session::pane_dirs`). A closed pane's hit shows in
+  the focused pane, rebuilt from that closed pane's log, and the bar says
+  "in closed pane N".
+- Not yet: regular expressions, searching panes without a log (`--no-log`).
 - A background indexer over data segments: an n-gram (e.g. trigram) index per
   segment for substring search, and a marks index for structure.
 - Queries run across panes and time: "errors in any pane in the last hour",
