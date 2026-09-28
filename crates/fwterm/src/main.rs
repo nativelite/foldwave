@@ -131,8 +131,10 @@ options:
                 fwterm.exe is used if present, else the built-in console host
   --pipe        run the program with no console: output over plain pipes
                 (native speed), keys to its stdin
-  --font NAME   font family, as installed (default Consolas); an unknown
-                name lists the monospaced families found
+  --font NAME   font family: shipped beside fwterm in fonts/ (JetBrains
+                Mono, the default, and Cascadia Mono) or installed; without
+                the shipped fonts the default is Consolas. An unknown name
+                lists the monospaced families found
   --px N        font size in pixels per em (default 16)
   --size WxH    client area in pixels (default 1200x720)
   --no-sharpen  draw the raw glyph outlines (no fitting or stem snapping)
@@ -3233,8 +3235,12 @@ keys:
     fn start(args: &Args) -> io::Result<i32> {
         choose_console_host(args)?;
         let mut raster = match &args.font {
-            // Consolas by its known files: no need to scan the font folders.
-            None => FontRasterizer::consolas(args.px)?,
+            // The shipped JetBrains Mono, else Consolas, each by its known
+            // files: no need to scan the font folders.
+            None => match fwrender::shipped_default() {
+                Some(family) => FontRasterizer::from_family(&family, args.px)?,
+                None => FontRasterizer::consolas(args.px)?,
+            },
             Some(name) => {
                 let catalog = fwrender::FontCatalog::system();
                 let family = catalog.family(name).map_err(|e| {

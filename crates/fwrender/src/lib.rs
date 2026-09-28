@@ -40,7 +40,9 @@ pub mod vk;
 pub mod win;
 
 pub use atlas::{Atlas, GlyphKey, GlyphPart, Metrics, Rasterizer, TestRasterizer, BOLD, ITALIC};
-pub use catalog::{font_dirs, Family, FontCatalog};
+pub use catalog::{
+    font_dirs, shipped_default, shipped_default_in, shipped_dir, Family, FontCatalog,
+};
 pub use cpu::{blend, CpuRenderer};
 pub use font::{default_fallbacks, system_font_dir, FontFile, FontRasterizer, Sharpening};
 pub use frame::{CellInstance, Frame, Highlight, Palette, STRIKE, UNDERLINE};

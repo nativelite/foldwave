@@ -25,22 +25,49 @@ pub struct Family {
 }
 
 /// The folders fonts are looked for in: `fonts/` beside the program, where
-/// fonts shipped with it go (Cascadia Mono with its italic,
-/// `tools/fetch_cascadia.py`), then the system's, then the current user's
+/// fonts shipped with it go (JetBrains Mono and Cascadia Mono,
+/// `tools/fetch_fonts.py`), then the system's, then the current user's
 /// (`%LOCALAPPDATA%\Microsoft\Windows\Fonts`, Windows 10 1809+). Shipped
 /// fonts come first, so where a style is found in several places (the system
 /// has an upright Cascadia Mono too) the shipped one is taken.
 pub fn font_dirs() -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = std::env::current_exe()
-        .ok()
-        .and_then(|exe| Some(exe.parent()?.join("fonts")))
-        .into_iter()
-        .collect();
+    let mut dirs: Vec<PathBuf> = shipped_dir().into_iter().collect();
     dirs.push(system_font_dir());
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
         dirs.push(PathBuf::from(local).join("Microsoft\\Windows\\Fonts"));
     }
     dirs
+}
+
+/// `fonts/` beside the running program, where `tools/fetch_fonts.py` puts
+/// the fonts shipped with it.
+pub fn shipped_dir() -> Option<PathBuf> {
+    Some(std::env::current_exe().ok()?.parent()?.join("fonts"))
+}
+
+/// The default font as shipped beside the program: JetBrains Mono, upright
+/// and italic from its two variable files (bold and bold italic at `wght`
+/// 700), taken straight from [`shipped_dir`] without scanning any font
+/// folder. `None` when it is not there.
+pub fn shipped_default() -> Option<Family> {
+    shipped_default_in(&shipped_dir()?)
+}
+
+/// [`shipped_default`] from the folder `dir`.
+pub fn shipped_default_in(dir: &std::path::Path) -> Option<Family> {
+    let regular = dir.join("JetBrainsMono.ttf");
+    if !regular.is_file() {
+        return None;
+    }
+    let italic = dir.join("JetBrainsMono-Italic.ttf");
+    Some(Family {
+        name: "JetBrains Mono".into(),
+        regular: FontFile::new(regular),
+        bold: None,
+        italic: italic.is_file().then(|| FontFile::new(italic)),
+        bold_italic: None,
+        variable: true,
+    })
 }
 
 /// Every font found, with its description.
@@ -189,7 +216,7 @@ mod tests {
         )
     }
 
-    /// Cascadia Mono as `tools/fetch_cascadia.py` ships it beside fwterm,
+    /// Cascadia Mono as `tools/fetch_fonts.py` ships it beside fwterm,
     /// ahead of the system's fonts: upright and italic from the shipped pair,
     /// each drawn bold at `wght` 700. Skipped until the fonts are fetched.
     #[test]
@@ -201,7 +228,7 @@ mod tests {
             .map(|p| target.join(p).join("fonts"))
             .find(|d| d.join("CascadiaMonoItalic.ttf").is_file())
         else {
-            eprintln!("Cascadia Mono not fetched (tools/fetch_cascadia.py); skipped");
+            eprintln!("Cascadia Mono not fetched (tools/fetch_fonts.py); skipped");
             return;
         };
         let cat = FontCatalog::scan(&[shipped.clone(), crate::font::system_font_dir()]);
@@ -232,6 +259,43 @@ mod tests {
             sum(&bold_italic) > sum(&slanted) * 11 / 10,
             "bold italic heavier"
         );
+    }
+
+    /// The default font as fetched into target/*/fonts: all four styles drawn
+    /// from its two files. Skipped until the fonts are fetched.
+    #[test]
+    fn the_shipped_default_is_jetbrains_mono_in_four_styles() {
+        use crate::Rasterizer;
+        let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        let Some(f) = ["release", "debug"]
+            .iter()
+            .find_map(|p| shipped_default_in(&target.join(p).join("fonts")))
+        else {
+            eprintln!("fonts not fetched (tools/fetch_fonts.py); skipped");
+            return;
+        };
+        assert_eq!(f.name, "JetBrains Mono");
+        assert!(f.italic.is_some() && f.variable);
+        let mut r = crate::FontRasterizer::from_family(&f, 32.0).unwrap();
+        // The raw outlines: stem snapping would widen the regular stem to a
+        // whole pixel and blur the difference between the weights.
+        r.set_sharpening(crate::Sharpening::OFF);
+        let m = r.metrics();
+        let mut draw = |style| {
+            let mut out = vec![0u8; (m.cell_w * m.cell_h) as usize];
+            r.rasterize('a', style, 1, &mut out);
+            out
+        };
+        let sum = |v: &[u8]| v.iter().map(|&x| x as u32).sum::<u32>();
+        let (regular, bold) = (draw(0), draw(crate::BOLD));
+        let (italic, bold_italic) = (draw(crate::ITALIC), draw(crate::BOLD | crate::ITALIC));
+        assert!(sum(&bold) > sum(&regular) * 11 / 10, "bold heavier");
+        assert_ne!(italic, regular, "a real italic");
+        assert!(
+            sum(&bold_italic) > sum(&italic) * 11 / 10,
+            "bold italic heavier"
+        );
+        assert!(shipped_default_in(&target.join("no-such-dir")).is_none());
     }
 
     fn catalog() -> FontCatalog {
