@@ -41,7 +41,8 @@ pub mod win;
 
 pub use atlas::{Atlas, GlyphKey, GlyphPart, Metrics, Rasterizer, TestRasterizer, BOLD, ITALIC};
 pub use catalog::{
-    font_dirs, shipped_default, shipped_default_in, shipped_dir, Family, FontCatalog,
+    builtin_default, font_dirs, Family, FontCatalog, JETBRAINS_MONO, JETBRAINS_MONO_ITALIC,
+    JETBRAINS_MONO_LICENSE,
 };
 pub use cpu::{blend, CpuRenderer};
 pub use font::{default_fallbacks, system_font_dir, FontFile, FontRasterizer, Sharpening};

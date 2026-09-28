@@ -131,10 +131,11 @@ options:
                 fwterm.exe is used if present, else the built-in console host
   --pipe        run the program with no console: output over plain pipes
                 (native speed), keys to its stdin
-  --font NAME   font family: shipped beside fwterm in fonts/ (JetBrains
-                Mono, the default, and Cascadia Mono) or installed; without
-                the shipped fonts the default is Consolas. An unknown name
-                lists the monospaced families found
+  --font NAME   font family (default JetBrains Mono, built into fwterm), or
+                any installed one; an unknown name lists the monospaced
+                families found
+  --licenses    show the licenses of what fwterm ships (JetBrains Mono,
+                Microsoft's ConPTY) and exit
   --px N        font size in pixels per em (default 16)
   --size WxH    client area in pixels (default 1200x720)
   --no-sharpen  draw the raw glyph outlines (no fitting or stem snapping)
@@ -246,6 +247,8 @@ keys:
         host_window_signs: bool,
         hidden: Hidden,
         zoom: bool,
+        /// Show the licenses of what fwterm ships, then exit.
+        licenses: bool,
         panes: usize,
         shell: Vec<String>,
     }
@@ -281,6 +284,7 @@ keys:
             host_window_signs: false,
             hidden: Hidden::Always,
             zoom: false,
+            licenses: false,
             panes: 1,
             shell: vec!["cmd.exe".into()],
         };
@@ -356,6 +360,10 @@ keys:
                 }
                 "--zoom" => {
                     a.zoom = true;
+                    i += 1;
+                }
+                "--licenses" => {
+                    a.licenses = true;
                     i += 1;
                 }
                 "--hidden" => {
@@ -3085,6 +3093,11 @@ keys:
                 return 2;
             }
         };
+        if args.licenses {
+            // What fwterm ships and their licenses, compiled in with it.
+            say!("{}", include_str!("../../../THIRD-PARTY-NOTICES.md"));
+            return 0;
+        }
         if args.choose_log_drive {
             return choose_log_drive(&args);
         }
@@ -3235,12 +3248,8 @@ keys:
     fn start(args: &Args) -> io::Result<i32> {
         choose_console_host(args)?;
         let mut raster = match &args.font {
-            // The shipped JetBrains Mono, else Consolas, each by its known
-            // files: no need to scan the font folders.
-            None => match fwrender::shipped_default() {
-                Some(family) => FontRasterizer::from_family(&family, args.px)?,
-                None => FontRasterizer::consolas(args.px)?,
-            },
+            // JetBrains Mono, compiled in: no font folder to scan.
+            None => FontRasterizer::from_family(&fwrender::builtin_default(), args.px)?,
             Some(name) => {
                 let catalog = fwrender::FontCatalog::system();
                 let family = catalog.family(name).map_err(|e| {

@@ -35,7 +35,10 @@ struct Face {
 impl Face {
     fn load(file: &FontFile, px_per_em: f32) -> io::Result<Face> {
         let path = &file.path;
-        let data = std::fs::read(path)?;
+        let data = match file.embedded {
+            Some(bytes) => bytes.to_vec(),
+            None => std::fs::read(path)?,
+        };
         let mut font = Font::from_bytes(data, file.index).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -73,13 +76,16 @@ impl Face {
 /// font, the instance to draw.
 #[derive(Debug, Clone)]
 pub struct FontFile {
-    /// Path to a `.ttf` or `.ttc`.
+    /// Path to a `.ttf` or `.ttc`; for a font compiled in, a name to show.
     pub path: PathBuf,
     /// Font index inside a collection; 0 for a single font.
     pub index: u32,
     /// Axis settings for a variable font, e.g. `[(*b"wght", 700.0)]`; empty
     /// for its default instance (and for any font that does not vary).
     pub variations: Vec<([u8; 4], f32)>,
+    /// A font compiled into the program ([`crate::builtin_default`]): its
+    /// bytes, read instead of `path`.
+    pub embedded: Option<&'static [u8]>,
 }
 
 impl FontFile {
@@ -89,6 +95,17 @@ impl FontFile {
             path: path.into(),
             index: 0,
             variations: Vec::new(),
+            embedded: None,
+        }
+    }
+
+    /// A font compiled into the program, shown as `built in/<name>`.
+    pub fn builtin(name: &str, bytes: &'static [u8]) -> FontFile {
+        FontFile {
+            path: PathBuf::from("built in").join(name),
+            index: 0,
+            variations: Vec::new(),
+            embedded: Some(bytes),
         }
     }
 }
