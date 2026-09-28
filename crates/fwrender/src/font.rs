@@ -20,7 +20,7 @@
 use crate::atlas::{Metrics, Rasterizer, BOLD, ITALIC};
 use glyphs::{Canvas, Font, VerticalFit};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// A face with the scale that maps its units to the requested size.
 struct Face {
@@ -33,14 +33,16 @@ struct Face {
 }
 
 impl Face {
-    fn load(path: &Path, index: u32, px_per_em: f32) -> io::Result<Face> {
+    fn load(file: &FontFile, px_per_em: f32) -> io::Result<Face> {
+        let path = &file.path;
         let data = std::fs::read(path)?;
-        let font = Font::from_bytes(data, index).map_err(|e| {
+        let mut font = Font::from_bytes(data, file.index).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("{}: {e}", path.display()),
             )
         })?;
+        font.set_variations(&file.variations);
         let scale = px_per_em / font.units_per_em() as f32;
         let fit = VerticalFit::new(&font, px_per_em);
         // `|` is a single vertical stem in most fonts: its width is the stem.
@@ -67,13 +69,17 @@ impl Face {
     }
 }
 
-/// A font file and, for a collection, which font in it.
+/// A font file and, for a collection, which font in it; for a variable
+/// font, the instance to draw.
 #[derive(Debug, Clone)]
 pub struct FontFile {
     /// Path to a `.ttf` or `.ttc`.
     pub path: PathBuf,
     /// Font index inside a collection; 0 for a single font.
     pub index: u32,
+    /// Axis settings for a variable font, e.g. `[(*b"wght", 700.0)]`; empty
+    /// for its default instance (and for any font that does not vary).
+    pub variations: Vec<([u8; 4], f32)>,
 }
 
 impl FontFile {
@@ -82,6 +88,7 @@ impl FontFile {
         FontFile {
             path: path.into(),
             index: 0,
+            variations: Vec::new(),
         }
     }
 }
@@ -179,7 +186,7 @@ impl FontRasterizer {
                 "size must be positive",
             ));
         }
-        let main = Face::load(&regular.path, regular.index, px_per_em)?;
+        let main = Face::load(regular, px_per_em)?;
         let f = &main.font;
         let m = f.glyph_index('M').ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "the main font has no 'M'")
@@ -216,12 +223,12 @@ impl FontRasterizer {
         let mut faces: [Option<Face>; 4] = [Some(main), None, None, None];
         for (slot, file) in faces.iter_mut().skip(1).zip(styles) {
             if let Some(file) = file {
-                *slot = Some(Face::load(&file.path, file.index, px_per_em)?);
+                *slot = Some(Face::load(file, px_per_em)?);
             }
         }
         let fallbacks = fallbacks
             .iter()
-            .filter_map(|f| Face::load(&f.path, f.index, px_per_em).ok())
+            .filter_map(|f| Face::load(f, px_per_em).ok())
             .collect();
         Ok(FontRasterizer {
             styles: faces,
@@ -258,13 +265,28 @@ impl FontRasterizer {
     /// An installed family ([`crate::FontCatalog::family`]) with the
     /// [`default_fallbacks`].
     pub fn from_family(family: &crate::Family, px_per_em: f32) -> io::Result<FontRasterizer> {
+        // A variable family without bold files: bold is its own heavier
+        // instance (glyphs draws `wght` 700; a font without the axis is
+        // unchanged by it).
+        let heavier = |f: &FontFile| {
+            let mut f = f.clone();
+            f.variations.push((*b"wght", 700.0));
+            f
+        };
+        let bold = family
+            .bold
+            .clone()
+            .or_else(|| family.variable.then(|| heavier(&family.regular)));
+        let bold_italic = family.bold_italic.clone().or_else(|| {
+            family
+                .italic
+                .as_ref()
+                .filter(|_| family.variable)
+                .map(heavier)
+        });
         FontRasterizer::new(
             &family.regular,
-            [
-                family.bold.as_ref(),
-                family.italic.as_ref(),
-                family.bold_italic.as_ref(),
-            ],
+            [bold.as_ref(), family.italic.as_ref(), bold_italic.as_ref()],
             &default_fallbacks(),
             px_per_em,
         )
@@ -378,6 +400,35 @@ impl Rasterizer for FontRasterizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_variable_family_without_bold_files_draws_bold_from_its_own_file() {
+        let path = system_font_dir().join("CascadiaMono.ttf");
+        if !path.exists() {
+            eprintln!("CascadiaMono.ttf not installed; skipped");
+            return;
+        }
+        let family = crate::Family {
+            name: "Cascadia Mono".into(),
+            regular: FontFile::new(&path),
+            bold: None,
+            italic: None,
+            bold_italic: None,
+            variable: true,
+        };
+        let mut r = FontRasterizer::from_family(&family, 32.0).unwrap();
+        let m = r.metrics();
+        let mut raster = |style| {
+            let mut out = vec![0u8; (m.cell_w * m.cell_h) as usize];
+            r.rasterize('M', style, 1, &mut out);
+            out.iter().map(|&x| x as u32).sum::<u32>()
+        };
+        let (regular, bold) = (raster(0), raster(BOLD));
+        assert!(
+            bold > regular * 11 / 10,
+            "bold ink {bold} vs regular {regular}"
+        );
+    }
 
     #[test]
     fn consolas_cells_ink_styles_and_fallbacks() {

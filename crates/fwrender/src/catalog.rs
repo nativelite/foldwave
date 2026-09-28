@@ -19,8 +19,8 @@ pub struct Family {
     pub bold: Option<FontFile>,
     pub italic: Option<FontFile>,
     pub bold_italic: Option<FontFile>,
-    /// The regular face is a variable font; its other weights are not
-    /// drawn (the default instance stands in for them).
+    /// The regular face is a variable font: without bold files, bold is
+    /// drawn from it at `wght` 700 (see `FontRasterizer::from_family`).
     pub variable: bool,
 }
 
@@ -67,6 +67,7 @@ impl FontCatalog {
                     let file = FontFile {
                         path: path.clone(),
                         index: info.index,
+                        variations: Vec::new(),
                     };
                     faces.push((file, info));
                 }
