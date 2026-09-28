@@ -37,10 +37,12 @@ pub enum FromHost {
     /// The program ended with this code; the host exits after sending it.
     Exited(i32),
     /// Lines `first..` asked for with [`ToHost::History`]; a line the host no
-    /// longer holds comes back empty.
+    /// longer holds comes back empty. `wrapped[i]`: line `first + i` ran on
+    /// into the next (autowrap).
     History {
         first: u64,
         lines: Vec<Vec<Cell>>,
+        wrapped: Vec<bool>,
     },
     /// Block `block` of generation `generation` (the folder `dir` in the
     /// pane's log folder) is durable in the log: the window may read it and
@@ -89,6 +91,8 @@ pub struct Update {
     /// (`?2004h`).
     pub cursor_visible: bool,
     pub bracketed_paste: bool,
+    /// Every row's wrap mark (it ran on into the next row), top first.
+    pub wrapped: Vec<bool>,
     /// Rows that changed, with their cells.
     pub rows: Vec<(u16, Vec<Cell>)>,
     pub cursor: (u16, u16),
@@ -146,6 +150,7 @@ impl Sender {
             alt,
             cursor_visible: term.cursor_visible(),
             bracketed_paste: term.bracketed_paste(),
+            wrapped: (0..rows).map(|r| screen.row_wrapped(r)).collect(),
             rows: changed,
             cursor: (c.row as u16, c.col as u16),
             size: (rows as u16, cols as u16),
@@ -167,6 +172,17 @@ pub fn host_line(term: &vterm::Term, n: u64) -> Option<Vec<Cell>> {
     let age = (scrolled - 1 - n) as usize;
     let mut line = Vec::new();
     history.history_row(age, &mut line).then_some(line)
+}
+
+/// Whether line `n` of the host's pane (numbered as [`host_line`] numbers
+/// them) ran on into the next.
+pub fn host_wrapped(term: &vterm::Term, n: u64) -> bool {
+    let history = term.scrollback();
+    let scrolled = history.scrolled_lines();
+    if n >= scrolled {
+        return history.row_wrapped((n - scrolled) as usize);
+    }
+    history.history_wrapped((scrolled - 1 - n) as usize)
 }
 
 /// The window's display-only copy of a pane's screen.
@@ -231,6 +247,9 @@ impl Mirror {
                 padded(cells, cols, &mut row);
                 screen.copy_cells(r, 0, &row);
             }
+        }
+        for r in 0..rows {
+            screen.set_row_wrapped(r, u.wrapped.get(r).copied().unwrap_or(false));
         }
         screen.set_cursor(Cursor::new(
             (u.cursor.0 as usize).min(rows - 1),
@@ -444,6 +463,15 @@ impl FromHost {
                     b.extend_from_slice(&r.to_le_bytes());
                     put_row(&mut b, cells);
                 }
+                // Wrap marks: a count, then a bit per row.
+                b.extend_from_slice(&(u.wrapped.len() as u16).to_le_bytes());
+                for chunk in u.wrapped.chunks(8) {
+                    let byte = chunk
+                        .iter()
+                        .enumerate()
+                        .fold(0u8, |acc, (i, &w)| acc | (w as u8) << i);
+                    b.push(byte);
+                }
                 T_UPDATE
             }
             FromHost::Mark { kind, line, exit } => {
@@ -457,11 +485,16 @@ impl FromHost {
                 b.extend_from_slice(&code.to_le_bytes());
                 T_EXITED
             }
-            FromHost::History { first, lines } => {
+            FromHost::History {
+                first,
+                lines,
+                wrapped,
+            } => {
                 b.extend_from_slice(&first.to_le_bytes());
                 b.extend_from_slice(&(lines.len() as u32).to_le_bytes());
-                for line in lines {
+                for (i, line) in lines.iter().enumerate() {
                     put_row(&mut b, line);
+                    b.push(wrapped.get(i).copied().unwrap_or(false) as u8);
                 }
                 T_HISTORY
             }
@@ -495,11 +528,22 @@ impl FromHost {
                     let r = b.u16()?;
                     rows.push((r, b.row()?));
                 }
+                let marks = b.u16()? as usize;
+                let mut wrapped = Vec::with_capacity(marks);
+                for k in 0..marks.div_ceil(8) {
+                    let byte = b.u8()?;
+                    for i in 0..8 {
+                        if k * 8 + i < marks {
+                            wrapped.push(byte & (1 << i) != 0);
+                        }
+                    }
+                }
                 FromHost::Update(Update {
                     scrolled,
                     alt,
                     cursor_visible: flags & 2 != 0,
                     bracketed_paste: flags & 4 != 0,
+                    wrapped,
                     rows,
                     cursor,
                     size,
@@ -525,10 +569,16 @@ impl FromHost {
                     return Err(bad());
                 }
                 let mut lines = Vec::with_capacity(n);
+                let mut wrapped = Vec::with_capacity(n);
                 for _ in 0..n {
                     lines.push(b.row()?);
+                    wrapped.push(b.u8()? != 0);
                 }
-                FromHost::History { first, lines }
+                FromHost::History {
+                    first,
+                    lines,
+                    wrapped,
+                }
             }
             T_BLOCK => {
                 let generation = b.u32()?;
@@ -746,6 +796,7 @@ mod tests {
                         ..Cell::default()
                     }],
                 ],
+                wrapped: vec![false, true],
             },
             FromHost::BlockReady {
                 generation: 3,
@@ -793,6 +844,7 @@ mod tests {
             // Not the defaults: they must survive the trip.
             cursor_visible: false,
             bracketed_paste: true,
+            wrapped: vec![true],
             rows: vec![(
                 0,
                 vec![Cell {
@@ -807,11 +859,13 @@ mod tests {
         match FromHost::read(&mut b.as_slice()).unwrap() {
             FromHost::Update(back) => {
                 assert!(!back.cursor_visible && back.bracketed_paste, "modes kept");
+                assert_eq!(back.wrapped, [true], "wrap marks kept");
                 assert_eq!(back.rows, u.rows);
             }
             _ => panic!("not an update"),
         }
-        let at = b.len() - 1; // the row's text, last: one byte, 'x'
+        // The row's text: its one byte, 'x' (the wrap marks come after it).
+        let at = b.iter().rposition(|&c| c == b'x').expect("the row's text");
         assert_eq!(b[at], b'x');
         b[at] = 0xFF; // not UTF-8
         assert!(FromHost::read(&mut b.as_slice()).is_err());

@@ -64,28 +64,45 @@ impl Selection {
 }
 
 /// The text from `start` to `end` inclusive, `cols` wide. `line(n)` gives
-/// line `n`'s characters (a wide character once, its second half left out),
-/// or `None` if the line is no longer held. Each line loses its trailing
-/// spaces; lines are joined with CR LF, as the Windows clipboard expects.
+/// line `n`'s characters (a wide character once, its second half left out)
+/// and whether the line wrapped onto the next (the emulator's autowrap), or
+/// `None` if the line is no longer held. A line that ends in a line break
+/// loses its trailing spaces and is joined to the next with CR LF, as the
+/// Windows clipboard expects; a wrapped one runs straight on, spaces and all,
+/// so a long line copies as the one line it was.
 pub fn text(
     start: Point,
     end: Point,
     cols: usize,
-    mut line: impl FnMut(u64, usize, usize) -> Option<String>,
+    mut line: impl FnMut(u64, usize, usize) -> Option<(String, bool)>,
 ) -> String {
     let mut out = String::new();
-    let mut first = true;
+    // Whether the last line taken ran on into this one.
+    let mut run_on: Option<bool> = None;
     for n in start.line..=end.line {
         let from = if n == start.line { start.col } else { 0 };
         let to = if n == end.line { end.col + 1 } else { cols };
-        let Some(text) = line(n, from, to.min(cols)) else {
+        let Some((text, wrapped)) = line(n, from, to.min(cols)) else {
+            run_on = None;
             continue;
         };
-        if !first {
+        // A break after a line that ended in one, or where a lost line came
+        // between (the two did not meet); the line before loses its spaces.
+        let brk = match run_on {
+            Some(ran_on) => !ran_on,
+            None => !out.is_empty(),
+        };
+        if brk {
+            let kept = out.trim_end_matches(' ').len();
+            out.truncate(kept);
             out.push_str("\r\n");
         }
-        first = false;
-        out.push_str(text.trim_end_matches(' '));
+        out.push_str(&text);
+        run_on = Some(wrapped && n != end.line);
+    }
+    if run_on != Some(true) {
+        let kept = out.trim_end_matches(' ').len();
+        out.truncate(kept);
     }
     out
 }
@@ -201,18 +218,50 @@ mod tests {
     #[test]
     fn text_joins_lines_trims_trailing_spaces_and_skips_lost_lines() {
         let lines = ["hello world   ", "second line   ", "gone", "last one  "];
-        let get = |n: u64, from: usize, to: usize| -> Option<String> {
+        let get = |n: u64, from: usize, to: usize| -> Option<(String, bool)> {
             if n == 2 {
                 return None;
             }
             let l: Vec<char> = lines[n as usize].chars().collect();
-            Some(l[from.min(l.len())..to.min(l.len())].iter().collect())
+            Some((
+                l[from.min(l.len())..to.min(l.len())].iter().collect(),
+                false,
+            ))
         };
         assert_eq!(text(pt(0, 6), pt(0, 10), 14, get), "world");
         assert_eq!(
             text(pt(0, 6), pt(3, 3), 14, get),
             "world\r\nsecond line\r\nlast"
         );
+    }
+
+    #[test]
+    fn a_wrapped_line_copies_as_one_line_with_its_spaces() {
+        // "echo one two three" wrapped on a 10-column screen, then "done".
+        let rows = [
+            ("echo one t", true),
+            ("wo three  ", false),
+            ("done      ", false),
+        ];
+        let get = |n: u64, from: usize, to: usize| -> Option<(String, bool)> {
+            let (l, w) = rows[n as usize];
+            let l: Vec<char> = l.chars().collect();
+            Some((l[from.min(l.len())..to.min(l.len())].iter().collect(), w))
+        };
+        assert_eq!(
+            text(pt(0, 0), pt(2, 9), 10, get),
+            "echo one two three\r\ndone"
+        );
+        // A wrap at a space keeps it: "ab " + "cd".
+        let spaced = [("ab ", true), ("cd", false)];
+        let get = |n: u64, from: usize, to: usize| -> Option<(String, bool)> {
+            let (l, w) = spaced[n as usize];
+            let l: Vec<char> = l.chars().collect();
+            Some((l[from.min(l.len())..to.min(l.len())].iter().collect(), w))
+        };
+        assert_eq!(text(pt(0, 0), pt(1, 2), 3, get), "ab cd");
+        // A selection ending on a wrapped row still loses its trailing spaces.
+        assert_eq!(text(pt(0, 0), pt(0, 2), 3, get), "ab");
     }
 
     #[test]

@@ -168,14 +168,23 @@ pub fn run(args: &Args) -> io::Result<i32> {
                         }
                     }
                     Ok(ToHost::History { first, count }) => {
-                        let lines: Vec<_> = match &*shared.term.lock().unwrap() {
+                        let (lines, wrapped): (Vec<_>, Vec<_>) = match &*shared.term.lock().unwrap()
+                        {
                             Emu::Local(t) => (first..first + u64::from(count.min(HISTORY_MAX)))
-                                .map(|n| crate::wire::host_line(t, n).unwrap_or_default())
-                                .collect(),
-                            Emu::Remote(_) => Vec::new(),
+                                .map(|n| {
+                                    let line = crate::wire::host_line(t, n).unwrap_or_default();
+                                    (line, crate::wire::host_wrapped(t, n))
+                                })
+                                .unzip(),
+                            Emu::Remote(_) => (Vec::new(), Vec::new()),
                         };
                         let mut o = out.lock().unwrap();
-                        let _ = FromHost::History { first, lines }.write(&mut *o);
+                        let _ = FromHost::History {
+                            first,
+                            lines,
+                            wrapped,
+                        }
+                        .write(&mut *o);
                         let _ = o.flush();
                     }
                     Err(_) => {

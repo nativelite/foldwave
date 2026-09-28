@@ -90,7 +90,7 @@ mod app {
         Atlas, CellInstance, CpuRenderer, FontRasterizer, Frame, GlyphKey, GlyphPart, Highlight,
         Metrics, Palette, Rasterizer, Sharpening,
     };
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::io;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1655,7 +1655,9 @@ keys:
         /// An isolated pane's host crashed and is to be restarted.
         host_died: AtomicBool,
         /// An isolated pane waiting for history lines from its host.
-        history_reply: Mutex<Option<std::sync::mpsc::Sender<(u64, Vec<Vec<ansi::Cell>>)>>>,
+        #[allow(clippy::type_complexity)]
+        history_reply:
+            Mutex<Option<std::sync::mpsc::Sender<(u64, Vec<Vec<ansi::Cell>>, Vec<bool>)>>>,
         /// Output since the last checkpoint sent to the log.
         since_checkpoint: AtomicU64,
         /// Output in the log's current generation.
@@ -1848,14 +1850,19 @@ keys:
         /// For an isolated pane, the lines in `lines` that have left its
         /// screen, fetched from its host (which holds its history), waiting
         /// up to half a second. Empty for a local pane: its history is here.
-        fn history_for(&self, lines: std::ops::Range<u64>) -> HashMap<u64, Vec<ansi::Cell>> {
+        #[allow(clippy::type_complexity)]
+        fn history_for(
+            &self,
+            lines: std::ops::Range<u64>,
+        ) -> (HashMap<u64, Vec<ansi::Cell>>, HashSet<u64>) {
+            let none = || (HashMap::new(), HashSet::new());
             let scrolled = match &*self.shared.term.lock().unwrap() {
                 Emu::Remote(m) => m.scrolled,
-                Emu::Local(_) => return HashMap::new(),
+                Emu::Local(_) => return none(),
             };
             let end = lines.end.min(scrolled);
             if lines.start >= end {
-                return HashMap::new();
+                return none();
             }
             let count = (end - lines.start).min(100_000) as u32;
             let (tx, rx) = std::sync::mpsc::channel();
@@ -1867,16 +1874,25 @@ keys:
                 .ask_history(lines.start, count)
                 .is_err()
             {
-                return HashMap::new();
+                return none();
             }
             match rx.recv_timeout(Duration::from_millis(500)) {
-                Ok((first, got)) => got
-                    .into_iter()
-                    .enumerate()
-                    .filter(|(_, l)| !l.is_empty())
-                    .map(|(i, l)| (first + i as u64, l))
-                    .collect(),
-                Err(_) => HashMap::new(),
+                Ok((first, got, wrapped)) => {
+                    let runs_on = wrapped
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, &w)| w)
+                        .map(|(i, _)| first + i as u64)
+                        .collect();
+                    let lines = got
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(_, l)| !l.is_empty())
+                        .map(|(i, l)| (first + i as u64, l))
+                        .collect();
+                    (lines, runs_on)
+                }
+                Err(_) => none(),
             }
         }
 
@@ -1931,17 +1947,23 @@ keys:
                     None => String::new(),
                 };
             }
-            let fetched = self.history_for(start.line..end.line + 1);
+            let (fetched, fetched_wrapped) = self.history_for(start.line..end.line + 1);
             let term = self.shared.term.lock().unwrap();
             select::text(start, end, term.screen().cols(), |n, from, to| {
                 let chars = Self::line_chars(&term, n, &fetched)?;
-                Some(
-                    chars[from.min(chars.len())..to.min(chars.len())]
-                        .iter()
-                        .filter(|(_, half)| !half)
-                        .map(|(c, _)| c)
-                        .collect(),
-                )
+                // Whether line `n` ran on into the next: from the host for
+                // lines fetched from it, else from what the pane holds.
+                let wrapped = if fetched.contains_key(&n) {
+                    fetched_wrapped.contains(&n)
+                } else {
+                    term.line_wrapped(n)
+                };
+                let text = chars[from.min(chars.len())..to.min(chars.len())]
+                    .iter()
+                    .filter(|(_, half)| !half)
+                    .map(|(c, _)| c)
+                    .collect();
+                Some((text, wrapped))
             })
         }
 
@@ -2326,13 +2348,12 @@ keys:
         select::text(start, end, s.cols(), |n, from, to| {
             let n = usize::try_from(n).ok().filter(|&n| n < s.rows())?;
             let chars = screen_row(s, n);
-            Some(
-                chars[from.min(chars.len())..to.min(chars.len())]
-                    .iter()
-                    .filter(|(_, half)| !half)
-                    .map(|(c, _)| c)
-                    .collect(),
-            )
+            let text = chars[from.min(chars.len())..to.min(chars.len())]
+                .iter()
+                .filter(|(_, half)| !half)
+                .map(|(c, _)| c)
+                .collect();
+            Some((text, s.row_wrapped(n)))
         })
     }
 
@@ -2872,9 +2893,13 @@ keys:
                         };
                         shared.blocks.lock().unwrap().mark(kind, line, exit);
                     }
-                    Ok(wire::FromHost::History { first, lines }) => {
+                    Ok(wire::FromHost::History {
+                        first,
+                        lines,
+                        wrapped,
+                    }) => {
                         if let Some(tx) = shared.history_reply.lock().unwrap().take() {
-                            let _ = tx.send((first, lines));
+                            let _ = tx.send((first, lines, wrapped));
                         }
                         continue;
                     }
@@ -4344,6 +4369,29 @@ keys:
                 catching_up: AtomicBool::new(false),
                 want: AtomicBool::new(false),
             })
+        }
+
+        #[test]
+        fn a_pane_knows_which_lines_wrapped_on_screen_and_in_history() {
+            let mut t = Term::with_history(2, 4, 10);
+            // "abcdefgh" wraps (line 0 runs on into 1), then "xy" alone.
+            t.feed(b"abcdefgh\r\nxy");
+            let emu = Emu::Local(t);
+            // Lines: 0 "abcd" (history, wrapped), 1 "efgh", 2 "xy".
+            assert_eq!(emu.scrolled_lines(), 1);
+            assert!(emu.line_wrapped(0), "in history");
+            assert!(!emu.line_wrapped(1) && !emu.line_wrapped(2));
+            let none = HashMap::new();
+            let (start, end) = (Point { line: 0, col: 0 }, Point { line: 1, col: 3 });
+            let text = select::text(start, end, 4, |n, from, to| {
+                let chars = Pane::line_chars(&emu, n, &none)?;
+                let s = chars[from..to.min(chars.len())]
+                    .iter()
+                    .map(|(c, _)| c)
+                    .collect();
+                Some((s, emu.line_wrapped(n)))
+            });
+            assert_eq!(text, "abcdefgh", "copied as the one line it was");
         }
 
         #[test]

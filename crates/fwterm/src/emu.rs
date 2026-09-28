@@ -39,6 +39,20 @@ impl Emu {
         }
     }
 
+    /// Whether output line `n` (numbered as [`Emu::scrolled_lines`] counts:
+    /// history, then screen rows) ran on into the next. A mirror knows only
+    /// its screen rows; its history lines come from the host.
+    pub fn line_wrapped(&self, n: u64) -> bool {
+        let scrolled = self.scrolled_lines();
+        if n >= scrolled {
+            return self.screen().row_wrapped((n - scrolled) as usize);
+        }
+        match self {
+            Emu::Local(t) => t.scrollback().history_wrapped((scrolled - 1 - n) as usize),
+            Emu::Remote(_) => false,
+        }
+    }
+
     /// The program's cursor is shown (`?25h`, the default) or hidden.
     pub fn cursor_visible(&self) -> bool {
         match self {
