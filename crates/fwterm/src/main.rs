@@ -1465,6 +1465,9 @@ keys:
         took: Option<Duration>,
     }
 
+    /// How often a selection dragged past a pane's edge scrolls it.
+    const EDGE_SCROLL_EVERY: Duration = Duration::from_millis(50);
+
     /// Hits kept per generation of each pane.
     const FIND_LIMIT: usize = 500;
 
@@ -3320,6 +3323,10 @@ keys:
         // may become a drag started.
         let mut selection: Option<(PaneId, Selection)> = None;
         let mut press: Option<(PaneId, Point)> = None;
+        // A drag held past a pane's top or bottom: the pointer (client
+        // pixels), and when the view last scrolled for it.
+        let mut drag_edge: Option<(i32, i32)> = None;
+        let mut edge_scrolled = Instant::now();
         // Mark the pane holding the selection for redraw, and drop it.
         let clear = |selection: &mut Option<(PaneId, Selection)>, panes: &[Pane]| {
             if let Some((id, _)) = selection.take() {
@@ -3356,6 +3363,12 @@ keys:
             let timeout = match last_draw {
                 Some(t) if due => Some(interval.saturating_sub(t.elapsed())),
                 _ => None,
+            };
+            // A drag held past the edge scrolls on a tick, moving or not.
+            let timeout = match (drag_edge, timeout) {
+                (Some(_), Some(t)) => Some(t.min(EDGE_SCROLL_EVERY)),
+                (Some(_), None) => Some(EDGE_SCROLL_EVERY),
+                (None, t) => t,
             };
             events.clear();
             surface.window().wait(timeout, &mut events);
@@ -3773,6 +3786,9 @@ keys:
                     Event::Drag(x, y) => {
                         if let Some((id, anchor)) = press {
                             if let Some(pane) = panes.iter().find(|p| p.id == id) {
+                                let row = y.div_euclid(m.cell_h as i32) - pane.rect.top as i32;
+                                let out = select::edge_scroll(row, pane.rect.rows) != 0;
+                                drag_edge = out.then_some((x, y));
                                 if let Some(head) = pane.point(x, y, m) {
                                     if head != anchor || selection.is_some() {
                                         let log = pane.deep.as_ref().map(|d| d.at);
@@ -3783,7 +3799,10 @@ keys:
                             }
                         }
                     }
-                    Event::Release(..) => press = None,
+                    Event::Release(..) => {
+                        press = None;
+                        drag_edge = None;
+                    }
                     Event::Wheel(delta) => {
                         // Scrolling leaves a search hit for the live view.
                         if panes[fi].find_view.take().is_some() {
@@ -3880,6 +3899,35 @@ keys:
                 // The last pane closed: so does the window, with its code.
                 finish(&frames);
                 return Ok(code);
+            }
+            // A selection dragged past a pane's edge: scroll and extend it,
+            // in the live and memory view (the log view's rows would not
+            // stay under the selection), no further back than memory holds.
+            if let (Some((id, anchor)), Some((x, y))) = (press, drag_edge) {
+                if edge_scrolled.elapsed() >= EDGE_SCROLL_EVERY {
+                    edge_scrolled = Instant::now();
+                    if let Some(p) = panes.iter_mut().find(|p| p.id == id && p.deep.is_none()) {
+                        let row = y.div_euclid(m.cell_h as i32) - p.rect.top as i32;
+                        let step = select::edge_scroll(row, p.rect.rows);
+                        let held = p.shared.term.lock().unwrap().scrollback().history_len();
+                        p.back = if step < 0 {
+                            (p.back + step.unsigned_abs() as usize).min(held)
+                        } else {
+                            p.back.saturating_sub(step as usize)
+                        };
+                        if let Some(head) = p.point(x, y, m) {
+                            selection = Some((
+                                id,
+                                Selection {
+                                    anchor,
+                                    head,
+                                    log: None,
+                                },
+                            ));
+                        }
+                        p.shared.pending.store(true, Ordering::Release);
+                    }
+                }
             }
             // Search results, when the search thread has them.
             if let Some(f) = find_bar.as_mut() {

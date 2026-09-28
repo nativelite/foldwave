@@ -104,6 +104,22 @@ fn class(c: char) -> u8 {
     }
 }
 
+/// While a selection is dragged past a pane's top or bottom, how many lines
+/// to scroll each tick, given the pointer's row relative to the pane
+/// (negative above it) and the pane's `rows`: back into history (negative)
+/// above, toward live (positive) below, faster the farther out, at most half
+/// the pane; 0 inside.
+pub fn edge_scroll(row: i32, rows: usize) -> i32 {
+    let cap = (rows as i32 / 2).max(1);
+    if row < 0 {
+        -(-row).min(cap)
+    } else if row >= rows as i32 {
+        (row - rows as i32 + 1).min(cap)
+    } else {
+        0
+    }
+}
+
 /// The columns of the word under column `col` of a line, `(first, last)`:
 /// the run of characters of the same kind (word characters, delimiters or
 /// spaces) around it. `chars` has one entry per column.
@@ -136,6 +152,20 @@ mod tests {
 
     fn pt(line: u64, col: usize) -> Point {
         Point { line, col }
+    }
+
+    #[test]
+    fn a_drag_past_the_edge_scrolls_faster_the_farther_out() {
+        assert_eq!(edge_scroll(0, 20), 0);
+        assert_eq!(edge_scroll(19, 20), 0);
+        assert_eq!(edge_scroll(-1, 20), -1, "just above: back one line");
+        assert_eq!(edge_scroll(-4, 20), -4);
+        assert_eq!(edge_scroll(-50, 20), -10, "at most half the pane");
+        assert_eq!(edge_scroll(20, 20), 1, "just below: toward live");
+        assert_eq!(edge_scroll(22, 20), 3);
+        assert_eq!(edge_scroll(0, 1), 0);
+        assert_eq!(edge_scroll(5, 1), 1, "a one-row pane still scrolls");
+        assert_eq!(edge_scroll(-3, 1), -1);
     }
 
     #[test]
