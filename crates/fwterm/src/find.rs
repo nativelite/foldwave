@@ -6,11 +6,12 @@
 //! first; these helpers order the hits, clean a log line for the search bar,
 //! and find the match on a rebuilt screen row to highlight it.
 
-/// One match in one pane's log.
+/// One match in one pane's log, or in its memory for a pane without one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hit {
     pub pane: usize,
-    /// The pane's log folder: a closed pane's hits are shown from it.
+    /// The pane's log folder (a closed pane's hits are shown from it);
+    /// empty for a hit in memory.
     pub dir: std::path::PathBuf,
     /// Line in the pane's logs, counted across its generations (as the log
     /// view counts them).
@@ -75,6 +76,38 @@ pub fn clean(raw: &[u8], max: usize) -> String {
     String::from_utf8_lossy(&out).chars().take(max).collect()
 }
 
+/// Hits for `needle` (ignoring ASCII case) in a pane's lines held in memory,
+/// for a pane without a log (`--no-log`): `lines` gives each line's number
+/// and characters, oldest first; at most `limit` hits, the newest. Such a
+/// hit has no log folder (`dir` empty) and orders by its line.
+pub fn search_lines(
+    pane: usize,
+    lines: impl Iterator<Item = (u64, Vec<char>)>,
+    needle: &str,
+    limit: usize,
+) -> Vec<Hit> {
+    let mut hits: Vec<Hit> = lines
+        .filter(|(_, row)| match_in_row(row, needle).is_some())
+        .map(|(line, row)| Hit {
+            pane,
+            dir: std::path::PathBuf::new(),
+            line,
+            text: row
+                .iter()
+                .collect::<String>()
+                .trim_end()
+                .chars()
+                .take(240)
+                .collect(),
+            generation: 0,
+            offset: line,
+        })
+        .collect();
+    let drop = hits.len().saturating_sub(limit);
+    hits.drain(..drop);
+    hits
+}
+
 /// Where `needle` sits in a screen row, ignoring ASCII case: the first and
 /// last columns it covers. `row` has one char per column.
 pub fn match_in_row(row: &[char], needle: &str) -> Option<(usize, usize)> {
@@ -118,6 +151,45 @@ mod tests {
         order(&mut h);
         let got: Vec<(usize, u64)> = h.iter().map(|h| (h.pane, h.offset)).collect();
         assert_eq!(got, vec![(1, 1), (0, 90), (0, 5), (2, 7)]);
+    }
+
+    #[test]
+    fn lines_in_memory_are_searched_and_the_newest_kept() {
+        let lines = [
+            "build ok",
+            "ERROR one",
+            "fine",
+            "an error two",
+            "error three  ",
+        ];
+        let rows = || {
+            lines
+                .iter()
+                .enumerate()
+                .map(|(i, l)| (100 + i as u64, l.chars().collect::<Vec<char>>()))
+        };
+        let hits = search_lines(3, rows(), "error", 10);
+        let got: Vec<(u64, &str)> = hits.iter().map(|h| (h.line, h.text.as_str())).collect();
+        assert_eq!(
+            got,
+            [
+                (101, "ERROR one"),
+                (103, "an error two"),
+                (104, "error three")
+            ]
+        );
+        assert!(hits
+            .iter()
+            .all(|h| h.pane == 3 && h.dir.as_os_str().is_empty()));
+        // Over the limit: the newest are kept.
+        let two: Vec<u64> = search_lines(3, rows(), "error", 2)
+            .iter()
+            .map(|h| h.line)
+            .collect();
+        assert_eq!(two, [103, 104]);
+        let mut h = hits.clone();
+        order(&mut h);
+        assert_eq!(h[0].line, 104, "newest first");
     }
 
     #[test]

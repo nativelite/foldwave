@@ -1010,7 +1010,10 @@ M4, [`logstore.rs`](../crates/fwterm/src/logstore.rs)).**
   search walks them all (`Session::pane_dirs`). A closed pane's hit shows in
   the focused pane, rebuilt from that closed pane's log, and the bar says
   "in closed pane N".
-- Not yet: regular expressions, searching panes without a log (`--no-log`).
+- Panes without a log (`--no-log`) are searched in what memory holds (their
+  history and screen, 2026-09-27; `find::search_lines`): a hit scrolls the
+  pane to put its line a third of the way down, the match highlighted.
+- Not yet: regular expressions.
 - A background indexer over data segments: an n-gram (e.g. trigram) index per
   segment for substring search, and a marks index for structure.
 - Queries run across panes and time: "errors in any pane in the last hour",

@@ -1925,7 +1925,10 @@ keys:
             self.seen_scrolled = scrolled;
             let held = history.history_len();
             let (rows, cols) = (term.screen().rows(), term.screen().cols());
-            if let Some((line, needle)) = self.find_view.clone() {
+            let logged = self.find_dir.is_some() || self.pane_dir.is_some();
+            // A search hit in a pane without a log: shown from memory, below.
+            let find_here = self.find_view.clone().filter(|_| !logged);
+            if let Some((line, needle)) = self.find_view.clone().filter(|_| logged) {
                 // A search hit: the log rebuilt a little past its line, the
                 // match highlighted where it landed.
                 if self.deep.as_ref().map_or(true, |d| d.total <= line) {
@@ -1993,14 +1996,20 @@ keys:
                 }
             } else {
                 self.deep = None;
+                let oldest = scrolled - held as u64;
+                if let Some((line, _)) = &find_here {
+                    // Its line a third of the way down the view.
+                    let top = line.saturating_sub(rows as u64 / 3).max(oldest);
+                    self.back = scrolled.saturating_sub(top) as usize;
+                }
                 self.back = self.back.min(held);
                 let top = scrolled.saturating_sub(self.back as u64);
                 let live_end = scrolled + rows as u64;
-                let oldest = scrolled - held as u64;
                 self.folds.forget_before(oldest);
                 // Live, the prompt stays at the bottom and folds let older
                 // lines show above; scrolled back, the view keeps its top.
-                let folded = (!term.in_alternate_screen())
+                // A search hit shows its lines unfolded.
+                let folded = (!term.in_alternate_screen() && find_here.is_none())
                     .then(|| match self.back {
                         0 => self.folds.live_view(live_end, rows, oldest),
                         _ => self.folds.view(top, rows, live_end),
@@ -2076,9 +2085,26 @@ keys:
                         .collect();
                 } else {
                     self.row_lines.clear();
-                    let highlight = selection
-                        .and_then(|sel| sel.in_view(top, rows, cols))
-                        .map(|(start, end)| Highlight { start, end });
+                    let highlight = match &find_here {
+                        // The match on the hit's line.
+                        Some((line, needle)) => (*line >= top && *line < top + rows as u64)
+                            .then(|| Pane::line_chars(&term, *line, &HashMap::new()))
+                            .flatten()
+                            .and_then(|l| {
+                                let chars: Vec<char> = l.into_iter().map(|(c, _)| c).collect();
+                                find::match_in_row(&chars, needle)
+                            })
+                            .map(|(a, b)| {
+                                let row = (*line - top) as usize;
+                                Highlight {
+                                    start: (row, a),
+                                    end: (row, b),
+                                }
+                            }),
+                        None => selection
+                            .and_then(|sel| sel.in_view(top, rows, cols))
+                            .map(|(start, end)| Highlight { start, end }),
+                    };
                     frame.update_view_at(
                         r.top,
                         r.left,
@@ -3205,10 +3231,27 @@ keys:
                                     Some(store) => store.session.pane_dirs(),
                                     None => Vec::new(),
                                 };
+                                // Panes without a log: what memory holds.
+                                let started = Instant::now();
+                                let memory: Vec<find::Hit> = panes
+                                    .iter()
+                                    .filter(|p| p.pane_dir.is_none())
+                                    .flat_map(|p| {
+                                        let term = p.shared.term.lock().unwrap();
+                                        let scrolled = term.scrolled_lines();
+                                        let held = term.scrollback().history_len() as u64;
+                                        let end = scrolled + term.screen().rows() as u64;
+                                        let none = HashMap::new();
+                                        let lines = (scrolled - held..end).filter_map(|n| {
+                                            let l = Pane::line_chars(&term, n, &none)?;
+                                            Some((n, l.into_iter().map(|(c, _)| c).collect()))
+                                        });
+                                        find::search_lines(p.id, lines, &f.query, FIND_LIMIT)
+                                    })
+                                    .collect();
                                 let (tx, rx) = std::sync::mpsc::channel();
                                 let (needle, w) = (f.query.clone(), waker.clone());
                                 std::thread::spawn(move || {
-                                    let started = Instant::now();
                                     // Every pane at once: each opens and
                                     // searches its own generations.
                                     let mut all: Vec<find::Hit> = std::thread::scope(|sc| {
@@ -3226,6 +3269,7 @@ keys:
                                             .flat_map(|h| h.join().unwrap_or_default())
                                             .collect()
                                     });
+                                    all.extend(memory);
                                     find::order(&mut all);
                                     let _ = tx.send((all, started.elapsed()));
                                     w.wake();
