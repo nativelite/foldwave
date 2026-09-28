@@ -24,10 +24,19 @@ pub struct Family {
     pub variable: bool,
 }
 
-/// The folders fonts are installed in: the system's, then the current
-/// user's (`%LOCALAPPDATA%\Microsoft\Windows\Fonts`, Windows 10 1809+).
+/// The folders fonts are looked for in: `fonts/` beside the program, where
+/// fonts shipped with it go (Cascadia Mono with its italic,
+/// `tools/fetch_cascadia.py`), then the system's, then the current user's
+/// (`%LOCALAPPDATA%\Microsoft\Windows\Fonts`, Windows 10 1809+). Shipped
+/// fonts come first, so where a style is found in several places (the system
+/// has an upright Cascadia Mono too) the shipped one is taken.
 pub fn font_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![system_font_dir()];
+    let mut dirs: Vec<PathBuf> = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.join("fonts")))
+        .into_iter()
+        .collect();
+    dirs.push(system_font_dir());
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
         dirs.push(PathBuf::from(local).join("Microsoft\\Windows\\Fonts"));
     }
@@ -122,6 +131,8 @@ impl FontCatalog {
             usable
                 .iter()
                 .filter(|(_, f)| f.italic == italic && (f.weight >= 600) == bold)
+                // Of equally close faces, the first found: shipped fonts
+                // are scanned first (see `font_dirs`).
                 .min_by_key(|(_, f)| (i32::from(f.weight) - target).abs())
                 .map(|(file, f)| (file.clone(), f.variable, f.family.clone()))
         };
@@ -176,6 +187,51 @@ mod tests {
                 variable: false,
             },
         )
+    }
+
+    /// Cascadia Mono as `tools/fetch_cascadia.py` ships it beside fwterm,
+    /// ahead of the system's fonts: upright and italic from the shipped pair,
+    /// each drawn bold at `wght` 700. Skipped until the fonts are fetched.
+    #[test]
+    fn shipped_cascadia_mono_has_italic_and_bold_italic() {
+        use crate::Rasterizer;
+        let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        let Some(shipped) = ["release", "debug"]
+            .iter()
+            .map(|p| target.join(p).join("fonts"))
+            .find(|d| d.join("CascadiaMonoItalic.ttf").is_file())
+        else {
+            eprintln!("Cascadia Mono not fetched (tools/fetch_cascadia.py); skipped");
+            return;
+        };
+        let cat = FontCatalog::scan(&[shipped.clone(), crate::font::system_font_dir()]);
+        let f = cat.family("Cascadia Mono").unwrap();
+        assert!(
+            f.regular.path.starts_with(&shipped),
+            "the shipped upright first"
+        );
+        let italic = f.italic.as_ref().expect("an italic face");
+        assert!(italic.path.ends_with("CascadiaMonoItalic.ttf"));
+        assert!(f.variable && f.bold.is_none() && f.bold_italic.is_none());
+
+        let mut r = crate::FontRasterizer::from_family(&f, 32.0).unwrap();
+        let m = r.metrics();
+        let mut ink = |style| {
+            let mut out = vec![0u8; (m.cell_w * m.cell_h) as usize];
+            r.rasterize('a', style, 1, &mut out);
+            out
+        };
+        let sum = |v: &[u8]| v.iter().map(|&x| x as u32).sum::<u32>();
+        let (upright, slanted) = (ink(0), ink(crate::ITALIC));
+        assert_ne!(
+            upright, slanted,
+            "italic is its own design, not the upright"
+        );
+        let bold_italic = ink(crate::BOLD | crate::ITALIC);
+        assert!(
+            sum(&bold_italic) > sum(&slanted) * 11 / 10,
+            "bold italic heavier"
+        );
     }
 
     fn catalog() -> FontCatalog {
