@@ -19,6 +19,10 @@ pub struct Point {
 pub struct Selection {
     pub anchor: Point,
     pub head: Point,
+    /// Made in the view rebuilt from a pane's log: which rebuilt screen (the
+    /// log line it ends before), whose rows its `line`s then are. `None` in
+    /// the live view, where lines are output lines.
+    pub log: Option<u64>,
 }
 
 impl Selection {
@@ -139,6 +143,7 @@ mod tests {
         let s = Selection {
             anchor: pt(12, 5),
             head: pt(10, 2),
+            log: None,
         };
         assert_eq!(s.ordered(), (pt(10, 2), pt(12, 5)));
         // View of 4 rows x 8 cols starting at line 10.

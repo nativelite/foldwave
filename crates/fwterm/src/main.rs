@@ -1793,15 +1793,22 @@ keys:
         }
 
         /// The output line and column under client pixel `(x, y)`, clamped
-        /// into the pane (a drag can leave it). `None` while the view shows
-        /// the log, whose lines are not the emulator's.
+        /// into the pane (a drag can leave it). While the view shows the
+        /// screen rebuilt from the log, whose lines are not the emulator's,
+        /// the line is that screen's row (see [`Selection::log`]).
         fn point(&self, x: i32, y: i32, m: Metrics) -> Option<Point> {
-            if self.deep.is_some() || !self.visible() {
+            if !self.visible() {
                 return None;
             }
             let r = self.rect;
             let row = (y.div_euclid(m.cell_h as i32) - r.top as i32).clamp(0, r.rows as i32 - 1);
             let col = (x.div_euclid(m.cell_w as i32) - r.left as i32).clamp(0, r.cols as i32 - 1);
+            if self.deep.is_some() {
+                return Some(Point {
+                    line: row as u64,
+                    col: col as usize,
+                });
+            }
             // The view as last drawn: its top row is `seen_scrolled - back`,
             // or, with folds in view, the rows it drew.
             let top = self.seen_scrolled.saturating_sub(self.back as u64);
@@ -1913,6 +1920,14 @@ keys:
         /// The selected text.
         fn selection_text(&self, sel: &Selection) -> String {
             let (start, end) = sel.ordered();
+            if let Some(at) = sel.log {
+                // Made in the view rebuilt from the log: its rows, while that
+                // screen is still the one shown.
+                return match self.deep.as_ref().filter(|d| d.at == at) {
+                    Some(d) => screen_text(d.term.screen(), start, end),
+                    None => String::new(),
+                };
+            }
             let fetched = self.history_for(start.line..end.line + 1);
             let term = self.shared.term.lock().unwrap();
             select::text(start, end, term.screen().cols(), |n, from, to| {
@@ -1929,11 +1944,19 @@ keys:
 
         /// The word under `at`, as a selection.
         fn word_at(&self, at: Point) -> Option<Selection> {
-            let term = self.shared.term.lock().unwrap();
-            let chars: Vec<char> = Self::line_chars(&term, at.line, &HashMap::new())?
-                .into_iter()
-                .map(|(c, _)| c)
-                .collect();
+            let log = self.deep.as_ref().map(|d| d.at);
+            let chars: Vec<char> = match &self.deep {
+                // The view rebuilt from the log: `at.line` is its row.
+                Some(d) => (at.line < d.term.screen().rows() as u64)
+                    .then(|| screen_row(d.term.screen(), at.line as usize))?,
+                None => {
+                    let term = self.shared.term.lock().unwrap();
+                    Self::line_chars(&term, at.line, &HashMap::new())?
+                }
+            }
+            .into_iter()
+            .map(|(c, _)| c)
+            .collect();
             let (first, last) = select::word_at(&chars, at.col);
             Some(Selection {
                 anchor: Point {
@@ -1944,6 +1967,7 @@ keys:
                     line: at.line,
                     col: last,
                 },
+                log,
             })
         }
 
@@ -2044,6 +2068,7 @@ keys:
                             start: (row, a),
                             end: (row, b),
                         });
+                    let highlight = log_selection(selection, d, rows, cols).or(highlight);
                     frame.update_view_at(
                         r.top,
                         r.left,
@@ -2071,6 +2096,7 @@ keys:
                     let end = d.total.saturating_sub(self.back as u64);
                     let _ = d.rebuild(end.max(1), rows, cols, pipe);
                     let s = d.term.screen();
+                    let highlight = log_selection(selection, d, rows, cols);
                     frame.update_view_at(
                         r.top,
                         r.left,
@@ -2078,7 +2104,7 @@ keys:
                         s,
                         0,
                         false,
-                        None,
+                        highlight,
                         pen.palette,
                         pen.atlas,
                         pen.raster,
@@ -2143,6 +2169,7 @@ keys:
                         .flatten()
                         .map(|row| ansi::Cursor::new(row, at.col));
                     let highlight = selection
+                        .filter(|sel| sel.log.is_none())
                         .and_then(|sel| {
                             let (a, b) = sel.ordered();
                             fold::highlight(view, cols, (a.line, a.col), (b.line, b.col))
@@ -2192,6 +2219,7 @@ keys:
                                 }
                             }),
                         None => selection
+                            .filter(|sel| sel.log.is_none())
                             .and_then(|sel| sel.in_view(top, rows, cols))
                             .map(|(start, end)| Highlight { start, end }),
                     };
@@ -2255,6 +2283,52 @@ keys:
                 }
             }
         }
+    }
+
+    /// A selection made on the screen `d` has rebuilt from the log, as that
+    /// screen's highlight; `None` for any other selection.
+    fn log_selection(
+        selection: Option<&Selection>,
+        d: &Deep,
+        rows: usize,
+        cols: usize,
+    ) -> Option<Highlight> {
+        selection
+            .filter(|sel| sel.log == Some(d.at))
+            .and_then(|sel| sel.in_view(0, rows, cols))
+            .map(|(start, end)| Highlight { start, end })
+    }
+
+    /// A screen row as characters, each with whether it is the second half
+    /// of a wide one.
+    fn screen_row(s: &ansi::Screen, r: usize) -> Vec<(char, bool)> {
+        let mut lead = ' ';
+        (0..s.cols())
+            .map(|c| {
+                let cell = s.cell(r, c);
+                let half = cell.width == ansi::CellWidth::Continuation;
+                if !half {
+                    lead = cell.ch;
+                }
+                (if half { lead } else { cell.ch }, half)
+            })
+            .collect()
+    }
+
+    /// The text of a screen from `start` to `end` (rows and columns), as a
+    /// selection in the view rebuilt from the log copies it.
+    fn screen_text(s: &ansi::Screen, start: Point, end: Point) -> String {
+        select::text(start, end, s.cols(), |n, from, to| {
+            let n = usize::try_from(n).ok().filter(|&n| n < s.rows())?;
+            let chars = screen_row(s, n);
+            Some(
+                chars[from.min(chars.len())..to.min(chars.len())]
+                    .iter()
+                    .filter(|(_, half)| !half)
+                    .map(|(c, _)| c)
+                    .collect(),
+            )
+        })
     }
 
     /// What drawing a cell needs.
@@ -3510,6 +3584,7 @@ keys:
                                         line: lines.end - 1,
                                         col: cols.saturating_sub(1),
                                     },
+                                    log: None,
                                 };
                                 let p = &mut panes[fi];
                                 // Bring its first line into view if it is above.
@@ -3700,7 +3775,8 @@ keys:
                             if let Some(pane) = panes.iter().find(|p| p.id == id) {
                                 if let Some(head) = pane.point(x, y, m) {
                                     if head != anchor || selection.is_some() {
-                                        selection = Some((id, Selection { anchor, head }));
+                                        let log = pane.deep.as_ref().map(|d| d.at);
+                                        selection = Some((id, Selection { anchor, head, log }));
                                         pane.shared.pending.store(true, Ordering::Release);
                                     }
                                 }
@@ -4216,6 +4292,37 @@ keys:
                 catching_up: AtomicBool::new(false),
                 want: AtomicBool::new(false),
             })
+        }
+
+        #[test]
+        fn a_selection_in_the_log_view_copies_and_shows_on_its_screen_only() {
+            let mut term = Term::new(4, 12);
+            term.feed("first line\r\nsecond 界 x\r\nthird".as_bytes());
+            let d = Deep {
+                gens: Vec::new(),
+                total: 3,
+                at: 3,
+                term,
+            };
+            let pt = |line, col| Point { line, col };
+            // From "line" on row 0 to "界" on row 1 (a wide glyph: once).
+            let text = screen_text(d.term.screen(), pt(0, 6), pt(1, 8));
+            assert_eq!(text, "line\r\nsecond 界");
+            let sel = Selection {
+                anchor: pt(1, 0),
+                head: pt(0, 6),
+                log: Some(3),
+            };
+            let hl = log_selection(Some(&sel), &d, 4, 12).unwrap();
+            assert_eq!((hl.start, hl.end), ((0, 6), (1, 0)));
+            // Made on another rebuilt screen, or in the live view: not here.
+            let other = Selection {
+                log: Some(9),
+                ..sel
+            };
+            assert!(log_selection(Some(&other), &d, 4, 12).is_none());
+            let live = Selection { log: None, ..sel };
+            assert!(log_selection(Some(&live), &d, 4, 12).is_none());
         }
 
         #[test]
