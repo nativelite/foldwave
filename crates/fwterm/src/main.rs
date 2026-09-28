@@ -2030,6 +2030,8 @@ keys:
             let mut term = shared.term.lock().unwrap();
             shared.want.store(false, Ordering::Release);
             term.take_dirty();
+            // The cursor, where the pane has focus and the program shows it.
+            let focused = focused && term.cursor_visible();
             let history = term.scrollback();
             let scrolled = term.scrolled_lines();
             if term.in_alternate_screen() {
@@ -3542,7 +3544,9 @@ keys:
                         if vk == 0x56 && ctrl {
                             match surface.window().clipboard() {
                                 Ok(Some(text)) => {
-                                    input.extend_from_slice(&select::paste_bytes(&text));
+                                    let bracketed =
+                                        panes[fi].shared.term.lock().unwrap().bracketed_paste();
+                                    input.extend_from_slice(&select::paste_bytes(&text, bracketed));
                                     panes[fi].back = 0;
                                     clear(&mut selection, &panes);
                                 }

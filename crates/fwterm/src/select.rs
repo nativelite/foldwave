@@ -141,9 +141,17 @@ pub fn word_at(chars: &[char], col: usize) -> (usize, usize) {
 }
 
 /// Text pasted into a terminal: line breaks become carriage returns, which
-/// is what the Enter key sends.
-pub fn paste_bytes(text: &str) -> Vec<u8> {
-    text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
+/// is what the Enter key sends. When the program asked for bracketed paste
+/// (`?2004h`), it comes wrapped in `ESC [200~` and `ESC [201~`, and any of
+/// those markers in the text itself are dropped, so pasted text cannot end
+/// the bracket early and pass the rest off as typed.
+pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let text = text.replace("\r\n", "\r").replace('\n', "\r");
+    if !bracketed {
+        return text.into_bytes();
+    }
+    let inner = text.replace("\x1b[200~", "").replace("\x1b[201~", "");
+    format!("\x1b[200~{inner}\x1b[201~").into_bytes()
 }
 
 #[cfg(test)]
@@ -220,7 +228,17 @@ mod tests {
 
     #[test]
     fn paste_turns_line_breaks_into_enter() {
-        assert_eq!(paste_bytes("a\r\nb\nc"), b"a\rb\rc");
-        assert_eq!(paste_bytes("é"), "é".as_bytes());
+        assert_eq!(paste_bytes("a\r\nb\nc", false), b"a\rb\rc");
+        assert_eq!(paste_bytes("é", false), "é".as_bytes());
+    }
+
+    #[test]
+    fn a_bracketed_paste_is_wrapped_and_cannot_close_itself() {
+        assert_eq!(paste_bytes("ls\nrm x", true), b"\x1b[200~ls\rrm x\x1b[201~");
+        // The end marker inside the text is dropped, not passed through.
+        assert_eq!(
+            paste_bytes("a\x1b[201~evil\n", true),
+            b"\x1b[200~aevil\r\x1b[201~"
+        );
     }
 }

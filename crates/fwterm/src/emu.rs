@@ -39,6 +39,22 @@ impl Emu {
         }
     }
 
+    /// The program's cursor is shown (`?25h`, the default) or hidden.
+    pub fn cursor_visible(&self) -> bool {
+        match self {
+            Emu::Local(t) => t.cursor_visible(),
+            Emu::Remote(m) => m.cursor_visible,
+        }
+    }
+
+    /// The program wants pasted text bracketed (`?2004h`).
+    pub fn bracketed_paste(&self) -> bool {
+        match self {
+            Emu::Local(t) => t.bracketed_paste(),
+            Emu::Remote(m) => m.bracketed_paste,
+        }
+    }
+
     pub fn in_alternate_screen(&self) -> bool {
         match self {
             Emu::Local(t) => t.in_alternate_screen(),

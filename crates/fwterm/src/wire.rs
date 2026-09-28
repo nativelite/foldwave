@@ -85,6 +85,10 @@ pub struct Update {
     pub scrolled: u64,
     /// The full-screen (alternate) screen is showing.
     pub alt: bool,
+    /// The program's cursor is shown (`?25h`), and it wants bracketed paste
+    /// (`?2004h`).
+    pub cursor_visible: bool,
+    pub bracketed_paste: bool,
     /// Rows that changed, with their cells.
     pub rows: Vec<(u16, Vec<Cell>)>,
     pub cursor: (u16, u16),
@@ -140,6 +144,8 @@ impl Sender {
         Some(Update {
             scrolled,
             alt,
+            cursor_visible: term.cursor_visible(),
+            bracketed_paste: term.bracketed_paste(),
             rows: changed,
             cursor: (c.row as u16, c.col as u16),
             size: (rows as u16, cols as u16),
@@ -170,6 +176,9 @@ pub struct Mirror {
     pub in_alt: bool,
     /// Lines scrolled off the top of the primary screen, as the host counts.
     pub scrolled: u64,
+    /// The program's modes, as the host's emulator last had them.
+    pub cursor_visible: bool,
+    pub bracketed_paste: bool,
 }
 
 impl Mirror {
@@ -179,6 +188,8 @@ impl Mirror {
             alt: Screen::new(rows, cols),
             in_alt: false,
             scrolled: 0,
+            cursor_visible: true,
+            bracketed_paste: false,
         }
     }
 
@@ -207,6 +218,8 @@ impl Mirror {
         }
         let mut row = Vec::with_capacity(cols);
         self.in_alt = u.alt;
+        self.cursor_visible = u.cursor_visible;
+        self.bracketed_paste = u.bracketed_paste;
         let screen = if u.alt {
             &mut self.alt
         } else {
@@ -418,7 +431,10 @@ impl FromHost {
         let tag = match self {
             FromHost::Update(u) => {
                 b.extend_from_slice(&u.scrolled.to_le_bytes());
-                b.push(u.alt as u8);
+                // Flags: the alternate screen, the cursor shown, bracketed paste.
+                b.push(
+                    u.alt as u8 | (u.cursor_visible as u8) << 1 | (u.bracketed_paste as u8) << 2,
+                );
                 b.extend_from_slice(&u.size.0.to_le_bytes());
                 b.extend_from_slice(&u.size.1.to_le_bytes());
                 b.extend_from_slice(&u.cursor.0.to_le_bytes());
@@ -469,7 +485,8 @@ impl FromHost {
         let msg = match tag {
             T_UPDATE => {
                 let scrolled = b.u64()?;
-                let alt = b.u8()? != 0;
+                let flags = b.u8()?;
+                let alt = flags & 1 != 0;
                 let size = (b.u16()?, b.u16()?);
                 let cursor = (b.u16()?, b.u16()?);
                 let n = b.u32()? as usize;
@@ -481,6 +498,8 @@ impl FromHost {
                 FromHost::Update(Update {
                     scrolled,
                     alt,
+                    cursor_visible: flags & 2 != 0,
+                    bracketed_paste: flags & 4 != 0,
                     rows,
                     cursor,
                     size,
@@ -771,6 +790,9 @@ mod tests {
         let mut u = Update {
             scrolled: 0,
             alt: false,
+            // Not the defaults: they must survive the trip.
+            cursor_visible: false,
+            bracketed_paste: true,
             rows: vec![(
                 0,
                 vec![Cell {
@@ -782,6 +804,13 @@ mod tests {
             size: (1, 1),
         };
         FromHost::Update(u.clone()).write(&mut b).unwrap();
+        match FromHost::read(&mut b.as_slice()).unwrap() {
+            FromHost::Update(back) => {
+                assert!(!back.cursor_visible && back.bracketed_paste, "modes kept");
+                assert_eq!(back.rows, u.rows);
+            }
+            _ => panic!("not an update"),
+        }
         let at = b.len() - 1; // the row's text, last: one byte, 'x'
         assert_eq!(b[at], b'x');
         b[at] = 0xFF; // not UTF-8
