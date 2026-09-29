@@ -28,6 +28,7 @@ pub fn run(args: &Args) -> io::Result<i32> {
     let shared = Arc::new(Shared {
         term: Mutex::new(Emu::Local({
             let mut t = Term::with_history(rows, cols, args.history);
+            t.set_history_bytes(crate::governor::machine_history_budget());
             if args.pipe {
                 t.feed(b"\x1b[20h");
             }

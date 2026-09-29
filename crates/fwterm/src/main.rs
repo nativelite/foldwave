@@ -182,7 +182,9 @@ options:
                 work; other shells mark them themselves if set up to; off
   --gpu-index G on (default): build the logs' search signatures on the GPU
                 (NVIDIA, through its driver), off the loggers' threads; off:
-                on each pane's logger thread. Without CUDA it is off
+                on each pane's logger thread. Without CUDA it is off. It
+                runs only for panes in this process (--no-isolate) or with
+                --host-signs gpu: pane hosts sign their own by default
   --host-signs S  who builds a pane host's search signatures: self (default:
                 its own logger thread) or gpu (the window's GPU indexer,
                 which reads each block back from the log; measured about
@@ -2893,6 +2895,7 @@ keys:
             let shared = Arc::new(Shared {
                 term: Mutex::new(Emu::Local({
                     let mut t = Term::with_history(rows, cols, args.history);
+                    t.set_history_bytes(governor::machine_history_budget());
                     if args.pipe {
                         // No tty turns LF into CR LF on a pipe: new line mode
                         // (LNM) makes the emulator do it, with no copy.
@@ -3542,7 +3545,11 @@ keys:
         } else {
             Arc::new(AtomicBool::new(false))
         };
-        let gpu = (args.gpu_index && logs.store.is_some())
+        // The GPU indexer signs this process's panes' logs, and pane hosts'
+        // only with --host-signs gpu: isolated panes (the default) sign their
+        // own, and an idle CUDA context costs the window ~170 MiB.
+        let signs_here = !args.isolate || args.host_signs_gpu;
+        let gpu = (args.gpu_index && logs.store.is_some() && signs_here)
             .then(|| indexer::Indexer::start(|r: &SigReply, g, b, sig| r(g, b, sig)))
             .flatten();
         let index_counts = gpu.as_ref().map(|g| g.counts.clone());

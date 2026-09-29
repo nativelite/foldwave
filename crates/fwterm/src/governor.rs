@@ -154,6 +154,29 @@ pub fn keep_parsing(hidden: bool, logged: bool, policy: Hidden, level: Level) ->
     }
 }
 
+/// A pane's RAM budget (design §4, memory): a 1,024th of the machine's
+/// physical memory, between 16 and 256 MiB; 64 MiB on the 64 GB reference
+/// machine. Fixed for the run, whatever the pane prints.
+pub fn pane_budget(total_ram: u64) -> u64 {
+    (total_ram / 1024).clamp(16 << 20, 256 << 20)
+}
+
+/// What a pane's in-memory history may hold, stored compactly: half its
+/// budget. The rest is the screen, the parser, the log's queue (4 MiB at
+/// most) and, for a pane host, the process itself. The line count
+/// (`--history`) caps it too; this bounds wide or colourful lines, which
+/// cost several KB each.
+pub fn history_budget(total_ram: u64) -> u64 {
+    pane_budget(total_ram) / 2
+}
+
+/// [`history_budget`] for this machine (the floor's if its memory cannot
+/// be read).
+pub fn machine_history_budget() -> usize {
+    let total = resmon::sys::system_info().map_or(0, |s| s.mem_total);
+    history_budget(total) as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,6 +188,17 @@ mod tests {
             core: logical,
             efficiency_class: class,
         }
+    }
+
+    #[test]
+    fn a_panes_budget_follows_the_machines_memory_within_bounds() {
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+        assert_eq!(pane_budget(64 * GIB), 64 * MIB, "the reference machine");
+        assert_eq!(history_budget(64 * GIB), 32 * MIB);
+        assert_eq!(pane_budget(8 * GIB), 16 * MIB, "a small machine: the floor");
+        assert_eq!(pane_budget(1024 * GIB), 256 * MIB, "a big one: the ceiling");
+        assert_eq!(pane_budget(0), 16 * MIB, "unknown: the floor");
     }
 
     #[test]
