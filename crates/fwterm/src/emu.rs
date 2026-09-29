@@ -30,12 +30,21 @@ impl Emu {
         }
     }
 
-    /// The primary screen, with the history (none for a mirror: an isolated
-    /// pane's history is its log).
+    /// The primary screen, with the history (none for a mirror: its lines
+    /// stay in the host, which sends those a view needs).
     pub fn scrollback(&self) -> &Screen {
         match self {
             Emu::Local(t) => t.scrollback(),
             Emu::Remote(m) => &m.primary,
+        }
+    }
+
+    /// How many lines that scrolled off are still held in memory: here, or
+    /// for a mirror in its host. Scrolling back further reads the log.
+    pub fn history_len(&self) -> usize {
+        match self {
+            Emu::Local(t) => t.scrollback().history_len(),
+            Emu::Remote(m) => m.held as usize,
         }
     }
 

@@ -50,6 +50,8 @@ mod fold;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod governor;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod hostlines;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod indexer;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod layout;
@@ -76,6 +78,7 @@ mod app {
     use crate::blocks;
     use crate::emu::Emu;
     use crate::fold;
+    use crate::hostlines;
     use crate::wire;
 
     mod host;
@@ -1677,10 +1680,19 @@ keys:
         marks_out: Option<Mutex<Vec<(u8, u64, Option<i32>)>>>,
         /// An isolated pane's host crashed and is to be restarted.
         host_died: AtomicBool,
-        /// An isolated pane waiting for history lines from its host.
+        /// An isolated pane waiting for history lines from its host: the
+        /// first and how many, and where they go.
         #[allow(clippy::type_complexity)]
-        history_reply:
-            Mutex<Option<std::sync::mpsc::Sender<(u64, Vec<Vec<ansi::Cell>>, Vec<bool>)>>>,
+        history_reply: Mutex<
+            Option<(
+                u64,
+                usize,
+                std::sync::mpsc::Sender<(u64, Vec<Vec<ansi::Cell>>, Vec<bool>)>,
+            )>,
+        >,
+        /// An isolated pane's history lines in a scrolled-back view, asked
+        /// for without waiting.
+        host_lines: Mutex<hostlines::HostLines>,
         /// Output since the last checkpoint sent to the log.
         since_checkpoint: AtomicU64,
         /// Output in the log's current generation.
@@ -1889,7 +1901,7 @@ keys:
             }
             let count = (end - lines.start).min(100_000) as u32;
             let (tx, rx) = std::sync::mpsc::channel();
-            *self.shared.history_reply.lock().unwrap() = Some(tx);
+            *self.shared.history_reply.lock().unwrap() = Some((lines.start, count as usize, tx));
             if self
                 .session
                 .lock()
@@ -2086,7 +2098,10 @@ keys:
                 self.back += (scrolled - self.seen_scrolled) as usize;
             }
             self.seen_scrolled = scrolled;
-            let held = history.history_len();
+            // An isolated pane's history is in its host, which sends the
+            // lines a scrolled-back view shows.
+            let remote = matches!(&*term, Emu::Remote(_));
+            let held = term.history_len();
             let (rows, cols) = (term.screen().rows(), term.screen().cols());
             let logged = self.find_dir.is_some() || self.pane_dir.is_some();
             // A search hit in a pane without a log: shown from memory, below.
@@ -2180,7 +2195,39 @@ keys:
                         0 => self.folds.live_view(live_end, rows, oldest),
                         _ => self.folds.view(top, rows, live_end),
                     })
-                    .flatten();
+                    .flatten()
+                    .or_else(|| {
+                        // An isolated pane scrolled back: its rows composed
+                        // like a view with folds, history lines from its host.
+                        (remote && self.back > 0 && !term.in_alternate_screen())
+                            .then(|| (top..top + rows as u64).map(fold::Row::Line).collect())
+                    });
+                // An isolated pane's history lines in view: ask its host for
+                // those not here yet (they are drawn when they come), and let
+                // go of those far from the view or no longer held.
+                let host_lines = folded.as_ref().filter(|_| remote).map(|view| {
+                    let mut h = self.shared.host_lines.lock().unwrap();
+                    let need: Vec<u64> = view
+                        .iter()
+                        .filter_map(|row| match *row {
+                            fold::Row::Line(l) if l < scrolled => Some(l),
+                            _ => None,
+                        })
+                        .collect();
+                    if let Some(ask) = h.to_ask(need.iter().copied(), Instant::now()) {
+                        let n = (ask.end - ask.start) as u32;
+                        let _ = self.session.lock().unwrap().ask_history(ask.start, n);
+                    }
+                    // A screen either side of what is in view (a live view
+                    // with a fold reaches well above `top`).
+                    let (lo, hi) = match (need.first(), need.last()) {
+                        (Some(&a), Some(&b)) => (a, b + 1),
+                        _ => (top, top),
+                    };
+                    let near = lo.saturating_sub(rows as u64).max(oldest);
+                    h.keep(near..hi + rows as u64);
+                    h
+                });
                 if let Some(view) = &folded {
                     // Folds in view: compose its rows, each a line from the
                     // screen or history, or a folded command's one line.
@@ -2197,7 +2244,12 @@ keys:
                                 .collect(),
                             fold::Row::Line(l) => {
                                 let mut out = Vec::new();
-                                history.history_row((scrolled - 1 - l) as usize, &mut out);
+                                match &host_lines {
+                                    Some(h) => out.extend(h.get(l).into_iter().flatten()),
+                                    None => {
+                                        history.history_row((scrolled - 1 - l) as usize, &mut out);
+                                    }
+                                }
                                 out
                             }
                             fold::Row::Folded { lines, .. } => fold::summary(lines)
@@ -2243,13 +2295,21 @@ keys:
                         pen.atlas,
                         pen.raster,
                     );
-                    self.row_lines = view
-                        .iter()
-                        .map(|x| match *x {
-                            fold::Row::Line(l) => l,
-                            fold::Row::Folded { first, .. } => first,
-                        })
-                        .collect();
+                    // Rows that are just `top + row` (an isolated pane's
+                    // view with no fold in it) keep no list: clicks then
+                    // follow `back` at once, as an edge-scrolled drag needs.
+                    let plain =
+                        view.iter().all(|x| matches!(x, fold::Row::Line(_))) && self.back > 0;
+                    self.row_lines = if plain {
+                        Vec::new()
+                    } else {
+                        view.iter()
+                            .map(|x| match *x {
+                                fold::Row::Line(l) => l,
+                                fold::Row::Folded { first, .. } => first,
+                            })
+                            .collect()
+                    };
                 } else {
                     self.row_lines.clear();
                     let highlight = match &find_here {
@@ -2720,6 +2780,7 @@ keys:
                 blocks: Mutex::new(blocks::Blocks::default()),
                 marks_out: None,
                 history_reply: Mutex::new(None),
+                host_lines: Mutex::new(hostlines::HostLines::default()),
                 host_died: AtomicBool::new(false),
                 since_checkpoint: AtomicU64::new(0),
                 gen_bytes: AtomicU64::new(0),
@@ -2921,10 +2982,20 @@ keys:
                         lines,
                         wrapped,
                     }) => {
-                        if let Some(tx) = shared.history_reply.lock().unwrap().take() {
-                            let _ = tx.send((first, lines, wrapped));
+                        // A copy waiting for exactly these lines gets them;
+                        // any other answer is a view's, drawn from here.
+                        let mut waiting = shared.history_reply.lock().unwrap();
+                        if waiting
+                            .as_ref()
+                            .is_some_and(|(f, n, _)| *f == first && *n == lines.len())
+                        {
+                            if let Some((_, _, tx)) = waiting.take() {
+                                let _ = tx.send((first, lines, wrapped));
+                            }
+                            continue;
                         }
-                        continue;
+                        drop(waiting);
+                        shared.host_lines.lock().unwrap().store(first, lines);
                     }
                     Ok(wire::FromHost::BlockReady {
                         generation,
@@ -3690,8 +3761,7 @@ keys:
                             // at the top of the view.
                             0x26 | 0x28 if ctrl && !shift => {
                                 let up = vk == 0x26;
-                                let held =
-                                    pane.shared.term.lock().unwrap().scrollback().history_len();
+                                let held = pane.shared.term.lock().unwrap().history_len();
                                 let in_log = pane.deep.is_some() && pane.back > held;
                                 let to = (!in_log)
                                     .then(|| {
@@ -3966,7 +4036,7 @@ keys:
                     if let Some(p) = panes.iter_mut().find(|p| p.id == id && p.deep.is_none()) {
                         let row = y.div_euclid(m.cell_h as i32) - p.rect.top as i32;
                         let step = select::edge_scroll(row, p.rect.rows);
-                        let held = p.shared.term.lock().unwrap().scrollback().history_len();
+                        let held = p.shared.term.lock().unwrap().history_len();
                         p.back = if step < 0 {
                             (p.back + step.unsigned_abs() as usize).min(held)
                         } else {
@@ -4400,6 +4470,7 @@ keys:
                 blocks: Mutex::new(blocks::Blocks::default()),
                 marks_out: None,
                 history_reply: Mutex::new(None),
+                host_lines: Mutex::new(hostlines::HostLines::default()),
                 host_died: AtomicBool::new(false),
                 since_checkpoint: AtomicU64::new(0),
                 gen_bytes: AtomicU64::new(0),

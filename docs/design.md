@@ -1865,6 +1865,23 @@ take the ship down.
   - **History on demand (built 2026-09-25).** A copy asks the host for the
     lines that left the screen (`ToHost::History`); the blocks test copies
     `out 1`..`out 40` exactly under `--isolate`.
+  - **Scrolled-back views from the host's memory (2026-09-29).** Until
+    then, scrolling an isolated pane back even one line switched to the view
+    rebuilt from the log. There, failed commands' `exit N` labels and folds
+    are not drawn, Ctrl+Up lands a row off per wrapped line, a live fold
+    shows nothing above it, and a drag past the edge does not scroll. Since
+    isolation is the default, the case-test pass found all of these. Now
+    each update also says how many history lines the host holds (8 bytes).
+    A view scrolled back into those asks for just the lines it shows,
+    without waiting (`hostlines.rs`), and draws them the way it draws an
+    in-process pane's history. Only past the host's memory does it read the
+    log, as an in-process pane does past its own. A live view asks for
+    nothing, so floods are unchanged: one isolated pane, 1 GiB through
+    `fwprobe throughput`, alternating builds, 2 rounds of 2 runs:
+    314.4–322.1 MiB/s before, 316.3–320.7 after. Checked in a window
+    through pane hosts: `exit 3` on a scrolled-back command, Ctrl+Up exact
+    across a wrapped line, a live fold with the lines above it, and a drag
+    past the top edge scrolling back.
   - **Supervisor (built 2026-09-25).** When a host's pipe ends without an
     exit message, the host crashed. The window starts a new host for that
     pane: a fresh program, a new log generation in the same pane folder, so

@@ -8,11 +8,12 @@
 //! works out each update by comparing the screen with its copy of what it
 //! sent.
 //!
-//! History does not travel. A first cut sent every line that scrolled off, up
-//! to 10,000 an update, and cost a flood half its throughput and four times
-//! the CPU. The host writes the pane's log; an isolated pane's scrollback
-//! reads that. The mirror counts lines only, so selections and blocks keep
-//! their numbering.
+//! History does not travel with updates. A first cut sent every line that
+//! scrolled off, up to 10,000 an update, and cost a flood half its throughput
+//! and four times the CPU. The mirror counts lines, so selections and blocks
+//! keep their numbering, and knows how many the host still holds; a view
+//! scrolled back into those asks for just the lines it shows
+//! ([`ToHost::History`]). Past them, scrollback reads the log the host writes.
 //!
 //! Rows travel as UTF-8 text plus runs of style, trailing blanks dropped, so
 //! a line costs about what its text does.
@@ -85,6 +86,9 @@ pub struct Update {
     /// Lines that scrolled off the top of the primary screen since the last
     /// update.
     pub scrolled: u64,
+    /// How many of the lines that scrolled off the host still holds: how far
+    /// back the window may ask for them ([`ToHost::History`]).
+    pub held: u64,
     /// The full-screen (alternate) screen is showing.
     pub alt: bool,
     /// The program's cursor is shown (`?25h`), and it wants bracketed paste
@@ -147,6 +151,7 @@ impl Sender {
         let c = screen.cursor();
         Some(Update {
             scrolled,
+            held: history.history_len() as u64,
             alt,
             cursor_visible: term.cursor_visible(),
             bracketed_paste: term.bracketed_paste(),
@@ -192,6 +197,8 @@ pub struct Mirror {
     pub in_alt: bool,
     /// Lines scrolled off the top of the primary screen, as the host counts.
     pub scrolled: u64,
+    /// How many of those the host still holds in memory.
+    pub held: u64,
     /// The program's modes, as the host's emulator last had them.
     pub cursor_visible: bool,
     pub bracketed_paste: bool,
@@ -204,6 +211,7 @@ impl Mirror {
             alt: Screen::new(rows, cols),
             in_alt: false,
             scrolled: 0,
+            held: 0,
             cursor_visible: true,
             bracketed_paste: false,
         }
@@ -227,6 +235,7 @@ impl Mirror {
         // Scroll as the host did; a whole screen or more of scrolling
         // replaces every row, and the update carries them all.
         self.scrolled += u.scrolled;
+        self.held = u.held.min(self.scrolled);
         let blank = Cell::default();
         let n = (u.scrolled as usize).min(rows);
         if n > 0 {
@@ -472,6 +481,7 @@ impl FromHost {
                         .fold(0u8, |acc, (i, &w)| acc | (w as u8) << i);
                     b.push(byte);
                 }
+                b.extend_from_slice(&u.held.to_le_bytes());
                 T_UPDATE
             }
             FromHost::Mark { kind, line, exit } => {
@@ -538,8 +548,10 @@ impl FromHost {
                         }
                     }
                 }
+                let held = b.u64()?;
                 FromHost::Update(Update {
                     scrolled,
+                    held,
                     alt,
                     cursor_visible: flags & 2 != 0,
                     bracketed_paste: flags & 4 != 0,
@@ -730,6 +742,8 @@ mod tests {
                     );
                     assert_eq!(mirror.screen().cursor(), term.screen().cursor());
                     assert_eq!(mirror.scrolled, term.scrollback().scrolled_lines());
+                    // How far back the window may ask for lines.
+                    assert_eq!(mirror.held, term.scrollback().history_len() as u64);
                 }
             }
         }
@@ -840,6 +854,7 @@ mod tests {
         let mut b = Vec::new();
         let mut u = Update {
             scrolled: 0,
+            held: 9_999,
             alt: false,
             // Not the defaults: they must survive the trip.
             cursor_visible: false,
@@ -859,6 +874,7 @@ mod tests {
         match FromHost::read(&mut b.as_slice()).unwrap() {
             FromHost::Update(back) => {
                 assert!(!back.cursor_visible && back.bracketed_paste, "modes kept");
+                assert_eq!(back.held, 9_999, "history held kept");
                 assert_eq!(back.wrapped, [true], "wrap marks kept");
                 assert_eq!(back.rows, u.rows);
             }
