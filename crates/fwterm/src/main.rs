@@ -60,6 +60,8 @@ mod logstore;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod select;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod theme;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod wire;
 
 #[cfg(windows)]
@@ -88,6 +90,7 @@ mod app {
     use crate::layout::{neighbor, pane_at, Dir, Layout, PaneId, Placement, Rect, Toward};
     use crate::logstore;
     use crate::select::{self, Point, Selection};
+    use crate::theme::Theme;
     use fwrender::win::{display_refresh_hz, CpuPresenter, Event, Waker, Window};
     use fwrender::{
         Atlas, CellInstance, CpuRenderer, FontRasterizer, Frame, GlyphKey, GlyphPart, Highlight,
@@ -137,6 +140,10 @@ options:
   --font NAME   font family (default JetBrains Mono, built into fwterm), or
                 any installed one; an unknown name lists the monospaced
                 families found
+  --theme T     colours: mirai (default, foldwave's own) or classic; any
+                colour can be changed in the settings file with
+                color.<name> = #rrggbb (bg, fg, selection, dim, accent,
+                rule, bar, bar_text, error, ansi0..ansi15)
   --licenses    show the licenses of what fwterm ships (JetBrains Mono,
                 Microsoft's ConPTY) and exit
   --px N        font size in pixels per em (default 16)
@@ -224,6 +231,8 @@ keys:
         backend: String,
         conpty: Option<String>,
         font: Option<String>,
+        /// `--theme`; else the settings file's, else Mirai.
+        theme: Option<String>,
         px: f32,
         size: (u32, u32),
         sharpen: bool,
@@ -267,6 +276,7 @@ keys:
             backend: "vulkan".into(),
             conpty: None,
             font: None,
+            theme: None,
             px: 16.0,
             size: (1200, 720),
             sharpen: true,
@@ -314,6 +324,16 @@ keys:
                 }
                 "--conpty" => a.conpty = Some(value(&mut i, "--conpty")?),
                 "--font" => a.font = Some(value(&mut i, "--font")?),
+                "--theme" => {
+                    let v = value(&mut i, "--theme")?;
+                    if Theme::named(&v).is_none() {
+                        return Err(format!(
+                            "bad --theme {v:?} (one of {})",
+                            crate::theme::NAMES.join(", ")
+                        ));
+                    }
+                    a.theme = Some(v);
+                }
                 "--px" => {
                     let v = value(&mut i, "--px")?;
                     a.px = v
@@ -1571,13 +1591,17 @@ keys:
     /// Hits kept per generation of each pane.
     const FIND_LIMIT: usize = 500;
 
-    /// Search bar colours.
-    const BAR_BG: u32 = 0xFF26_4F78;
-    const BAR_FG: u32 = 0xFFE8_E8E8;
-
     /// A bar across window row `row`: `text`, then blanks, in the bar's
-    /// colours (the search bar, a paste waiting to be confirmed).
-    fn draw_bar(text: &str, row: usize, cols: usize, frame: &mut Frame, pen: &mut Pen) {
+    /// colours, its first `lead` characters (the bar's name) in the accent
+    /// (the search bar, a paste waiting to be confirmed).
+    fn draw_bar(
+        text: &str,
+        lead: usize,
+        row: usize,
+        cols: usize,
+        frame: &mut Frame,
+        pen: &mut Pen,
+    ) {
         let mut chars = text.chars();
         for col in 0..cols {
             let ch = chars.next().unwrap_or(' ');
@@ -1591,8 +1615,12 @@ keys:
             );
             let cell = CellInstance {
                 glyph,
-                fg: BAR_FG,
-                bg: BAR_BG,
+                fg: if col < lead {
+                    pen.theme.accent
+                } else {
+                    pen.theme.bar_text
+                },
+                bg: pen.theme.bar,
                 flags: 0,
             };
             frame.put(row, col, cell);
@@ -2511,7 +2539,7 @@ keys:
                             let glyph = pen.atlas.slot(key, pen.raster);
                             let cell = CellInstance {
                                 glyph,
-                                fg: EXIT_FAILED,
+                                fg: pen.theme.error,
                                 bg: pen.palette.bg,
                                 flags: 0,
                             };
@@ -2571,15 +2599,29 @@ keys:
     /// What drawing a cell needs.
     struct Pen<'a> {
         palette: &'a Palette,
+        theme: &'a Theme,
         atlas: &'a mut Atlas,
         raster: &'a mut FontRasterizer,
     }
 
-    /// Divider colours: the lines around the focused pane stand out.
-    const DIVIDER: u32 = 0xFF4A_4A4A;
-    const DIVIDER_FOCUSED: u32 = 0xFF3A_96DD;
-    /// A failed command's `exit N`.
-    const EXIT_FAILED: u32 = 0xFFD0_5A5A;
+    /// How far the focused pane's corner brackets run along the dividers,
+    /// in cells: across, and down (a cell is about twice as tall).
+    const BRACKET_COLS: i64 = 4;
+    const BRACKET_ROWS: i64 = 2;
+
+    /// Whether divider cell `(row, col)` is part of the corner brackets that
+    /// mark focused pane `f` (design §11 row 17): on the line around it,
+    /// within a few cells of one of its corners.
+    fn in_bracket(row: usize, col: usize, f: Rect) -> bool {
+        let (r, c) = (row as i64, col as i64);
+        let (top, bottom) = (f.top as i64 - 1, (f.top + f.rows) as i64);
+        let (left, right) = (f.left as i64 - 1, (f.left + f.cols) as i64);
+        let across = (r == top || r == bottom) && (left..=right).contains(&c);
+        let down = (c == left || c == right) && (top..=bottom).contains(&r);
+        let near_col = (c - left).abs().min((c - right).abs()) <= BRACKET_COLS;
+        let near_row = (r - top).abs().min((r - bottom).abs()) <= BRACKET_ROWS;
+        (across && near_col) || (down && near_row)
+    }
 
     /// Draw the dividers of `placement`, those touching the focused pane in
     /// the focus colour.
@@ -2591,10 +2633,7 @@ keys:
             .map(|(_, r)| *r)
             .unwrap_or_default();
         for &(row, col, ch) in &placement.dividers {
-            let near = row + 1 >= f.top
-                && row <= f.top + f.rows
-                && col + 1 >= f.left
-                && col <= f.left + f.cols;
+            let near = in_bracket(row, col, f);
             let glyph = pen.atlas.slot(
                 GlyphKey {
                     ch,
@@ -2608,7 +2647,11 @@ keys:
                 col,
                 CellInstance {
                     glyph,
-                    fg: if near { DIVIDER_FOCUSED } else { DIVIDER },
+                    fg: if near {
+                        pen.theme.accent
+                    } else {
+                        pen.theme.rule
+                    },
                     bg: pen.palette.bg,
                     flags: 0,
                 },
@@ -3595,7 +3638,25 @@ keys:
         fwrender::win::raise_thread_priority();
         let hz = args.max_fps.or_else(display_refresh_hz).unwrap_or(60);
         let min_interval = Duration::from_secs_f64(1.0 / hz as f64);
-        let palette = Palette::default();
+        // The look: --theme, else the settings file's, else Mirai; then the
+        // file's colour overrides.
+        let conf = settings().1;
+        let name = args.theme.clone().or(conf.theme.clone());
+        let mut theme = name
+            .as_deref()
+            .map_or(Some(Theme::mirai()), Theme::named)
+            .unwrap_or_else(|| {
+                say!("fwterm: unknown theme {name:?} in the settings file; using mirai");
+                Theme::mirai()
+            });
+        let bad = theme.apply(&conf.colors);
+        if !bad.is_empty() {
+            say!(
+                "fwterm: colours not understood in the settings file: {}",
+                bad.join(", ")
+            );
+        }
+        let palette = theme.palette.clone();
         let mut frame = Frame::new();
         let mut events = Vec::new();
         let mut input = Vec::new();
@@ -4350,6 +4411,7 @@ keys:
             }
             let mut pen = Pen {
                 palette: &palette,
+                theme: &theme,
                 atlas: &mut atlas,
                 raster: &mut raster,
             };
@@ -4417,9 +4479,10 @@ keys:
                     (Some(note), true) => format!("{status}  [{note}]"),
                     _ => status,
                 };
-                let text = format!(" find: {}_   {status}", f.query);
+                let text = format!(" FIND › {}_   {status}", f.query);
                 draw_bar(
                     &text,
+                    7,
                     grid_rows.saturating_sub(1),
                     grid_cols,
                     &mut frame,
@@ -4435,11 +4498,12 @@ keys:
                     format!("{n} lines")
                 };
                 let text = format!(
-                    " Paste {lines}? The program runs each line as it arrives.   \
+                    " PASTE › {lines}? The program runs each line as it arrives.   \
                      Enter pastes, Esc cancels"
                 );
                 draw_bar(
                     &text,
+                    8,
                     grid_rows.saturating_sub(1),
                     grid_cols,
                     &mut frame,
@@ -4618,6 +4682,32 @@ keys:
                 assert!(on_screen, "line {} shows {:?}", h.line, h.text);
             }
             let _ = std::fs::remove_dir_all(&pane);
+        }
+
+        #[test]
+        fn the_focused_panes_corners_are_bracketed_and_the_rest_of_its_lines_are_not() {
+            // A pane at rows 5..25, columns 10..70: its lines are row 4 and
+            // row 25, column 9 and column 70.
+            let f = Rect {
+                top: 5,
+                left: 10,
+                rows: 20,
+                cols: 60,
+            };
+            assert!(in_bracket(4, 9, f), "the top-left corner");
+            assert!(
+                in_bracket(4, 13, f) && !in_bracket(4, 14, f),
+                "4 cells along"
+            );
+            assert!(in_bracket(6, 9, f) && !in_bracket(7, 9, f), "2 cells down");
+            assert!(
+                in_bracket(25, 70, f) && in_bracket(23, 70, f),
+                "the bottom-right"
+            );
+            assert!(!in_bracket(15, 70, f), "the middle of a side");
+            assert!(!in_bracket(4, 40, f), "the middle of the top");
+            assert!(!in_bracket(15, 40, f), "inside the pane");
+            assert!(!in_bracket(3, 9, f), "past the corner");
         }
 
         #[test]

@@ -31,7 +31,7 @@ pub struct CellInstance {
 
 /// Colours: the terminal's default foreground and background and the 256
 /// indexed colours (xterm's defaults).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Palette {
     /// Default foreground.
     pub fg: u32,

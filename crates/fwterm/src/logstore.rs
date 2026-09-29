@@ -69,20 +69,39 @@ pub struct Settings {
     /// `paste_warning = off` stops fwterm asking before a paste that would
     /// run several lines (on by default; design §11 row 14).
     pub paste_warning: Option<bool>,
+    /// `theme = mirai|classic`, and `color.<name> = #rrggbb` overrides
+    /// (`theme::Theme::apply`), in the file's order.
+    pub theme: Option<String>,
+    pub colors: Vec<(String, String)>,
 }
 
-/// `key = value` lines; `#` starts a comment. Unknown keys are ignored.
+/// `key = value` lines; `#` starts a comment, except at the start of a
+/// value, where it is a colour's (`color.bg = #060b12  # night`). Unknown
+/// keys are ignored.
 pub fn parse_settings(text: &str) -> Settings {
     let mut s = Settings::default();
     for line in text.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
         let Some((k, v)) = line.split_once('=') else {
             continue;
+        };
+        let v = v.trim_start();
+        let v = match v.strip_prefix('#') {
+            Some(rest) => &v[..1 + rest.find('#').unwrap_or(rest.len())],
+            None => v.split('#').next().unwrap_or(""),
         };
         let v = v.trim();
         match k.trim() {
             "log_dir" if !v.is_empty() => s.log_dir = Some(PathBuf::from(v)),
             "log_cap_gib" => s.log_cap = v.parse::<u64>().ok().map(|g| g * GIB),
+            "theme" if !v.is_empty() => s.theme = Some(v.to_string()),
+            k if k.starts_with("color.") => {
+                s.colors
+                    .push((k["color.".len()..].to_string(), v.to_string()));
+            }
             "paste_warning" => {
                 s.paste_warning = match v {
                     "on" | "true" | "1" => Some(true),
@@ -495,6 +514,14 @@ mod tests {
             parse_settings("paste_warning = maybe\n").paste_warning,
             None
         );
+        // The look: a theme, and colour overrides in order, a value's own
+        // `#` kept and a comment after it dropped.
+        let s = parse_settings(
+            "theme = classic\ncolor.accent = #ff8800  # warm\ncolor.ansi1=#aa0000\n# color.bg = #000000\n",
+        );
+        assert_eq!(s.theme.as_deref(), Some("classic"));
+        let kv = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert_eq!(s.colors, [kv("accent", "#ff8800"), kv("ansi1", "#aa0000")]);
     }
 
     #[test]
