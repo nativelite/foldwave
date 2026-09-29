@@ -73,6 +73,8 @@ pub struct Settings {
     /// (`theme::Theme::apply`), in the file's order.
     pub theme: Option<String>,
     pub colors: Vec<(String, String)>,
+    /// `instruments = off` hides the instrument strip (on by default).
+    pub instruments: Option<bool>,
 }
 
 /// `key = value` lines; `#` starts a comment, except at the start of a
@@ -102,17 +104,21 @@ pub fn parse_settings(text: &str) -> Settings {
                 s.colors
                     .push((k["color.".len()..].to_string(), v.to_string()));
             }
-            "paste_warning" => {
-                s.paste_warning = match v {
-                    "on" | "true" | "1" => Some(true),
-                    "off" | "false" | "0" => Some(false),
-                    _ => None,
-                }
-            }
+            "paste_warning" => s.paste_warning = on_off(v),
+            "instruments" => s.instruments = on_off(v),
             _ => {}
         }
     }
     s
+}
+
+/// `on`/`off` (or true/false, 1/0).
+fn on_off(v: &str) -> Option<bool> {
+    match v {
+        "on" | "true" | "1" => Some(true),
+        "off" | "false" | "0" => Some(false),
+        _ => None,
+    }
 }
 
 /// `settings` with `log_dir` set to `dir`, other lines kept.
@@ -522,6 +528,11 @@ mod tests {
         assert_eq!(s.theme.as_deref(), Some("classic"));
         let kv = |k: &str, v: &str| (k.to_string(), v.to_string());
         assert_eq!(s.colors, [kv("accent", "#ff8800"), kv("ansi1", "#aa0000")]);
+        assert_eq!(
+            parse_settings("instruments = off\n").instruments,
+            Some(false)
+        );
+        assert_eq!(parse_settings("").instruments, None);
     }
 
     #[test]

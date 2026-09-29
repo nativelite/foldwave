@@ -62,6 +62,8 @@ mod logstore;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod select;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod strip;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod theme;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod wire;
@@ -93,6 +95,7 @@ mod app {
     use crate::layout::{neighbor, pane_at, Dir, Layout, PaneId, Placement, Rect, Toward};
     use crate::logstore;
     use crate::select::{self, Point, Selection};
+    use crate::strip;
     use crate::theme::Theme;
     use fwrender::win::{display_refresh_hz, CpuPresenter, Event, Waker, Window};
     use fwrender::{
@@ -143,6 +146,8 @@ options:
   --font NAME   font family (default JetBrains Mono, built into fwterm), or
                 any installed one; an unknown name lists the monospaced
                 families found
+  (instruments = off in the settings file hides the strip of readings
+  under the title bar)
   --theme T     colours: mirai (default, foldwave's own) or classic; any
                 colour can be changed in the settings file with
                 color.<name> = #rrggbb (bg, fg, selection, dim, accent,
@@ -1627,6 +1632,57 @@ keys:
                 flags: 0,
             };
             frame.put(row, col, cell);
+        }
+    }
+
+    /// Where the panes go in a `rows x cols` grid whose top `strip` rows are
+    /// the instrument strip's.
+    fn place_panes(
+        layout: &Layout,
+        zoom: Option<PaneId>,
+        rows: usize,
+        cols: usize,
+        strip: usize,
+    ) -> Placement {
+        let mut p = layout.place_zoomed(zoom, rows.saturating_sub(strip).max(1), cols);
+        for (_, r) in &mut p.panes {
+            r.top += strip;
+        }
+        for d in &mut p.dividers {
+            d.0 += strip;
+        }
+        p
+    }
+
+    /// Draw the instrument strip across grid row 0.
+    fn draw_strip(line: &[(char, strip::Kind)], cols: usize, frame: &mut Frame, pen: &mut Pen) {
+        let t = pen.theme;
+        let bg = t.title_bar.unwrap_or(t.bar);
+        for col in 0..cols {
+            let (ch, kind) = line.get(col).copied().unwrap_or((' ', strip::Kind::Label));
+            let fg = match kind {
+                strip::Kind::Label => t.dim,
+                strip::Kind::Value => t.palette.fg,
+                strip::Kind::Accent => t.accent,
+                strip::Kind::Good => t.palette.indexed[2],
+                strip::Kind::Bad => t.error,
+            };
+            let key = GlyphKey {
+                ch,
+                style: 0,
+                part: GlyphPart::Single,
+            };
+            let glyph = pen.atlas.slot(key, pen.raster);
+            frame.put(
+                0,
+                col,
+                CellInstance {
+                    glyph,
+                    fg,
+                    bg,
+                    flags: 0,
+                },
+            );
         }
     }
 
@@ -3323,10 +3379,19 @@ keys:
     /// How often the governor reads the CPU counters.
     const PRESSURE_EVERY: Duration = Duration::from_millis(500);
 
+    /// fwterm's CPU as the pressure watch last read it: a share of the
+    /// machine in millionths; `NO_READING` before the first.
+    const NO_READING: u64 = u64::MAX;
+
     /// Watch how busy other programs keep the machine; the flag is true while
     /// it is [`Level::Busy`]. fwterm's own time is the window's plus its pane
-    /// hosts' (`hosts`).
-    fn start_pressure_watch(hosts: Arc<Mutex<governor::Family>>) -> Arc<AtomicBool> {
+    /// hosts' (`hosts`); its share goes to `cpu`, and `wake` (the instrument
+    /// strip's window) is woken when the strip's reading of it changes.
+    fn start_pressure_watch(
+        hosts: Arc<Mutex<governor::Family>>,
+        cpu: Arc<AtomicU64>,
+        wake: Option<fwrender::win::Waker>,
+    ) -> Arc<AtomicBool> {
         let busy = Arc::new(AtomicBool::new(false));
         let flag = busy.clone();
         std::thread::spawn(move || {
@@ -3344,8 +3409,17 @@ keys:
                 let Some(now) = own() else {
                     return;
                 };
-                level = governor::next(level, resmon::cpu::load(&before, &now));
+                let load = resmon::cpu::load(&before, &now);
+                level = governor::next(level, load);
                 flag.store(level == Level::Busy, Ordering::Release);
+                let share = (load.process * 1e6) as u64;
+                let old = cpu.swap(share, Ordering::AcqRel);
+                // The strip shows tenths of a percent: wake it only for those.
+                if old == NO_READING || old / 1000 != share / 1000 {
+                    if let Some(w) = &wake {
+                        w.wake();
+                    }
+                }
                 before = now;
             }
         });
@@ -3586,8 +3660,12 @@ keys:
             let _ = resmon::cpu::place_current_thread(&place);
         }
         let hosts = Arc::new(Mutex::new(governor::Family::default()));
-        let busy = if args.governor {
-            start_pressure_watch(hosts.clone())
+        // The instrument strip takes the grid's top row (design §11 row 17).
+        let strip_rows = usize::from(settings().1.instruments.unwrap_or(true));
+        let cpu_share = Arc::new(AtomicU64::new(NO_READING));
+        let busy = if args.governor || strip_rows > 0 {
+            let wake = (strip_rows > 0).then(|| surface.window().waker());
+            start_pressure_watch(hosts.clone(), cpu_share.clone(), wake)
         } else {
             Arc::new(AtomicBool::new(false))
         };
@@ -3614,7 +3692,7 @@ keys:
         };
         let ids: Vec<PaneId> = (0..args.panes).collect();
         let mut layout = Layout::grid(&ids);
-        let mut placement = layout.place(grid_rows, grid_cols);
+        let mut placement = place_panes(&layout, None, grid_rows, grid_cols, strip_rows);
         let mut panes = placement
             .panes
             .iter()
@@ -3630,9 +3708,15 @@ keys:
         // pastes at once).
         let paste_warning = settings().1.paste_warning.unwrap_or(true);
         let mut paste_ask: Option<(PaneId, String, usize)> = None;
+        // The instrument strip's last line, when it next reads, and the log
+        // drive's free space (read every 5 s).
+        let mut strip_line: Vec<(char, strip::Kind)> = Vec::new();
+        let mut strip_next = Instant::now();
+        #[allow(clippy::type_complexity)]
+        let mut log_free: Option<(Instant, Option<(String, u64)>)> = None;
         // Every pane starts at its real size; a zoom then hides the rest.
         if zoom.is_some() {
-            placement = layout.place_zoomed(zoom, grid_rows, grid_cols);
+            placement = place_panes(&layout, zoom, grid_rows, grid_cols, strip_rows);
             place_all(&mut panes, &placement);
         }
 
@@ -3718,7 +3802,7 @@ keys:
                 || panes
                     .iter()
                     .any(|p| p.shared.pending.load(Ordering::Acquire));
-            let level = if busy.load(Ordering::Acquire) {
+            let level = if args.governor && busy.load(Ordering::Acquire) {
                 Level::Busy
             } else {
                 Level::Calm
@@ -4156,7 +4240,8 @@ keys:
                         };
                         // Splitting or moving the focus shows every pane again.
                         if (dir.is_some() || toward.is_some()) && zoom.take().is_some() {
-                            placement = layout.place_zoomed(zoom, grid_rows, grid_cols);
+                            placement =
+                                place_panes(&layout, zoom, grid_rows, grid_cols, strip_rows);
                             place_all(&mut panes, &placement);
                             layout_dirty = true;
                         }
@@ -4170,7 +4255,8 @@ keys:
                             let id = next_id;
                             if room >= 3 && layout.split(focus, dir, id) {
                                 next_id += 1;
-                                placement = layout.place_zoomed(zoom, grid_rows, grid_cols);
+                                placement =
+                                    place_panes(&layout, zoom, grid_rows, grid_cols, strip_rows);
                                 let rect = placement
                                     .panes
                                     .iter()
@@ -4185,7 +4271,9 @@ keys:
                                     Err(e) => {
                                         say!("fwterm: new pane: {e}");
                                         layout.remove(id);
-                                        placement = layout.place_zoomed(zoom, grid_rows, grid_cols);
+                                        placement = place_panes(
+                                            &layout, zoom, grid_rows, grid_cols, strip_rows,
+                                        );
                                     }
                                 }
                                 place_all(&mut panes, &placement);
@@ -4268,7 +4356,7 @@ keys:
                             surface = after_draw_error(surface, e, &atlas, &mut gpu_faults)?;
                         }
                         (grid_rows, grid_cols) = grid(w, h);
-                        placement = layout.place_zoomed(zoom, grid_rows, grid_cols);
+                        placement = place_panes(&layout, zoom, grid_rows, grid_cols, strip_rows);
                         place_all(&mut panes, &placement);
                         frame.damage_all();
                         layout_dirty = true;
@@ -4398,7 +4486,7 @@ keys:
                 }
             }
             if layout_dirty {
-                placement = layout.place_zoomed(zoom, grid_rows, grid_cols);
+                placement = place_panes(&layout, zoom, grid_rows, grid_cols, strip_rows);
                 place_all(&mut panes, &placement);
             }
             // Hidden panes stop parsing when the governor says so, and catch
@@ -4426,6 +4514,7 @@ keys:
             if last_draw.map_or(false, |t| t.elapsed() < interval) {
                 continue;
             }
+            let relayout = layout_dirty;
             let mut pen = Pen {
                 palette: &palette,
                 theme: &theme,
@@ -4461,6 +4550,61 @@ keys:
             if layout_dirty {
                 draw_dividers(&placement, focus, &mut frame, &mut pen);
                 layout_dirty = false;
+            }
+            // The instrument strip, over the grid's top row: its readings
+            // at most twice a second, drawn when they change.
+            if strip_rows > 0 && (relayout || Instant::now() >= strip_next) {
+                strip_next = Instant::now() + Duration::from_millis(500);
+                if log_free
+                    .as_ref()
+                    .map_or(true, |(at, _)| at.elapsed() >= Duration::from_secs(5))
+                {
+                    let vol = logs
+                        .store
+                        .as_ref()
+                        .and_then(|st| resmon::volume::of(&st.root).ok());
+                    log_free = Some((
+                        Instant::now(),
+                        vol.map(|v| {
+                            let root = v
+                                .root
+                                .to_string_lossy()
+                                .trim_end_matches(['\\', '/'])
+                                .to_string();
+                            (root, v.free)
+                        }),
+                    ));
+                }
+                let isolated: Vec<bool> = panes
+                    .iter()
+                    .filter(|p| matches!(&*p.session.lock().unwrap(), Session::Host { .. }))
+                    .map(|p| !p.shared.host_died.load(Ordering::Acquire))
+                    .collect();
+                let share = cpu_share.load(Ordering::Acquire);
+                let readings = strip::Readings {
+                    panes: panes.len(),
+                    focus: panes
+                        .iter()
+                        .position(|p| p.id == focus)
+                        .map_or(1, |i| i + 1),
+                    cpu: (share != NO_READING).then(|| share as f64 / 1e6),
+                    log: log_free.as_ref().and_then(|(_, v)| v.clone()),
+                    index: if index_counts.is_some() {
+                        "GPU"
+                    } else if logs.store.is_some() {
+                        "CPU"
+                    } else {
+                        "OFF"
+                    },
+                    hosts: (!isolated.is_empty())
+                        .then(|| (isolated.iter().filter(|&&up| up).count(), isolated.len())),
+                };
+                let line = strip::line(&readings);
+                if relayout || line != strip_line {
+                    draw_strip(&line, grid_cols, &mut frame, &mut pen);
+                    strip_line = line;
+                    drew = true;
+                }
             }
             // The search bar, over the window's bottom row.
             if let Some(f) = &find_bar {
