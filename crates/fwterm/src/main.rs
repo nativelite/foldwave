@@ -2204,7 +2204,10 @@ keys:
                     });
                 // An isolated pane's history lines in view: ask its host for
                 // those not here yet (they are drawn when they come), and let
-                // go of those far from the view or no longer held.
+                // go of those far from the view or no longer held. Lock
+                // order here: `term` (held for the whole draw), then
+                // `host_lines`, then `session`; nothing may take them in
+                // the other order.
                 let host_lines = folded.as_ref().filter(|_| remote).map(|view| {
                     let mut h = self.shared.host_lines.lock().unwrap();
                     let need: Vec<u64> = view
