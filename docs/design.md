@@ -89,7 +89,7 @@ before it is claimed.
 | Idle | ~0% CPU, no busy polling, GPU idle when nothing changes |
 | History | 100 GB per session on disk; open, jump to any line, and search in < 1 s |
 | Memory | a fixed, machine-derived RAM budget per pane; RAM never grows with history |
-| Crash | after a crash or kill, every pane's history up to the last flush replays — **measured** (E6, §8.0): 9 kills, every log an exact prefix, no torn tail |
+| Crash | after a crash or kill, every pane's history up to the last flush replays — **measured** (E6, §8.0): 9 kills, every log an exact prefix, no torn tail; **in fwterm** (2026-09-29): 16 flooding panes killed 6 times, 96 of 96 logs exact prefixes |
 | Fault isolation | a crash in one part doesn't take the ship down: an agent, a pane, a parser, the indexer, the AI server or the GPU device each fail alone. The failed part restarts or rebuilds from its log within 2 s (target), and every other pane keeps running |
 
 Where atrium stands today (*measured*, Windows, release, output timestamped on a
@@ -694,10 +694,32 @@ rebuilds a screen from it.
   persist each write before returning, but the 990 PRO is a consumer drive
   with no power-loss protection, so a real power cut could still lose what sat
   in its volatile cache. Testing that needs hardware we do not have.
-- **Still untested:** a *concurrent* crash — 16 panes writing when the kill
-  lands — and replay of a device-level log, which would have to demultiplex
-  pane-tagged records. Both matter only if §8.4's per-pane decision is
-  revisited.
+- **Concurrent, in fwterm itself (2026-09-29, `fwbench logcheck`).** 16
+  isolated panes, pipe lane, each running `fwbench --emit` (4 GiB), logging
+  to E:; fwterm killed with `TerminateProcess` after 2, 3, 5, 10, 12 and 20 s.
+  `fwbench logcheck` reads every pane's generations in order and compares
+  them byte for byte with the seeded stream.
+
+  | Kill after | Durable | Exact prefixes |
+  | --- | --- | --- |
+  | 2 s | 5.0 GiB | 16 of 16 |
+  | 3 s | 2.1 GiB | 16 of 16 |
+  | 5 s | 5.3 GiB | 16 of 16 |
+  | 10 s | 11.0 GiB | 16 of 16 |
+  | 12 s | 12.6 GiB | 16 of 16 |
+  | 20 s | 17.1 GiB | 16 of 16 |
+
+  Every log is an exact prefix, across generation roll-overs (up to 5 per
+  pane). The pane hosts outlived the window: they left only when they
+  noticed their pipe had broken, and kept flooding meanwhile. Each host is
+  now in a kill-on-close job the window owns, so the window's death ends
+  them however it dies. They still take 0.1 s (a 2 s flood) to 3 s (20 s) to
+  go: a process cannot finish terminating while its write-through writes
+  are in flight, and the disk queue is deep by then. Before the job,
+  2.7–9.3 s. Durable totals above include what hosts wrote in that time.
+- **Still untested:** replay of a device-level log, which would have to
+  demultiplex pane-tagged records; it matters only if §8.4's per-pane
+  decision is revisited.
 
 **What E5 settles.** §8.0 is no longer a proposal with arithmetic behind it:
 the legs compose, the pipeline runs 5–9× the target flat out, and at the target

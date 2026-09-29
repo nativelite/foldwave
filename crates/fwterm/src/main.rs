@@ -3064,6 +3064,15 @@ keys:
         cmd.arg("--").args(&args.shell);
         cmd.env("FWTERM_BANNER", format!("{}{note}", logs.banner()));
         let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+        // Every host is in one job that closes with this process: if the
+        // window dies, however it dies, its hosts and their programs go at
+        // once instead of flooding on until they notice (design §4, crash).
+        // A normal close still lets each host shut down first (`kill`).
+        static HOSTS: std::sync::OnceLock<Option<resmon::job::KillOnClose>> =
+            std::sync::OnceLock::new();
+        if let Some(job) = HOSTS.get_or_init(|| resmon::job::KillOnClose::new().ok()) {
+            let _ = job.assign(&child);
+        }
         if let Ok(clock) = resmon::cpu::ProcessClock::of(&child) {
             hosts.lock().unwrap().add(clock);
         }
