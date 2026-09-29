@@ -157,6 +157,15 @@ pub fn word_at(chars: &[char], col: usize) -> (usize, usize) {
     (first, last)
 }
 
+/// Whether pasting `text` should be confirmed first, and if so how many
+/// lines it holds: it has a line break, and the program neither asked for
+/// bracketed paste nor is full-screen, so a shell would run each line as it
+/// arrives (design §11 row 14). PSReadLine never asks for bracketed paste.
+pub fn paste_asks(text: &str, bracketed: bool, full_screen: bool) -> Option<usize> {
+    let breaks = text.contains(['\r', '\n']);
+    (breaks && !bracketed && !full_screen).then(|| text.lines().count().max(1))
+}
+
 /// Text pasted into a terminal: line breaks become carriage returns, which
 /// is what the Enter key sends. When the program asked for bracketed paste
 /// (`?2004h`), it comes wrapped in `ESC [200~` and `ESC [201~`, and any of
@@ -273,6 +282,22 @@ mod tests {
         assert_eq!(word_at(&line, 20), (19, 20), "a run of spaces");
         assert_eq!(word_at(&line, 99), (21, 23), "clamped to the end");
         assert_eq!(word_at(&[], 3), (0, 0));
+    }
+
+    #[test]
+    fn a_paste_that_would_run_lines_asks_first() {
+        // Two lines into a shell that did not ask for bracketed paste: ask.
+        assert_eq!(paste_asks("echo a\r\necho b", false, false), Some(2));
+        assert_eq!(
+            paste_asks("echo a\n", false, false),
+            Some(1),
+            "a trailing Enter runs it"
+        );
+        assert_eq!(paste_asks("one line", false, false), None);
+        // Bracketed, the program takes the text as pasted: no question.
+        assert_eq!(paste_asks("a\nb", true, false), None);
+        // A full-screen program (an editor) takes lines as text.
+        assert_eq!(paste_asks("a\nb", false, true), None);
     }
 
     #[test]

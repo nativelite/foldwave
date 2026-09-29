@@ -210,7 +210,10 @@ keys:
   drag, double-click   select text in a pane / select a word
   Ctrl+Shift+C      copy the selection (Ctrl+C too while there is one;
                     otherwise Ctrl+C goes to the program)
-  Ctrl+V, Ctrl+Shift+V   paste
+  Ctrl+V, Ctrl+Shift+V   paste; several lines into a program that did not
+                    ask for bracketed paste (a shell runs each) ask first:
+                    Enter pastes, Esc cancels (paste_warning = off in the
+                    settings file pastes at once)
   Shift+PgUp/PgDn, wheel   scroll the focused pane back / forward
 ";
 
@@ -1493,6 +1496,30 @@ keys:
     /// Search bar colours.
     const BAR_BG: u32 = 0xFF26_4F78;
     const BAR_FG: u32 = 0xFFE8_E8E8;
+
+    /// A bar across window row `row`: `text`, then blanks, in the bar's
+    /// colours (the search bar, a paste waiting to be confirmed).
+    fn draw_bar(text: &str, row: usize, cols: usize, frame: &mut Frame, pen: &mut Pen) {
+        let mut chars = text.chars();
+        for col in 0..cols {
+            let ch = chars.next().unwrap_or(' ');
+            let glyph = pen.atlas.slot(
+                GlyphKey {
+                    ch,
+                    style: 0,
+                    part: GlyphPart::Single,
+                },
+                pen.raster,
+            );
+            let cell = CellInstance {
+                glyph,
+                fg: BAR_FG,
+                bg: BAR_BG,
+                flags: 0,
+            };
+            frame.put(row, col, cell);
+        }
+    }
 
     /// Leave the search: every pane back to its live view.
     fn close_find(panes: &mut [Pane]) {
@@ -3427,6 +3454,11 @@ keys:
         let mut focus: PaneId = 0;
         let mut zoom: Option<PaneId> = (args.zoom && args.panes > 1).then_some(0);
         let mut find_bar: Option<FindBar> = None;
+        // A paste that would run several lines, waiting for Enter or Esc
+        // (design §11 row 14; `paste_warning = off` in the settings file
+        // pastes at once).
+        let paste_warning = settings().1.paste_warning.unwrap_or(true);
+        let mut paste_ask: Option<(PaneId, String, usize)> = None;
         // Every pane starts at its real size; a zoom then hides the rest.
         if zoom.is_some() {
             placement = layout.place_zoomed(zoom, grid_rows, grid_cols);
@@ -3514,6 +3546,35 @@ keys:
                 let Some(fi) = panes.iter().position(|p| p.id == focus) else {
                     break;
                 };
+                // A paste waiting to be confirmed: Enter pastes it into the
+                // pane it was meant for, Esc drops it; other keys wait.
+                if paste_ask.is_some() {
+                    match *e {
+                        Event::Char(_) if drop_char => {
+                            drop_char = false;
+                            continue;
+                        }
+                        Event::Char('\r') => {
+                            if let Some((id, text, _)) = paste_ask.take() {
+                                if let Some(p) = panes.iter_mut().find(|p| p.id == id) {
+                                    let bracketed = p.shared.term.lock().unwrap().bracketed_paste();
+                                    let bytes = select::paste_bytes(&text, bracketed);
+                                    let _ = p.session.lock().unwrap().write(&bytes);
+                                    p.back = 0;
+                                }
+                            }
+                            layout_dirty = true;
+                            continue;
+                        }
+                        Event::Char('\u{1b}') => {
+                            paste_ask = None;
+                            layout_dirty = true;
+                            continue;
+                        }
+                        Event::Char(_) | Event::Key { .. } | Event::SysKey { .. } => continue,
+                        _ => {}
+                    }
+                }
                 // The search bar takes what is typed while it is open; keys
                 // other than its own toggle do not reach the program.
                 if let Some(f) = find_bar.as_mut() {
@@ -3671,9 +3732,21 @@ keys:
                         if vk == 0x56 && ctrl {
                             match surface.window().clipboard() {
                                 Ok(Some(text)) => {
-                                    let bracketed =
-                                        panes[fi].shared.term.lock().unwrap().bracketed_paste();
-                                    input.extend_from_slice(&select::paste_bytes(&text, bracketed));
+                                    let (bracketed, full) = {
+                                        let t = panes[fi].shared.term.lock().unwrap();
+                                        (t.bracketed_paste(), t.in_alternate_screen())
+                                    };
+                                    match select::paste_asks(&text, bracketed, full)
+                                        .filter(|_| paste_warning)
+                                    {
+                                        Some(n) => {
+                                            paste_ask = Some((panes[fi].id, text, n));
+                                            layout_dirty = true;
+                                        }
+                                        None => input.extend_from_slice(&select::paste_bytes(
+                                            &text, bracketed,
+                                        )),
+                                    }
                                     panes[fi].back = 0;
                                     clear(&mut selection, &panes);
                                 }
@@ -4179,29 +4252,34 @@ keys:
                     (Some(note), true) => format!("{status}  [{note}]"),
                     _ => status,
                 };
-                let text: Vec<char> = format!(" find: {}_   {status}", f.query).chars().collect();
-                let row = grid_rows.saturating_sub(1);
-                for col in 0..grid_cols {
-                    let ch = text.get(col).copied().unwrap_or(' ');
-                    let glyph = pen.atlas.slot(
-                        GlyphKey {
-                            ch,
-                            style: 0,
-                            part: GlyphPart::Single,
-                        },
-                        pen.raster,
-                    );
-                    frame.put(
-                        row,
-                        col,
-                        CellInstance {
-                            glyph,
-                            fg: BAR_FG,
-                            bg: BAR_BG,
-                            flags: 0,
-                        },
-                    );
-                }
+                let text = format!(" find: {}_   {status}", f.query);
+                draw_bar(
+                    &text,
+                    grid_rows.saturating_sub(1),
+                    grid_cols,
+                    &mut frame,
+                    &mut pen,
+                );
+                drew = true;
+            }
+            // A paste waiting to be confirmed, over the same row.
+            if let Some((_, _, n)) = &paste_ask {
+                let lines = if *n == 1 {
+                    "1 line".to_string()
+                } else {
+                    format!("{n} lines")
+                };
+                let text = format!(
+                    " Paste {lines}? The program runs each line as it arrives.   \
+                     Enter pastes, Esc cancels"
+                );
+                draw_bar(
+                    &text,
+                    grid_rows.saturating_sub(1),
+                    grid_cols,
+                    &mut frame,
+                    &mut pen,
+                );
                 drew = true;
             }
             if drew && frame.damaged_rows() > 0 {

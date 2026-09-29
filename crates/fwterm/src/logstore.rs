@@ -66,6 +66,9 @@ pub fn generation_bytes(budget: u64) -> u64 {
 pub struct Settings {
     pub log_dir: Option<PathBuf>,
     pub log_cap: Option<u64>,
+    /// `paste_warning = off` stops fwterm asking before a paste that would
+    /// run several lines (on by default; design §11 row 14).
+    pub paste_warning: Option<bool>,
 }
 
 /// `key = value` lines; `#` starts a comment. Unknown keys are ignored.
@@ -80,6 +83,13 @@ pub fn parse_settings(text: &str) -> Settings {
         match k.trim() {
             "log_dir" if !v.is_empty() => s.log_dir = Some(PathBuf::from(v)),
             "log_cap_gib" => s.log_cap = v.parse::<u64>().ok().map(|g| g * GIB),
+            "paste_warning" => {
+                s.paste_warning = match v {
+                    "on" | "true" | "1" => Some(true),
+                    "off" | "false" | "0" => Some(false),
+                    _ => None,
+                }
+            }
             _ => {}
         }
     }
@@ -447,6 +457,20 @@ mod tests {
         let again = with_log_dir("log_cap_gib=4\nlog_dir = C:\\old\n", Path::new("D:\\new"));
         assert_eq!(again, "log_cap_gib=4\nlog_dir = D:\\new\n");
         assert_eq!(parse_settings("log_dir =\n").log_dir, None);
+        // The multi-line paste question: on unless the file says off.
+        assert_eq!(parse_settings("").paste_warning, None);
+        assert_eq!(
+            parse_settings("paste_warning = off\n").paste_warning,
+            Some(false)
+        );
+        assert_eq!(
+            parse_settings("paste_warning=on\n").paste_warning,
+            Some(true)
+        );
+        assert_eq!(
+            parse_settings("paste_warning = maybe\n").paste_warning,
+            None
+        );
     }
 
     #[test]
@@ -454,7 +478,7 @@ mod tests {
         let app = PathBuf::from("L\\foldwave");
         let set = Settings {
             log_dir: Some(PathBuf::from("S")),
-            log_cap: None,
+            ..Settings::default()
         };
         let none = Settings::default();
         let r = |f: Option<&str>, e: Option<&str>, s: &Settings| {
