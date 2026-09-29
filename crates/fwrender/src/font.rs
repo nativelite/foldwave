@@ -2,7 +2,8 @@
 //! into cell-sized coverage.
 //!
 //! A [`FontRasterizer`] has a face per style (regular, bold, italic, bold
-//! italic; missing styles fall back to regular) and a list of fallback fonts
+//! italic; a missing style falls back to regular or bold, and a missing
+//! italic is that face slanted, see [`SLANT`]) and a list of fallback fonts
 //! for characters the main font lacks (CJK, symbols). The cell comes from the
 //! main font: its advance of `M` wide, and tall enough for its ascent and
 //! descent as Windows lays out lines (`OS/2` metrics), each rounded to whole
@@ -18,7 +19,7 @@
 //! raw outline.
 
 use crate::atlas::{Metrics, Rasterizer, BOLD, ITALIC};
-use glyphs::{Canvas, Font, VerticalFit};
+use glyphs::{Canvas, Font, OutlineSink, VerticalFit};
 use std::io;
 use std::path::PathBuf;
 
@@ -334,13 +335,55 @@ impl FontRasterizer {
     }
 }
 
-/// The face for `style`, falling back towards regular.
-fn styled(styles: &[Option<Face>; 4], style: u8) -> &Face {
+/// The face for `style`, falling back towards regular, and whether it is
+/// an italic face.
+fn styled(styles: &[Option<Face>; 4], style: u8) -> (&Face, bool) {
     let want = (style & (BOLD | ITALIC)) as usize;
     [want, want & !(ITALIC as usize), want & !(BOLD as usize), 0]
         .iter()
-        .find_map(|&i| styles[i].as_ref())
+        .find_map(|&i| styles[i].as_ref().map(|f| (f, i & ITALIC as usize != 0)))
         .expect("regular is always loaded")
+}
+
+/// How far a slanted glyph leans, in width per unit of height (about 11
+/// degrees, near the slant of monospaced italics), when italic is asked of a
+/// family without an italic face (Cascadia Mono installed without its
+/// italic file): the upright face slanted, as Windows Terminal does.
+pub const SLANT: f32 = 0.2;
+
+/// An [`OutlineSink`] that slants the outline on its way through: each point
+/// moves right by [`SLANT`] times its height above `mid`, the cell's middle,
+/// so the glyph leans about its centre and stays in its cell.
+struct Slanted<'a> {
+    inner: &'a mut dyn OutlineSink,
+    mid: f32,
+}
+
+impl Slanted<'_> {
+    fn x(&self, x: f32, y: f32) -> f32 {
+        x + (y - self.mid) * SLANT
+    }
+}
+
+impl OutlineSink for Slanted<'_> {
+    fn move_to(&mut self, x: f32, y: f32) {
+        let x = self.x(x, y);
+        self.inner.move_to(x, y);
+    }
+
+    fn line_to(&mut self, x: f32, y: f32) {
+        let x = self.x(x, y);
+        self.inner.line_to(x, y);
+    }
+
+    fn quad_to(&mut self, cx: f32, cy: f32, x: f32, y: f32) {
+        let (cx, x) = (self.x(cx, cy), self.x(x, y));
+        self.inner.quad_to(cx, cy, x, y);
+    }
+
+    fn close(&mut self) {
+        self.inner.close();
+    }
 }
 
 impl Rasterizer for FontRasterizer {
@@ -366,7 +409,7 @@ impl Rasterizer for FontRasterizer {
             sharpening,
             curve,
         } = self;
-        let styled = styled(styles, style);
+        let (styled, italic_face) = styled(styles, style);
         let (face, glyph) = match styled.font.glyph_index(ch) {
             Some(g) => (styled, g),
             None => match fallbacks
@@ -404,13 +447,22 @@ impl Rasterizer for FontRasterizer {
         } else {
             &[0.0]
         };
+        // Italic asked of a face that is not italic (the family has none,
+        // or a fallback drew the character): slanted about the cell's middle.
+        let slant = style & ITALIC != 0 && !(italic_face && std::ptr::eq(face, styled));
+        let mid = (m.baseline as f32 - h as f32 / 2.0) / face.scale;
         let mut drawn = Ok(false);
         for &k in passes {
             let mut pen = canvas.pen(face.scale, pen_x + k * face.stem_widen, m.baseline as f32);
+            let mut slanted = Slanted {
+                inner: &mut pen,
+                mid,
+            };
+            let sink: &mut dyn OutlineSink = if slant { &mut slanted } else { slanted.inner };
             drawn = if sharpening.vertical_fit {
-                face.font.outline(glyph, &mut face.fit.apply(&mut pen))
+                face.font.outline(glyph, &mut face.fit.apply(sink))
             } else {
-                face.font.outline(glyph, &mut pen)
+                face.font.outline(glyph, sink)
             };
         }
         if matches!(drawn, Ok(true)) {
@@ -454,6 +506,76 @@ mod tests {
             bold > regular * 11 / 10,
             "bold ink {bold} vs regular {regular}"
         );
+    }
+
+    #[test]
+    fn a_family_without_an_italic_face_draws_italic_slanted() {
+        let path = system_font_dir().join("consola.ttf");
+        if !path.exists() {
+            eprintln!("consola.ttf not installed; skipped");
+            return;
+        }
+        // Consolas' regular file alone, as a family with no italic.
+        let family = crate::Family {
+            name: "Consolas".into(),
+            regular: FontFile::new(&path),
+            bold: None,
+            italic: None,
+            bold_italic: None,
+            variable: false,
+        };
+        let mut r = FontRasterizer::from_family(&family, 32.0).unwrap();
+        let m = r.metrics();
+        let (w, h) = (m.cell_w as usize, m.cell_h as usize);
+        let mut raster = |ch, style| {
+            let mut out = vec![0u8; w * h];
+            r.rasterize(ch, style, 1, &mut out);
+            out
+        };
+        // Where the ink of rows `rows` sits across the cell, on average.
+        let centre = |v: &[u8], rows: std::ops::Range<usize>| {
+            let (mut sum, mut ink) = (0.0f32, 0.0f32);
+            for y in rows {
+                for x in 0..w {
+                    let a = v[y * w + x] as f32;
+                    sum += a * x as f32;
+                    ink += a;
+                }
+            }
+            sum / ink.max(1.0)
+        };
+        // How far `l`'s top sits right of its foot: more when italic.
+        let top = m.baseline as usize * 3 / 10..m.baseline as usize / 2;
+        let foot = m.baseline as usize * 3 / 4..m.baseline as usize;
+        let (up, it) = (raster('l', 0), raster('l', ITALIC));
+        let lean = |v: &[u8]| centre(v, top.clone()) - centre(v, foot.clone());
+        assert!(
+            lean(&it) - lean(&up) > 2.0,
+            "italic leans right: {} vs {}",
+            lean(&it),
+            lean(&up)
+        );
+        // Bold italic leans too.
+        let ink = |v: &[u8]| v.iter().map(|&x| x as u32).sum::<u32>();
+        let bi = raster('l', BOLD | ITALIC);
+        assert!(
+            lean(&bi) - lean(&up) > 2.0,
+            "bold italic leans: {}",
+            lean(&bi)
+        );
+        // Slanted, the glyph still fits its cell: less than one pixel's
+        // worth of ink in its outer columns (a trace of antialiasing).
+        let edges = |v: &[u8]| {
+            (0..h)
+                .map(|y| v[y * w] as u32 + v[y * w + w - 1] as u32)
+                .sum::<u32>()
+        };
+        assert!(
+            edges(&it) < 255,
+            "italic 'l' stays inside the cell: {}",
+            edges(&it)
+        );
+        assert!(ink(&it) * 10 > ink(&up) * 9, "about the same ink");
     }
 
     #[test]
