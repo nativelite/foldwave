@@ -1338,14 +1338,14 @@ keys:
     /// Lines of a log a regex is tried on, from the index's hits for the
     /// literal it requires (newest first).
     const REGEX_CANDIDATES: usize = 20_000;
-    /// How long a regex with no literal may read logs line by line, every
-    /// pane at once; past it, the search reports the newest it covered.
+    /// How long a regex may try log lines, every pane at once; past it, the
+    /// search reports the newest it covered.
     const REGEX_SCAN: Duration = Duration::from_secs(5);
 
     /// Hits for `query` in every generation of one pane's logs, newest
     /// generation first, at most `limit` per generation, with lines numbered
-    /// as [`Deep`] numbers them; and whether a regex with no literal to look
-    /// up stopped at `deadline` before reading them all.
+    /// as [`Deep`] numbers them; and whether a regex stopped at `deadline`
+    /// before trying every line it had to.
     ///
     /// Text goes to the log's index. A regex tries the lines the index finds
     /// for a literal it requires (three characters or more, as the index
@@ -1425,6 +1425,12 @@ keys:
                         // Several hits on one line: tried once.
                         if last.replace(local) == Some(local) {
                             continue;
+                        }
+                        // A literal on most lines ("err") leaves nearly every
+                        // line to try: the same deadline as reading them all.
+                        if Instant::now() >= deadline {
+                            cut = true;
+                            break;
                         }
                         if let Some(text) = try_line(local) {
                             push(local, offset, text);
@@ -1612,18 +1618,25 @@ keys:
 
         /// Rebuild the screen as it was when the logs reached line `end`:
         /// restore the nearest checkpoint before it in its generation, replay
-        /// the rest.
+        /// the rest. The line break ending line `end - 1` is left out, so that
+        /// line is the bottom row and the screen shows the `rows` lines before
+        /// `end`, not a blank row for the line to come.
         fn rebuild(&mut self, end: u64, rows: usize, cols: usize, pipe: bool) -> io::Result<()> {
             if end == self.at {
                 return Ok(());
             }
+            // The generation holding the break before `end`: at a roll-over
+            // line (the end of one and the start of the next), the earlier.
             let k = self
                 .gens
-                .partition_point(|(_, start)| *start <= end)
+                .partition_point(|(_, start)| *start < end)
                 .saturating_sub(1);
             let (reader, start) = &self.gens[k];
             let local = (end.saturating_sub(*start)).min(reader.line_count() - 1);
-            let offset = reader.line_start(local)?;
+            let offset = match reader.line_start(local)? {
+                o if local > 0 => o - 1,
+                o => o,
+            };
             let (mut term, from) = match reader.checkpoint_before(offset)? {
                 Some((at, blob)) => match Term::restore(&blob) {
                     Ok(t) => (t, at),
@@ -3982,7 +3995,7 @@ keys:
                     f.took = Some(took);
                     f.note = cut.then(|| {
                         format!(
-                            "a pattern with no 3-letter literal: the newest {} s of reading",
+                            "stopped after {} s: the newest output searched first",
                             REGEX_SCAN.as_secs()
                         )
                     });
@@ -4255,6 +4268,9 @@ keys:
             let past = Instant::now();
             let q = find::Query::parse(r"/\w+/").unwrap();
             assert!(search_pane(7, &pane, &q, 100, past).1);
+            // A regex whose literal is on many lines is cut short the same way.
+            let q = find::Query::parse(r"/needle [a-z]$/").unwrap();
+            assert!(search_pane(7, &pane, &q, 100, past).1);
             let hits = search("needle");
             let got: Vec<(usize, u64, &str)> = hits
                 .iter()
@@ -4295,15 +4311,23 @@ keys:
             let mut d = Deep::open(&pane).unwrap();
             // 11 line starts in each; they share the line the roll fell on.
             assert_eq!(d.total, 21);
+            // The screen's rows are the 4 lines before `end`: no blank row
+            // at the bottom, so a view of `rows` lines ending at `end` starts
+            // exactly at `end - rows` (what Ctrl+Up puts at the top).
             let at = |d: &mut Deep, end: u64| {
                 d.rebuild(end, 4, 10, false).unwrap();
-                row(&d.term, 2)
+                (row(&d.term, 0), row(&d.term, 3))
             };
-            assert_eq!(at(&mut d, 5), "L4", "inside the first generation");
-            assert_eq!(at(&mut d, 10), "L9", "at the roll: the checkpoint alone");
+            let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+            assert_eq!(
+                at(&mut d, 5),
+                pair("L1", "L4"),
+                "inside the first generation"
+            );
+            assert_eq!(at(&mut d, 10), pair("L6", "L9"), "at the roll");
             assert_eq!(
                 at(&mut d, 15),
-                "L14",
+                pair("L11", "L14"),
                 "inside the second, from its checkpoint"
             );
 
@@ -4311,7 +4335,7 @@ keys:
             logstore::delete(&pane.join(logstore::gen_name(1, 0)));
             let mut d = Deep::open(&pane).unwrap();
             assert_eq!(d.total, 11);
-            assert_eq!(at(&mut d, 5), "L14");
+            assert_eq!(at(&mut d, 5).1, "L14");
             let _ = std::fs::remove_dir_all(&pane);
         }
 
