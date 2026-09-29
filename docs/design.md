@@ -1882,6 +1882,26 @@ take the ship down.
     through pane hosts: `exit 3` on a scrolled-back command, Ctrl+Up exact
     across a wrapped line, a live fold with the lines above it, and a drag
     past the top edge scrolling back.
+  - **The GPU fails alone (2026-09-29).** Until then a failed Vulkan draw
+    ended fwterm's loop, and the window and every pane host with it.
+    - Renderer: a draw or resize that fails on Vulkan (a lost device or
+      surface) tears the renderer down, keeps the window
+      (`VkWindow::try_new`, `into_window`), and builds a new Vulkan device on
+      it; after 3 failures in a minute the CPU renderer draws for good. The
+      frame is redrawn in full; panes and programs are not touched. Checked
+      in a window with a pane printing a counter every 50 ms and four losses
+      injected (`FOLDWAVE_TEST_GPU_LOSS=4,6,8,10`, a test hook): new
+      devices in 78, 78 and 92 ms, the CPU in 17 ms after the fourth, the
+      counter never stopped, the pane host kept running.
+    - Indexer: a failed CUDA launch signs its batch on the CPU (no block
+      goes without) and opens a new context, 3 times a minute at most;
+      past that every logger signs its own, as without CUDA. Checked with
+      a 1 GiB flood and two failed launches (`FOLDWAVE_TEST_CUDA_FAIL=2,4`):
+      `index_faults 2`, 951 blocks signed on the GPU in 28 launches after and
+      between them, 72 on the CPU, all 1,023 signed.
+    - The hooks inject the error where the call returns it; a real device
+      reset also fails later calls, and teardown ignores those (it waits for
+      the device without checking the result).
   - **Supervisor (built 2026-09-25).** When a host's pipe ends without an
     exit message, the host crashed. The window starts a new host for that
     pane: a fresh program, a new log generation in the same pane folder, so

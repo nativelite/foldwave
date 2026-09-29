@@ -2188,13 +2188,34 @@ impl VkWindow {
         atlas: &Atlas,
         mode: PresentMode,
     ) -> Result<VkWindow, Error> {
+        VkWindow::try_new(window, atlas, mode).map_err(|(e, _)| e)
+    }
+
+    /// As [`VkWindow::new`], but a failure hands the window back, so the
+    /// caller can draw into it another way (after a lost device, say).
+    pub fn try_new(
+        window: crate::win::Window,
+        atlas: &Atlas,
+        mode: PresentMode,
+    ) -> Result<VkWindow, (Error, crate::win::Window)> {
         let (w, h) = window.client_size();
         // SAFETY: the handles are `window`'s, and `window` is moved into the
-        // result next to the renderer, which drops first (field order).
-        let renderer = unsafe {
+        // result next to the renderer, which drops first (field order); on
+        // failure the partly built renderer is gone before `window` returns.
+        match unsafe {
             VkRenderer::for_window(window.hinstance(), window.hwnd(), w, h, atlas, mode)
-        }?;
-        Ok(VkWindow { renderer, window })
+        } {
+            Ok(renderer) => Ok(VkWindow { renderer, window }),
+            Err(e) => Err((e, window)),
+        }
+    }
+
+    /// Tear the renderer down and keep the window: after the device is lost
+    /// (`VK_ERROR_DEVICE_LOST`), before building a new one on it.
+    pub fn into_window(self) -> crate::win::Window {
+        let VkWindow { renderer, window } = self;
+        drop(renderer);
+        window
     }
 
     /// The window.

@@ -536,6 +536,80 @@ keys:
         }
     }
 
+    /// How many times the GPU may fail within [`GPU_FAULT_SPAN`] and still get
+    /// a new Vulkan device; past that the CPU draws for good.
+    const GPU_REBUILDS: usize = 3;
+    const GPU_FAULT_SPAN: Duration = Duration::from_secs(60);
+
+    /// When drawing on the GPU last failed (design §4, fault isolation: the
+    /// GPU device fails alone).
+    #[derive(Default)]
+    struct GpuFaults {
+        at: Vec<Instant>,
+    }
+
+    impl GpuFaults {
+        /// A failure at `now`: whether to try Vulkan again.
+        fn retry(&mut self, now: Instant) -> bool {
+            self.at.retain(|t| now.duration_since(*t) < GPU_FAULT_SPAN);
+            self.at.push(now);
+            self.at.len() <= GPU_REBUILDS
+        }
+    }
+
+    /// `e` came from drawing or resizing `surface`: on the GPU, recover (see
+    /// [`Surface::recover`]); a failure on the CPU is fatal.
+    fn after_draw_error(
+        surface: Surface,
+        e: io::Error,
+        atlas: &Atlas,
+        faults: &mut GpuFaults,
+    ) -> io::Result<Surface> {
+        if !matches!(surface, Surface::Vulkan(_)) {
+            return Err(e);
+        }
+        let t = Instant::now();
+        let vulkan = faults.retry(t);
+        let (surface, how) = surface.recover(atlas, vulkan);
+        say!(
+            "fwterm: drawing on the GPU failed ({e}); now drawing with {how} ({} ms)",
+            t.elapsed().as_millis()
+        );
+        Ok(surface)
+    }
+
+    impl Surface {
+        /// After drawing on the GPU failed (a lost device, a lost surface):
+        /// the same window with a new Vulkan renderer when `vulkan` and one
+        /// can be made, else the CPU renderer. Panes and their programs are
+        /// untouched. Returns the new surface and what now draws.
+        fn recover(self, atlas: &Atlas, vulkan: bool) -> (Surface, &'static str) {
+            let window = match self {
+                Surface::Cpu { window, .. } => window,
+                Surface::Vulkan(v) => v.into_window(),
+            };
+            let window = if vulkan {
+                match fwrender::vk::VkWindow::try_new(
+                    window,
+                    atlas,
+                    fwrender::vk::PresentMode::Mailbox,
+                ) {
+                    Ok(v) => return (Surface::Vulkan(v), "a new Vulkan device"),
+                    Err((_, window)) => window,
+                }
+            } else {
+                window
+            };
+            let (w, h) = window.client_size();
+            let cpu = Surface::Cpu {
+                window,
+                cpu: CpuRenderer::new(w, h),
+                presenter: CpuPresenter::new(),
+            };
+            (cpu, "the CPU")
+        }
+    }
+
     /// Bytes for the shell for a typed character.
     fn char_bytes(c: char, out: &mut Vec<u8>) {
         match c {
@@ -1805,10 +1879,12 @@ keys:
         // Search signatures: how many the GPU built, how many the loggers did.
         let text = match index {
             Some(c) => format!(
-                "{text}index_gpu_blocks {}\nindex_cpu_blocks {}\nindex_launches {}\n",
+                "{text}index_gpu_blocks {}\nindex_cpu_blocks {}\nindex_launches {}\n\
+                 index_faults {}\n",
                 c.gpu.load(Ordering::Relaxed),
                 c.cpu.load(Ordering::Relaxed),
-                c.launches.load(Ordering::Relaxed)
+                c.launches.load(Ordering::Relaxed),
+                c.faults.load(Ordering::Relaxed)
             ),
             None => text,
         };
@@ -3420,6 +3496,19 @@ keys:
             }
         };
 
+        let mut gpu_faults = GpuFaults::default();
+        // A test hook: FOLDWAVE_TEST_GPU_LOSS=<seconds>[,<seconds>...] takes
+        // the first Vulkan frame drawn after each of those times as a lost
+        // device.
+        let started_at = Instant::now();
+        let mut gpu_losses: Vec<Instant> = std::env::var("FOLDWAVE_TEST_GPU_LOSS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| s.trim().parse::<f64>().ok())
+            .map(|s| started_at + Duration::from_secs_f64(s))
+            .rev()
+            .collect();
+
         let grid = |w: u32, h: u32| {
             (
                 (h / m.cell_h).max(1) as usize,
@@ -4081,7 +4170,9 @@ keys:
                         pane.shared.pending.store(true, Ordering::Release);
                     }
                     Event::Resized(w, h) if w > 0 && h > 0 => {
-                        surface.resize(w, h)?;
+                        if let Err(e) = surface.resize(w, h) {
+                            surface = after_draw_error(surface, e, &atlas, &mut gpu_faults)?;
+                        }
                         (grid_rows, grid_cols) = grid(w, h);
                         placement = layout.place_zoomed(zoom, grid_rows, grid_cols);
                         place_all(&mut panes, &placement);
@@ -4341,7 +4432,23 @@ keys:
                 drew = true;
             }
             if drew && frame.damaged_rows() > 0 {
-                surface.draw(&frame, &mut atlas)?;
+                let injected = matches!(surface, Surface::Vulkan(_))
+                    && gpu_losses.last().is_some_and(|&t| Instant::now() >= t);
+                let drawn = if injected {
+                    gpu_losses.pop();
+                    Err(io::Error::other(
+                        "VK_ERROR_DEVICE_LOST, injected by FOLDWAVE_TEST_GPU_LOSS",
+                    ))
+                } else {
+                    surface.draw(&frame, &mut atlas)
+                };
+                if let Err(e) = drawn {
+                    // The GPU fails alone: the window and every pane go on,
+                    // redrawn in full on what draws now.
+                    surface = after_draw_error(surface, e, &atlas, &mut gpu_faults)?;
+                    frame.damage_all();
+                    surface.draw(&frame, &mut atlas)?;
+                }
                 frame.clear_damage();
                 last_draw = Some(Instant::now());
                 if args.stats.is_some() {
@@ -4495,6 +4602,19 @@ keys:
                 assert!(on_screen, "line {} shows {:?}", h.line, h.text);
             }
             let _ = std::fs::remove_dir_all(&pane);
+        }
+
+        #[test]
+        fn the_gpu_is_rebuilt_a_few_times_a_minute_then_the_cpu_draws() {
+            let t = Instant::now();
+            let mut f = GpuFaults::default();
+            let s = Duration::from_secs;
+            assert!(f.retry(t) && f.retry(t + s(1)) && f.retry(t + s(2)));
+            assert!(!f.retry(t + s(3)), "a fourth within the minute: the CPU");
+            // A minute after the first three, the GPU gets another chance.
+            let mut f = GpuFaults::default();
+            assert!(f.retry(t) && f.retry(t + s(1)) && f.retry(t + s(2)));
+            assert!(f.retry(t + s(62)), "the old failures have aged out");
         }
 
         #[test]

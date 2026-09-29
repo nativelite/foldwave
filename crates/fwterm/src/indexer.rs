@@ -94,6 +94,17 @@ enum Work<R> {
 }
 
 impl<R> Work<R> {
+    /// Its signature built here, when the GPU could not: `None` for a host's
+    /// block that cannot be read (panelog rebuilds it when the log opens).
+    fn cpu_signature(&self) -> Option<Vec<u8>> {
+        match self {
+            Work::Staged(j) => Some(panelog::signature(Some(j.lead), &j.bytes)),
+            Work::Log { block, log, .. } => {
+                read_block(log, *block).map(|(lead, bytes)| panelog::signature(lead, &bytes))
+            }
+        }
+    }
+
     fn target(&self) -> (&R, u32, u64) {
         match self {
             Work::Staged(j) => (&j.reply, j.generation, j.block),
@@ -130,6 +141,9 @@ pub struct Counts {
     pub gpu: AtomicU64,
     pub cpu: AtomicU64,
     pub launches: AtomicU64,
+    /// Launches that failed (a GPU reset, a lost context): their blocks
+    /// were signed on the CPU and the indexer opened a new context.
+    pub faults: AtomicU64,
 }
 
 /// The loggers' side of the indexer.
@@ -152,11 +166,26 @@ impl<R: Send + 'static> Indexer<R> {
     /// signature to its logger. `None` when there is no CUDA device or the
     /// kernel will not load: every logger then builds its own.
     pub fn start(deliver: impl Fn(&R, u32, u64, Vec<u8>) + Send + 'static) -> Option<Indexer<R>> {
+        // A test hook: FOLDWAVE_TEST_CUDA_FAIL=<n>[,<n>...] fails those
+        // launches (counted from 0) as a GPU reset would.
+        let faults = std::env::var("FOLDWAVE_TEST_CUDA_FAIL")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|n| n.trim().parse().ok())
+            .collect();
+        Indexer::start_with(deliver, faults)
+    }
+
+    /// [`Indexer::start`], with the launches in `faults` made to fail.
+    fn start_with(
+        deliver: impl Fn(&R, u32, u64, Vec<u8>) + Send + 'static,
+        faults: Vec<u64>,
+    ) -> Option<Indexer<R>> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Work<R>>(QUEUE);
         let (ready_tx, ready) = std::sync::mpsc::channel();
         let counts = Arc::new(Counts::default());
         let c = counts.clone();
-        std::thread::spawn(move || run(rx, deliver, ready_tx, c));
+        std::thread::spawn(move || run(rx, deliver, ready_tx, c, faults));
         ready.recv().ok().filter(|&ok| ok)?;
         Some(Indexer { tx, counts })
     }
@@ -274,12 +303,61 @@ fn read_block(log: &panelog::ByteReader, block: u64) -> Option<(Option<[u8; 2]>,
     Some((Some(lead), bytes))
 }
 
+/// How many times a minute the indexer opens a new CUDA context after a
+/// failed launch; past that, every logger signs its own blocks.
+const REOPENS: usize = 3;
+const REOPEN_SPAN: Duration = Duration::from_secs(60);
+
+/// How a CUDA session of the indexer ended.
+enum Ended {
+    /// Every sender is gone: the window is closing.
+    Closed,
+    /// CUDA could not start, or a launch failed.
+    Failed,
+}
+
 fn run<R>(
     rx: Receiver<Work<R>>,
     deliver: impl Fn(&R, u32, u64, Vec<u8>),
     ready: std::sync::mpsc::Sender<bool>,
     counts: Arc<Counts>,
+    mut faults: Vec<u64>,
 ) {
+    let mut ready = Some(ready);
+    let mut failed: Vec<Instant> = Vec::new();
+    loop {
+        match session(&rx, &deliver, &mut ready, &counts, &mut faults) {
+            Ended::Closed => return,
+            Ended::Failed if ready.is_some() => {
+                // CUDA never started: the loggers sign their own.
+                if let Some(r) = ready.take() {
+                    let _ = r.send(false);
+                }
+                return;
+            }
+            Ended::Failed => {
+                // Design §4, fault isolation: the indexer fails alone, and
+                // comes back on a new context unless it keeps failing.
+                let now = Instant::now();
+                failed.retain(|t| now.duration_since(*t) < REOPEN_SPAN);
+                failed.push(now);
+                if failed.len() > REOPENS {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+/// One CUDA context's worth of launches.
+fn session<R>(
+    rx: &Receiver<Work<R>>,
+    deliver: &impl Fn(&R, u32, u64, Vec<u8>),
+    ready: &mut Option<std::sync::mpsc::Sender<bool>>,
+    counts: &Counts,
+    faults: &mut Vec<u64>,
+) -> Ended {
     let stride = BLOCK + 2;
     let setup = || -> Result<_, fwcuda::Error> {
         let cuda = fwcuda::Cuda::load()?;
@@ -287,12 +365,10 @@ fn run<R>(
         Ok((cuda, dev))
     };
     let Ok((cuda, dev)) = setup() else {
-        let _ = ready.send(false);
-        return;
+        return Ended::Failed;
     };
     let Ok(ctx) = fwcuda::Context::new_blocking(&cuda, &dev) else {
-        let _ = ready.send(false);
-        return;
+        return Ended::Failed;
     };
     let parts = (|| -> Result<_, fwcuda::Error> {
         Ok((
@@ -303,17 +379,18 @@ fn run<R>(
         ))
     })();
     let Ok((kernel, mut host, dev_in, dev_out)) = parts else {
-        let _ = ready.send(false);
-        return;
+        return Ended::Failed;
     };
-    let _ = ready.send(true);
+    if let Some(r) = ready.take() {
+        let _ = r.send(true);
+    }
     let mut sigs = vec![0u8; MAX_BATCH * fwcuda::SIG_BYTES];
     let mut batch: Vec<Work<R>> = Vec::with_capacity(MAX_BATCH);
     loop {
         // Wait for work, then gather more for up to GATHER or a full batch.
         match rx.recv() {
             Ok(j) => batch.push(j),
-            Err(_) => return,
+            Err(_) => return Ended::Closed,
         }
         let until = Instant::now() + GATHER;
         while batch.len() < MAX_BATCH {
@@ -358,15 +435,38 @@ fn run<R>(
         if n == 0 {
             continue;
         }
+        // Launches so far, failed ones too: what the test hook counts.
+        let launch =
+            counts.launches.load(Ordering::Relaxed) + counts.faults.load(Ordering::Relaxed);
+        let injected = faults.first() == Some(&launch);
+        if injected {
+            faults.remove(0);
+        }
         let built = (|| -> Result<(), fwcuda::Error> {
+            if injected {
+                // What a reset GPU returns: CUDA_ERROR_LAUNCH_FAILED.
+                return Err(fwcuda::Error::Driver {
+                    call: "FOLDWAVE_TEST_CUDA_FAIL",
+                    code: 719,
+                    name: None,
+                });
+            }
             ctx.copy_h2d_prefix(&dev_in, &host.as_slice()[..n * stride])?;
             kernel.build(&dev_in, 2, stride, n, &dev_out)?;
             ctx.copy_d2h_prefix(&mut sigs[..n * fwcuda::SIG_BYTES], &dev_out)
         })();
         if built.is_err() {
-            // The GPU failed: hand the blocks back as never built; panelog
-            // rebuilds their signatures when the log is opened. Stop.
-            return;
+            // The GPU failed: this batch is signed here, so no block goes
+            // without, and a new context is opened for the next.
+            counts.faults.fetch_add(1, Ordering::Relaxed);
+            for w in batch.drain(..) {
+                if let Some(sig) = w.cpu_signature() {
+                    counts.cpu.fetch_add(1, Ordering::Relaxed);
+                    let (reply, generation, block) = w.target();
+                    deliver(reply, generation, block, sig);
+                }
+            }
+            return Ended::Failed;
         }
         counts.launches.fetch_add(1, Ordering::Relaxed);
         counts.gpu.fetch_add(n as u64, Ordering::Relaxed);
@@ -442,6 +542,60 @@ mod tests {
             assert_eq!(Some(&sig), want.get(&(g, blk)), "pane {g} block {blk}");
         }
         assert_eq!(ix.counts.gpu.load(Ordering::Relaxed), sent);
+    }
+
+    #[test]
+    fn a_failed_launch_is_signed_on_the_cpu_and_the_gpu_comes_back() {
+        let (tx, rx) = std::sync::mpsc::channel::<(u32, u64, Vec<u8>)>();
+        // The first launch fails, as a GPU reset would make it.
+        let Some(ix) = Indexer::start_with(
+            move |r: &std::sync::mpsc::Sender<_>, g, b, sig| {
+                let _ = r.send((g, b, sig));
+            },
+            vec![0],
+        ) else {
+            return; // no CUDA here
+        };
+        let data = text(9 * BLOCK);
+        let mut s = BlockStager::default();
+        let staged: Vec<Staged> = s
+            .push(&data)
+            .into_iter()
+            .filter(|b| b.lead.is_some())
+            .collect();
+        let want: std::collections::HashMap<u64, Vec<u8>> = staged
+            .iter()
+            .map(|b| (b.block, panelog::signature(b.lead, &b.bytes)))
+            .collect();
+        // Two waves: the first meets the failure, the second a new context.
+        for wave in staged.chunks(4) {
+            for st in wave {
+                let job = Job {
+                    reply: tx.clone(),
+                    generation: 0,
+                    block: st.block,
+                    lead: st.lead.unwrap(),
+                    bytes: st.bytes.clone(),
+                };
+                assert!(ix.submit(job).is_ok());
+            }
+            for _ in wave {
+                let (_, blk, sig) = rx.recv_timeout(Duration::from_secs(20)).unwrap();
+                assert_eq!(Some(&sig), want.get(&blk), "block {blk}");
+            }
+        }
+        let c = &ix.counts;
+        assert_eq!(c.faults.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            c.cpu.load(Ordering::Relaxed),
+            4,
+            "the failed batch, on the CPU"
+        );
+        assert_eq!(
+            c.gpu.load(Ordering::Relaxed),
+            4,
+            "the next, on the GPU again"
+        );
     }
 
     #[test]
