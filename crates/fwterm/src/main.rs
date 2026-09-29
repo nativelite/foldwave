@@ -96,7 +96,7 @@ mod app {
     use std::collections::{HashMap, HashSet};
     use std::io;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::mpsc::SyncSender;
     use std::sync::{Arc, Mutex, Weak};
     use std::time::{Duration, Instant};
@@ -203,7 +203,8 @@ keys:
   Ctrl+Up/Down      jump to the previous / next command's prompt
   Ctrl+Shift+O      select a command's output (then Ctrl+C copies it)
   Ctrl+Shift+[ / ]  fold that command's output to one line / unfold
-  Ctrl+Shift+F      search every pane's log: type, Enter searches, Enter /
+  Ctrl+Shift+F      search every pane's log, and earlier sessions' in the same
+                    log folder: type, Enter searches, Enter /
                     Shift+Enter step through hits (newest first), Esc closes;
                     /pattern/ is a regular expression (. [a-z] \\d \\w \\s
                     * + ? {m,n} | ( ) ^ $), case ignored like text
@@ -1391,6 +1392,7 @@ keys:
                     text,
                     generation: *stamp,
                     offset,
+                    session: None,
                 });
             };
             let re = match query {
@@ -1542,8 +1544,9 @@ keys:
         zoom: &mut Option<PaneId>,
         focus: &mut PaneId,
     ) {
-        // A pane closed since: its log is shown in the focused pane.
-        let open = panes.iter().any(|p| p.id == hit.pane);
+        // A pane closed since, or one of an earlier session: its log is
+        // shown in the focused pane.
+        let open = hit.session.is_none() && panes.iter().any(|p| p.id == hit.pane);
         let target = if open { hit.pane } else { *focus };
         if zoom.is_some() && *zoom != Some(target) {
             *zoom = None;
@@ -1577,6 +1580,17 @@ keys:
         /// The line the rebuilt screen ends before, and the rebuilt term.
         at: u64,
         term: Term,
+        /// The log ends lines with bare line feeds: a pipe pane's, perhaps
+        /// from another session in another lane, replayed as one.
+        bare_lf: bool,
+    }
+
+    /// Whether most line breaks in `bytes` are bare line feeds, as a pipe
+    /// pane's program writes them; a console pane's host writes CR LF.
+    fn bare_line_feeds(bytes: &[u8]) -> bool {
+        let lf = bytes.iter().filter(|&&b| b == b'\n').count();
+        let crlf = bytes.windows(2).filter(|w| w == b"\r\n").count();
+        lf - crlf > crlf
     }
 
     impl Deep {
@@ -1596,11 +1610,17 @@ keys:
             if gens.is_empty() {
                 return Err(io::ErrorKind::NotFound.into());
             }
+            // The first 64 KiB of the newest generation tell the lane.
+            let mut head = vec![0u8; 64 * 1024];
+            let n = gens
+                .last()
+                .map_or(0, |(r, _)| r.read_at(0, &mut head).unwrap_or(0));
             Ok(Deep {
                 gens,
                 total,
                 at: u64::MAX,
                 term: Term::new(1, 1),
+                bare_lf: bare_line_feeds(&head[..n]),
             })
         }
 
@@ -1674,7 +1694,7 @@ keys:
                 },
                 None => (Term::new(rows, cols), 0),
             };
-            if from == 0 && pipe {
+            if from == 0 && (pipe || self.bare_lf) {
                 term.feed(b"\x1b[20h");
             }
             let mut buf = vec![0u8; 256 * 1024];
@@ -3606,11 +3626,21 @@ keys:
                                 };
                                 f.error = None;
                                 // Every pane this session logged, closed
-                                // ones too.
-                                let jobs: Vec<(PaneId, PathBuf)> = match &logs.store {
-                                    Some(store) => store.session.pane_dirs(),
-                                    None => Vec::new(),
-                                };
+                                // ones too; earlier sessions' panes are
+                                // listed on the search thread.
+                                let (jobs, own): (Vec<(PaneId, PathBuf, Option<u64>)>, _) =
+                                    match &logs.store {
+                                        Some(store) => (
+                                            store
+                                                .session
+                                                .pane_dirs()
+                                                .into_iter()
+                                                .map(|(id, d)| (id, d, None))
+                                                .collect(),
+                                            Some(store.session.dir.clone()),
+                                        ),
+                                        None => (Vec::new(), None),
+                                    };
                                 // Panes without a log: what memory holds.
                                 let started = Instant::now();
                                 let memory: Vec<find::Hit> = panes
@@ -3633,17 +3663,45 @@ keys:
                                 let w = waker.clone();
                                 std::thread::spawn(move || {
                                     let deadline = started + REGEX_SCAN;
-                                    // Every pane at once: each opens and
-                                    // searches its own generations.
+                                    // Then every earlier session's panes, in
+                                    // the same log root (design §11 row 13).
+                                    let mut jobs = jobs;
+                                    if let Some(own) = &own {
+                                        let root = own.parent().unwrap_or(own);
+                                        for (stamp, dirs) in logstore::earlier_sessions(root, own) {
+                                            jobs.extend(
+                                                dirs.into_iter()
+                                                    .map(|(id, d)| (id, d, Some(stamp))),
+                                            );
+                                        }
+                                    }
+                                    // Panes searched side by side, a worker
+                                    // per core: each opens and searches its
+                                    // own generations.
+                                    let workers = std::thread::available_parallelism()
+                                        .map_or(4, |n| n.get())
+                                        .clamp(1, jobs.len().max(1));
+                                    let next = AtomicUsize::new(0);
                                     let (mut all, cut) = std::thread::scope(|sc| {
-                                        let handles: Vec<_> = jobs
-                                            .iter()
-                                            .map(|(id, dir)| {
-                                                let query = &query;
+                                        let handles: Vec<_> = (0..workers)
+                                            .map(|_| {
+                                                let (query, jobs, next) = (&query, &jobs, &next);
                                                 sc.spawn(move || {
-                                                    search_pane(
-                                                        *id, dir, query, FIND_LIMIT, deadline,
-                                                    )
+                                                    let mut hits = Vec::new();
+                                                    let mut cut = false;
+                                                    while let Some((id, dir, session)) = jobs
+                                                        .get(next.fetch_add(1, Ordering::Relaxed))
+                                                    {
+                                                        let (h, c) = search_pane(
+                                                            *id, dir, query, FIND_LIMIT, deadline,
+                                                        );
+                                                        hits.extend(h.into_iter().map(|mut h| {
+                                                            h.session = *session;
+                                                            h
+                                                        }));
+                                                        cut |= c;
+                                                    }
+                                                    (hits, cut)
                                                 })
                                             })
                                             .collect();
@@ -4224,27 +4282,27 @@ keys:
                     _ if f.searched == f.query && f.error.is_some() => {
                         f.error.clone().unwrap_or_default()
                     }
-                    (Some(_), _) => "searching every pane's log...".to_string(),
+                    (Some(_), _) => "searching every log, earlier sessions' too...".to_string(),
                     (None, 0) if !f.searched.is_empty() && f.searched == f.query => {
                         let ms = f.took.map_or(0.0, |t| t.as_secs_f64() * 1e3);
                         format!("no matches ({ms:.0} ms)")
                     }
-                    (None, 0) => "Enter searches every pane's log, Esc closes".into(),
+                    (None, 0) => {
+                        "Enter searches every pane's log and earlier sessions', Esc closes".into()
+                    }
                     (None, n) if f.searched == f.query => {
                         let h = &f.hits[f.at];
                         let ms = f.took.map_or(0.0, |t| t.as_secs_f64() * 1e3);
-                        let closed = if panes.iter().any(|p| p.id == h.pane) {
-                            ""
-                        } else {
-                            "closed "
+                        let pane = h.pane + 1;
+                        let place = match h.session {
+                            Some(s) => format!(
+                                "pane {pane} of a session started {}",
+                                find::ago(logstore::now_ms().saturating_sub(s))
+                            ),
+                            None if panes.iter().any(|p| p.id == h.pane) => format!("pane {pane}"),
+                            None => format!("closed pane {pane}"),
                         };
-                        format!(
-                            "{}/{} ({ms:.0} ms) in {closed}pane {}: {}",
-                            f.at + 1,
-                            n,
-                            h.pane + 1,
-                            h.text
-                        )
+                        format!("{}/{} ({ms:.0} ms) in {place}: {}", f.at + 1, n, h.text)
                     }
                     (None, _) => "Enter searches again".into(),
                 };
@@ -4440,6 +4498,17 @@ keys:
         }
 
         #[test]
+        fn a_log_of_bare_line_feeds_is_replayed_as_a_pipe_panes() {
+            assert!(bare_line_feeds(b"one\ntwo\nthree\n"));
+            assert!(!bare_line_feeds(b"one\r\ntwo\r\n"));
+            // A console pane's output: CR LF, with cursor moves between.
+            assert!(!bare_line_feeds(b"\x1b[2;1Hdir\r\n a\r\n b\n"));
+            assert!(!bare_line_feeds(b"no breaks at all"));
+            // A pipe pane running cmd writes CR LF too: either way is right.
+            assert!(bare_line_feeds(b"a\nb\nc\r\n"));
+        }
+
+        #[test]
         fn scrollback_continues_across_log_generations() {
             let pane = std::env::temp_dir().join(format!("fwterm-deep-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&pane);
@@ -4594,6 +4663,7 @@ keys:
                 total: 3,
                 at: 3,
                 term,
+                bare_lf: false,
             };
             let pt = |line, col| Point { line, col };
             // From "line" on row 0 to "界" on row 1 (a wide glyph: once).

@@ -338,25 +338,49 @@ impl Session {
     /// Every pane this session has logged, open or closed since, by id.
     /// Pane ids are never reused, so each folder is one pane's.
     pub fn pane_dirs(&self) -> Vec<(usize, PathBuf)> {
-        let mut out: Vec<(usize, PathBuf)> = fs::read_dir(&self.dir)
-            .into_iter()
-            .flatten()
-            .filter_map(|e| {
-                let e = e.ok()?;
-                let id = e
-                    .file_name()
-                    .to_str()?
-                    .strip_prefix("pane-")?
-                    .parse()
-                    .ok()?;
-                // A real folder: never a link or junction to somewhere else.
-                let t = e.file_type().ok()?;
-                (t.is_dir() && !t.is_symlink()).then(|| (id, e.path()))
-            })
-            .collect();
-        out.sort_unstable_by_key(|(id, _)| *id);
-        out
+        pane_dirs(&self.dir)
     }
+}
+
+/// The pane folders of session folder `dir`, by id.
+fn pane_dirs(dir: &Path) -> Vec<(usize, PathBuf)> {
+    let mut out: Vec<(usize, PathBuf)> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let id = e
+                .file_name()
+                .to_str()?
+                .strip_prefix("pane-")?
+                .parse()
+                .ok()?;
+            // A real folder: never a link or junction to somewhere else.
+            let t = e.file_type().ok()?;
+            (t.is_dir() && !t.is_symlink()).then(|| (id, e.path()))
+        })
+        .collect();
+    out.sort_unstable_by_key(|(id, _)| *id);
+    out
+}
+
+/// Every other fwterm session under `root` (earlier runs, and any other
+/// window still running), newest first: when it started (ms since the
+/// epoch, from its name) and its pane folders by id. For searching them
+/// (design §11 row 13); only folders fwterm made and marked are listed.
+pub fn earlier_sessions(root: &Path, own: &Path) -> Vec<(u64, Vec<(usize, PathBuf)>)> {
+    let mut out: Vec<(u64, Vec<(usize, PathBuf)>)> = ours(root, is_session_name)
+        .into_iter()
+        .filter(|s| s != own && s.join(MARK).is_file())
+        .filter_map(|s| {
+            let name = s.file_name()?.to_str()?;
+            let stamp = name.split_once('-')?.0.parse().ok()?;
+            Some((stamp, pane_dirs(&s)))
+        })
+        .filter(|(_, panes)| !panes.is_empty())
+        .collect();
+    out.sort_by(|a, b| b.0.cmp(&a.0));
+    out
 }
 
 /// Bytes shown to people: `8.7 GB`, `256 MB`.
@@ -509,6 +533,37 @@ mod tests {
         fs::write(g.join("panelog.meta"), b"panelog 1\n").unwrap();
         fs::write(g.join("seg-00000001.log"), vec![0u8; bytes]).unwrap();
         g
+    }
+
+    #[test]
+    fn earlier_sessions_are_listed_newest_first_with_their_panes() {
+        let root = scratch("earlier");
+        let own = Session::create(&root).unwrap();
+        fake_gen(&own.pane_dir(0), 900, 0, 10);
+        let old = root.join("0000000000100-1");
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join(MARK), b"").unwrap();
+        fake_gen(&old.join("pane-0"), 100, 0, 10);
+        fake_gen(&old.join("pane-3"), 100, 0, 10);
+        let newer = root.join("0000000000200-2");
+        fs::create_dir_all(&newer).unwrap();
+        fs::write(newer.join(MARK), b"").unwrap();
+        fake_gen(&newer.join("pane-1"), 200, 0, 10);
+        // Named like a session but not fwterm's (no mark): never searched.
+        let lookalike = root.join("0000000000300-3");
+        fake_gen(&lookalike.join("pane-0"), 300, 0, 10);
+
+        let got = earlier_sessions(&root, &own.dir);
+        assert_eq!(
+            got,
+            vec![
+                (200, vec![(1, newer.join("pane-1"))]),
+                (100, vec![(0, old.join("pane-0")), (3, old.join("pane-3"))]),
+            ],
+            "this session left out"
+        );
+        drop(own);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

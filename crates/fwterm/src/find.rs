@@ -48,6 +48,21 @@ pub struct Hit {
     /// When its generation started (ms) and its offset there: newest first.
     pub generation: u64,
     pub offset: u64,
+    /// When the earlier session it is from started (ms since the epoch);
+    /// `None` for this window's panes. Pane ids are per session.
+    pub session: Option<u64>,
+}
+
+/// How long ago, for the search bar: `just now`, `12 min ago`, `3 h ago`,
+/// `2 days ago`.
+pub fn ago(ms: u64) -> String {
+    let min = ms / 60_000;
+    match min {
+        0 => "just now".into(),
+        1..=59 => format!("{min} min ago"),
+        60..=2879 => format!("{} h ago", min / 60),
+        _ => format!("{} days ago", min / 1440),
+    }
 }
 
 /// Newest first across panes: by generation start, then offset.
@@ -128,6 +143,7 @@ pub fn search_lines(
                 .collect(),
             generation: 0,
             offset: line,
+            session: None,
         })
         .collect();
     let drop = hits.len().saturating_sub(limit);
@@ -164,7 +180,17 @@ mod tests {
             text: String::new(),
             generation,
             offset,
+            session: None,
         }
+    }
+
+    #[test]
+    fn ages_read_as_people_say_them() {
+        assert_eq!(ago(30_000), "just now");
+        assert_eq!(ago(12 * 60_000), "12 min ago");
+        assert_eq!(ago(3 * 3_600_000 + 5), "3 h ago");
+        assert_eq!(ago(47 * 3_600_000), "47 h ago");
+        assert_eq!(ago(2 * 86_400_000), "2 days ago");
     }
 
     #[test]
