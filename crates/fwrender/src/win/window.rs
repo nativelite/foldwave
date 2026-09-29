@@ -376,6 +376,24 @@ impl Window {
             & set(DWMWA_BORDER_COLOR, colorref(border))
     }
 
+    /// Give the title bar and frame back to the system's colours.
+    pub fn reset_frame_colors(&self) {
+        // DWMWA_COLOR_DEFAULT.
+        let default = 0xFFFF_FFFFu32;
+        for attribute in [DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_BORDER_COLOR] {
+            // SAFETY: `hwnd` is live; `default` is a 4-byte COLORREF that
+            // outlives the call.
+            unsafe {
+                DwmSetWindowAttribute(
+                    self.hwnd,
+                    attribute,
+                    (&default as *const u32).cast(),
+                    std::mem::size_of::<u32>() as u32,
+                )
+            };
+        }
+    }
+
     /// The window's DPI (96 at 100 % scaling).
     pub fn dpi(&self) -> u32 {
         // SAFETY: `hwnd` is live.

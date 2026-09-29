@@ -62,6 +62,8 @@ mod logstore;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod select;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod settings_ui;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod strip;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod theme;
@@ -95,6 +97,7 @@ mod app {
     use crate::layout::{neighbor, pane_at, Dir, Layout, PaneId, Placement, Rect, Toward};
     use crate::logstore;
     use crate::select::{self, Point, Selection};
+    use crate::settings_ui;
     use crate::strip;
     use crate::theme::Theme;
     use fwrender::win::{display_refresh_hz, CpuPresenter, Event, Waker, Window};
@@ -151,7 +154,8 @@ options:
   --theme T     colours: mirai (default, foldwave's own) or classic; any
                 colour can be changed in the settings file with
                 color.<name> = #rrggbb (bg, fg, selection, dim, accent,
-                rule, bar, bar_text, error, title_bar, ansi0..ansi15)
+                rule, bar, bar_text, error, surface, title_bar,
+                ansi0..ansi15)
   --licenses    show the licenses of what fwterm ships (JetBrains Mono,
                 Microsoft's ConPTY) and exit
   --px N        font size in pixels per em (default 16)
@@ -215,6 +219,8 @@ keys:
   Alt+Shift+Minus   split it, the new one below
   Alt+Shift+D       split it along its longer side
   Alt+Arrow, click  focus the pane in that direction / under the pointer
+  Ctrl+,            settings: theme, font, size, the paste question, the
+                    instrument strip, logs (saved to fwterm.conf)
   Ctrl+Shift+W      close the focused pane (the last one closes the window)
   Ctrl+Shift+Z      zoom the focused pane to the whole window, or back
   Ctrl+Up/Down      jump to the previous / next command's prompt
@@ -241,7 +247,8 @@ keys:
         font: Option<String>,
         /// `--theme`; else the settings file's, else Mirai.
         theme: Option<String>,
-        px: f32,
+        /// `--px`; else the settings file's, else 16.
+        px: Option<f32>,
         size: (u32, u32),
         sharpen: bool,
         max_fps: Option<u32>,
@@ -285,7 +292,7 @@ keys:
             conpty: None,
             font: None,
             theme: None,
-            px: 16.0,
+            px: None,
             size: (1200, 720),
             sharpen: true,
             max_fps: None,
@@ -344,11 +351,12 @@ keys:
                 }
                 "--px" => {
                     let v = value(&mut i, "--px")?;
-                    a.px = v
-                        .parse()
-                        .ok()
-                        .filter(|p: &f32| *p >= 4.0)
-                        .ok_or(format!("bad --px {v:?}"))?;
+                    a.px = Some(
+                        v.parse()
+                            .ok()
+                            .filter(|p: &f32| *p >= 4.0)
+                            .ok_or(format!("bad --px {v:?}"))?,
+                    );
                 }
                 "--size" => {
                     let v = value(&mut i, "--size")?;
@@ -1657,7 +1665,7 @@ keys:
     /// Draw the instrument strip across grid row 0.
     fn draw_strip(line: &[(char, strip::Kind)], cols: usize, frame: &mut Frame, pen: &mut Pen) {
         let t = pen.theme;
-        let bg = t.title_bar.unwrap_or(t.bar);
+        let bg = t.surface;
         for col in 0..cols {
             let (ch, kind) = line.get(col).copied().unwrap_or((' ', strip::Kind::Label));
             let fg = match kind {
@@ -1683,6 +1691,46 @@ keys:
                     flags: 0,
                 },
             );
+        }
+    }
+
+    /// Draw the settings sheet's cells with their top-left at `(top, left)`.
+    fn draw_sheet(
+        cells: &[Vec<settings_ui::Cell>],
+        top: usize,
+        left: usize,
+        frame: &mut Frame,
+        pen: &mut Pen,
+    ) {
+        use settings_ui::Paint as P;
+        let t = pen.theme;
+        let bg = t.surface;
+        for (r, row) in cells.iter().enumerate() {
+            for (c, &(ch, paint, sel)) in row.iter().enumerate() {
+                let fg = match paint {
+                    P::Rule => t.rule,
+                    P::Corner | P::Title | P::NavOn | P::Button => t.accent,
+                    P::Nav | P::Note | P::Hint => t.dim,
+                    P::Label | P::Value => t.palette.fg,
+                };
+                let key = GlyphKey {
+                    ch,
+                    style: 0,
+                    part: GlyphPart::Single,
+                };
+                let glyph = pen.atlas.slot(key, pen.raster);
+                let bg = if sel { t.palette.selection } else { bg };
+                frame.put(
+                    top + r,
+                    left + c,
+                    CellInstance {
+                        glyph,
+                        fg,
+                        bg,
+                        flags: 0,
+                    },
+                );
+            }
         }
     }
 
@@ -3589,16 +3637,21 @@ keys:
 
     fn start(args: &Args) -> io::Result<i32> {
         choose_console_host(args)?;
-        let mut raster = match &args.font {
+        // The font: --font / --px, else the settings file's, else JetBrains
+        // Mono at 16 px.
+        let conf = settings().1;
+        let px = args.px.or(conf.px.map(|p| p as f32)).unwrap_or(16.0);
+        let font = args.font.clone().or(conf.font.clone());
+        let mut raster = match &font {
             // JetBrains Mono, compiled in: no font folder to scan.
-            None => FontRasterizer::from_family(&fwrender::builtin_default(), args.px)?,
+            None => FontRasterizer::from_family(&fwrender::builtin_default(), px)?,
             Some(name) => {
                 let catalog = fwrender::FontCatalog::system();
                 let family = catalog.family(name).map_err(|e| {
                     let known = catalog.monospace_families().join(", ");
                     io::Error::new(e.kind(), format!("{e}; monospaced fonts found: {known}"))
                 })?;
-                FontRasterizer::from_family(&family, args.px)?
+                FontRasterizer::from_family(&family, px)?
             }
         };
         if !args.sharpen {
@@ -3661,7 +3714,7 @@ keys:
         }
         let hosts = Arc::new(Mutex::new(governor::Family::default()));
         // The instrument strip takes the grid's top row (design §11 row 17).
-        let strip_rows = usize::from(settings().1.instruments.unwrap_or(true));
+        let mut strip_rows = usize::from(settings().1.instruments.unwrap_or(true));
         let cpu_share = Arc::new(AtomicU64::new(NO_READING));
         let busy = if args.governor || strip_rows > 0 {
             let wake = (strip_rows > 0).then(|| surface.window().waker());
@@ -3706,7 +3759,9 @@ keys:
         // A paste that would run several lines, waiting for Enter or Esc
         // (design §11 row 14; `paste_warning = off` in the settings file
         // pastes at once).
-        let paste_warning = settings().1.paste_warning.unwrap_or(true);
+        let mut paste_warning = settings().1.paste_warning.unwrap_or(true);
+        // The settings sheet, while open (Ctrl+,).
+        let mut sheet: Option<settings_ui::Form> = None;
         let mut paste_ask: Option<(PaneId, String, usize)> = None;
         // The instrument strip's last line, when it next reads, and the log
         // drive's free space (read every 5 s).
@@ -3729,6 +3784,7 @@ keys:
         // file's colour overrides.
         let conf = settings().1;
         let name = args.theme.clone().or(conf.theme.clone());
+        let mut theme_name = name.clone().unwrap_or_else(|| "mirai".into());
         let mut theme = name
             .as_deref()
             .map_or(Some(Theme::mirai()), Theme::named)
@@ -3743,7 +3799,7 @@ keys:
                 bad.join(", ")
             );
         }
-        let palette = theme.palette.clone();
+        let mut palette = theme.palette.clone();
         // foldwave's icon, drawn at the sizes a window icon may need, and
         // the title bar in the theme's colours (Windows 11).
         let icons: Vec<(u32, Vec<u8>)> = icon::sizes_for(surface.window().dpi())
@@ -3833,6 +3889,110 @@ keys:
                 let Some(fi) = panes.iter().position(|p| p.id == focus) else {
                     break;
                 };
+                // The settings sheet takes every key and click while open.
+                if let Some(form) = sheet.as_mut() {
+                    use settings_ui::Key as K;
+                    let key = match *e {
+                        Event::Char(_) if drop_char => {
+                            drop_char = false;
+                            continue;
+                        }
+                        Event::Char('\r') => K::Enter,
+                        Event::Char('\u{1b}') => K::Esc,
+                        Event::Char('\u{8}') => K::Backspace,
+                        // Ctrl+S.
+                        Event::Char('\u{13}') => K::Save,
+                        Event::Char(c) => K::Char(c),
+                        Event::Key {
+                            vk: 0x26,
+                            down: true,
+                        } => K::Up,
+                        Event::Key {
+                            vk: 0x28,
+                            down: true,
+                        } => K::Down,
+                        Event::Key {
+                            vk: 0x25,
+                            down: true,
+                        } => K::Left,
+                        Event::Key {
+                            vk: 0x27,
+                            down: true,
+                        } => K::Right,
+                        Event::Key { .. }
+                        | Event::SysKey { .. }
+                        | Event::Click(..)
+                        | Event::DoubleClick(..)
+                        | Event::Drag(..)
+                        | Event::Release(..)
+                        | Event::Wheel(_) => continue,
+                        _ => K::Char('\u{0}'),
+                    };
+                    if key != K::Char('\u{0}') {
+                        match form.key(key) {
+                            settings_ui::Action::None => {}
+                            settings_ui::Action::Close => sheet = None,
+                            settings_ui::Action::Save(values) => {
+                                // Into the settings file, other lines kept;
+                                // then what applies at once, applied.
+                                let (app, _) = settings();
+                                let saved = app.as_deref().map(|a| {
+                                    let path = logstore::settings_path(a);
+                                    let old = std::fs::read_to_string(&path).unwrap_or_default();
+                                    std::fs::create_dir_all(a)
+                                        .and_then(|_| {
+                                            std::fs::write(
+                                                &path,
+                                                settings_ui::merged(&old, &values),
+                                            )
+                                        })
+                                        .map(|_| path)
+                                });
+                                match saved {
+                                    Some(Err(e)) => {
+                                        say!("fwterm: could not save the settings: {e}")
+                                    }
+                                    None => {
+                                        say!("fwterm: no LOCALAPPDATA: the settings were not saved")
+                                    }
+                                    Some(Ok(_)) => {}
+                                }
+                                let conf = settings().1;
+                                if let Some(t) = conf.theme.as_deref().and_then(Theme::named) {
+                                    theme = t;
+                                    theme_name = conf.theme.clone().unwrap_or_default();
+                                    theme.apply(&conf.colors);
+                                    palette = theme.palette.clone();
+                                    match theme.title_bar {
+                                        Some(bar) => {
+                                            surface.window().set_frame_colors(
+                                                bar,
+                                                theme.palette.fg,
+                                                theme.rule,
+                                            );
+                                        }
+                                        None => {
+                                            surface.window().reset_frame_colors();
+                                        }
+                                    }
+                                }
+                                paste_warning = conf.paste_warning.unwrap_or(true);
+                                let rows = usize::from(conf.instruments.unwrap_or(true));
+                                if rows != strip_rows {
+                                    strip_rows = rows;
+                                    placement = place_panes(
+                                        &layout, zoom, grid_rows, grid_cols, strip_rows,
+                                    );
+                                    place_all(&mut panes, &placement);
+                                }
+                                frame.damage_all();
+                                sheet = None;
+                            }
+                        }
+                        layout_dirty = true;
+                    }
+                    continue;
+                }
                 // A paste waiting to be confirmed: Enter pastes it into the
                 // pane it was meant for, Esc drops it; other keys wait.
                 if paste_ask.is_some() {
@@ -4079,6 +4239,13 @@ keys:
                                 Err(e) => say!("fwterm: paste: {e}"),
                             }
                             drop_char = true;
+                            continue;
+                        }
+                        // Ctrl+, : the settings sheet.
+                        // (Ctrl+, types no character, so none is dropped.)
+                        if vk == 0xBC && ctrl && !shift {
+                            sheet = Some(settings_ui::Form::new(&settings().1, &theme_name));
+                            layout_dirty = true;
                             continue;
                         }
                         // Ctrl+Shift+F: search every pane's log, or stop.
@@ -4672,6 +4839,18 @@ keys:
                 );
                 drew = true;
             }
+            // The settings sheet, over everything, centred.
+            if let Some(form) = &sheet {
+                let w = grid_cols.saturating_sub(4).min(96);
+                let h = grid_rows.saturating_sub(2).min(22);
+                let cells = settings_ui::render(form, w, h);
+                let (top, left) = (
+                    grid_rows.saturating_sub(h) / 2,
+                    grid_cols.saturating_sub(w) / 2,
+                );
+                draw_sheet(&cells, top, left, &mut frame, &mut pen);
+                drew = true;
+            }
             if drew && frame.damaged_rows() > 0 {
                 let injected = matches!(surface, Surface::Vulkan(_))
                     && gpu_losses.last().is_some_and(|&t| Instant::now() >= t);
@@ -4958,7 +5137,7 @@ keys:
                 "-NoLogo",
             ]))
             .unwrap();
-            assert_eq!((a.backend.as_str(), a.px), ("cpu", 18.0));
+            assert_eq!((a.backend.as_str(), a.px), ("cpu", Some(18.0)));
             assert_eq!(a.shell, ["pwsh", "-NoLogo"]);
             assert!(!a.pipe);
             assert!(parse(&argv(&["--pipe", "--", "x"])).unwrap().pipe);

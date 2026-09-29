@@ -21,6 +21,8 @@ pub struct Theme {
     pub bar_text: u32,
     /// A failed command's `exit N`.
     pub error: u32,
+    /// Panels over the panes: the instrument strip, the settings sheet.
+    pub surface: u32,
     /// The window's title bar (Windows 11 colours it); `None` leaves the
     /// system's.
     pub title_bar: Option<u32>,
@@ -59,6 +61,7 @@ impl Theme {
             bar: rgb(0x0f2233),
             bar_text: rgb(0xdff6ff),
             error: rgb(0xff5c7a),
+            surface: rgb(0x0d1622),
             title_bar: Some(rgb(0x0d1622)),
         }
     }
@@ -73,6 +76,7 @@ impl Theme {
             bar: rgb(0x264f78),
             bar_text: rgb(0xe8e8e8),
             error: rgb(0xd05a5a),
+            surface: rgb(0x1e1e1e),
             title_bar: None,
         }
     }
@@ -88,7 +92,7 @@ impl Theme {
 
     /// Apply `color.<name> = #rrggbb` overrides from the settings file:
     /// `bg`, `fg`, `selection`, `dim`, `accent`, `rule`, `bar`, `bar_text`,
-    /// `error`, `title_bar`, `ansi0`..`ansi15`. Returns the keys it could
+    /// `error`, `surface`, `title_bar`, `ansi0`..`ansi15`. Returns the keys it could
     /// not use.
     pub fn apply(&mut self, overrides: &[(String, String)]) -> Vec<String> {
         let mut bad = Vec::new();
@@ -107,6 +111,7 @@ impl Theme {
                 "bar" => &mut self.bar,
                 "bar_text" => &mut self.bar_text,
                 "error" => &mut self.error,
+                "surface" => &mut self.surface,
                 "title_bar" => self.title_bar.insert(c),
                 k => match k.strip_prefix("ansi").and_then(|n| n.parse::<usize>().ok()) {
                     Some(n) if n < 16 => &mut self.palette.indexed[n],

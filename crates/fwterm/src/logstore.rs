@@ -75,6 +75,9 @@ pub struct Settings {
     pub colors: Vec<(String, String)>,
     /// `instruments = off` hides the instrument strip (on by default).
     pub instruments: Option<bool>,
+    /// `font = <family>` and `px = <size>`, unless `--font` / `--px` say.
+    pub font: Option<String>,
+    pub px: Option<u32>,
 }
 
 /// `key = value` lines; `#` starts a comment, except at the start of a
@@ -106,6 +109,8 @@ pub fn parse_settings(text: &str) -> Settings {
             }
             "paste_warning" => s.paste_warning = on_off(v),
             "instruments" => s.instruments = on_off(v),
+            "font" if !v.is_empty() => s.font = Some(v.to_string()),
+            "px" => s.px = v.parse::<u32>().ok().filter(|p| (4..=200).contains(p)),
             _ => {}
         }
     }
