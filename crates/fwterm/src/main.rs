@@ -52,6 +52,8 @@ mod governor;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod hostlines;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod icon;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod indexer;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod layout;
@@ -81,6 +83,7 @@ mod app {
     use crate::emu::Emu;
     use crate::fold;
     use crate::hostlines;
+    use crate::icon;
     use crate::wire;
 
     mod host;
@@ -143,7 +146,7 @@ options:
   --theme T     colours: mirai (default, foldwave's own) or classic; any
                 colour can be changed in the settings file with
                 color.<name> = #rrggbb (bg, fg, selection, dim, accent,
-                rule, bar, bar_text, error, ansi0..ansi15)
+                rule, bar, bar_text, error, title_bar, ansi0..ansi15)
   --licenses    show the licenses of what fwterm ships (JetBrains Mono,
                 Microsoft's ConPTY) and exit
   --px N        font size in pixels per em (default 16)
@@ -3657,6 +3660,20 @@ keys:
             );
         }
         let palette = theme.palette.clone();
+        // foldwave's icon, drawn at the sizes a window icon may need, and
+        // the title bar in the theme's colours (Windows 11).
+        let icons: Vec<(u32, Vec<u8>)> = icon::sizes_for(surface.window().dpi())
+            .iter()
+            .map(|&s| (s, icon::reticle(s)))
+            .collect();
+        if let Err(e) = surface.window().set_icon(&icons) {
+            say!("fwterm: could not set the window's icon: {e}");
+        }
+        if let Some(bar) = theme.title_bar {
+            surface
+                .window()
+                .set_frame_colors(bar, theme.palette.fg, theme.rule);
+        }
         let mut frame = Frame::new();
         let mut events = Vec::new();
         let mut input = Vec::new();

@@ -102,6 +102,8 @@ pub struct Window {
     /// a plain wait timeout rounds to. Null when the system has none (before
     /// Windows 10 1803); `wait` then falls back to the millisecond timeout.
     timer: Handle,
+    /// Icons set with [`Window::set_icon`], destroyed with the window.
+    icons: Vec<Handle>,
 }
 
 impl std::fmt::Debug for Window {
@@ -134,6 +136,55 @@ impl Waker {
             unsafe { PostMessageW(*hwnd as Hwnd, WM_WAKE, 0, 0) };
         }
     }
+}
+
+/// An `HICON` from a straight-alpha RGBA image `size` pixels square.
+fn make_icon(size: u32, rgba: &[u8]) -> io::Result<Handle> {
+    let info = BitmapInfo::top_down_32(size as i32, size as i32);
+    let mut bits: *mut c_void = std::ptr::null_mut();
+    // SAFETY: `info` is a valid 32bpp header; DIB_RGB_COLORS (0) needs no DC.
+    let color = unsafe {
+        CreateDIBSection(
+            std::ptr::null_mut(),
+            &info,
+            0,
+            &mut bits,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if color.is_null() || bits.is_null() {
+        return Err(last_error("CreateDIBSection for an icon"));
+    }
+    let n = (size * size * 4) as usize;
+    // SAFETY: the section holds `size * size` 4-byte pixels at `bits`.
+    let dst = unsafe { std::slice::from_raw_parts_mut(bits.cast::<u8>(), n) };
+    for (d, s) in dst.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
+        d.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
+    }
+    // The mask is all zeros: the colour bitmap's alpha decides. Rows of a
+    // monochrome bitmap are padded to 16 bits.
+    let mask_bits = vec![0u8; (size as usize).div_ceil(16) * 2 * size as usize];
+    // SAFETY: `mask_bits` holds a whole 1bpp `size x size` bitmap.
+    let mask = unsafe { CreateBitmap(size as i32, size as i32, 1, 1, mask_bits.as_ptr().cast()) };
+    let icon_info = IconInfo {
+        icon: 1,
+        x_hotspot: 0,
+        y_hotspot: 0,
+        mask,
+        color,
+    };
+    // SAFETY: both bitmaps are live; CreateIconIndirect copies them.
+    let icon = unsafe { CreateIconIndirect(&icon_info) };
+    // SAFETY: our bitmaps, no longer needed once copied into the icon.
+    unsafe {
+        DeleteObject(color);
+        DeleteObject(mask);
+    }
+    if icon.is_null() {
+        return Err(last_error("CreateIconIndirect"));
+    }
+    Ok(icon)
 }
 
 fn last_error(what: &str) -> io::Error {
@@ -236,6 +287,7 @@ impl Window {
                     TIMER_MODIFY_AND_SYNCHRONIZE,
                 )
             },
+            icons: Vec::new(),
         };
 
         window.set_client_size(width, height)?;
@@ -273,6 +325,61 @@ impl Window {
         } else {
             Err(last_error("sizing the window"))
         }
+    }
+
+    /// Set the window's icon from square images, each its size and its
+    /// pixels as straight-alpha RGBA rows, top first: the one nearest 16 px
+    /// at the window's DPI for the title bar, nearest 32 px for the taskbar
+    /// and Alt+Tab (a larger one is scaled down, a smaller one never up).
+    pub fn set_icon(&mut self, images: &[(u32, Vec<u8>)]) -> io::Result<()> {
+        // SAFETY: `hwnd` is live.
+        let dpi = unsafe { GetDpiForWindow(self.hwnd) }.max(96);
+        let pick = |want: u32| {
+            images
+                .iter()
+                .filter(|(s, px)| px.len() == (*s * *s * 4) as usize)
+                .min_by_key(|(s, _)| if *s >= want { *s - want } else { u32::MAX - *s })
+        };
+        for (which, base) in [(ICON_SMALL, 16), (ICON_BIG, 32)] {
+            let Some((size, rgba)) = pick(base * dpi / 96) else {
+                continue;
+            };
+            let icon = make_icon(*size, rgba)?;
+            // SAFETY: `hwnd` is live; the window keeps using the icon, which
+            // this window owns until it is destroyed.
+            unsafe { SendMessageW(self.hwnd, WM_SETICON, which, icon as isize) };
+            self.icons.push(icon);
+        }
+        Ok(())
+    }
+
+    /// Colour the title bar and frame: `caption` behind the title, `text`
+    /// for it, `border` around the window (ARGB). The frame is switched to
+    /// dark mode first. Windows before 11 ignore the colours; false then.
+    pub fn set_frame_colors(&self, caption: u32, text: u32, border: u32) -> bool {
+        let colorref = |c: u32| ((c >> 16) & 0xFF) | (c & 0xFF00) | ((c & 0xFF) << 16);
+        let set = |attribute: u32, value: u32| {
+            // SAFETY: `hwnd` is live; `value` is a 4-byte BOOL or COLORREF
+            // that outlives the call.
+            unsafe {
+                DwmSetWindowAttribute(
+                    self.hwnd,
+                    attribute,
+                    (&value as *const u32).cast(),
+                    std::mem::size_of::<u32>() as u32,
+                ) == 0
+            }
+        };
+        set(DWMWA_USE_IMMERSIVE_DARK_MODE, 1);
+        set(DWMWA_CAPTION_COLOR, colorref(caption))
+            & set(DWMWA_TEXT_COLOR, colorref(text))
+            & set(DWMWA_BORDER_COLOR, colorref(border))
+    }
+
+    /// The window's DPI (96 at 100 % scaling).
+    pub fn dpi(&self) -> u32 {
+        // SAFETY: `hwnd` is live.
+        unsafe { GetDpiForWindow(self.hwnd) }
     }
 
     /// The `HWND`, for creating a GPU surface.
@@ -456,6 +563,11 @@ impl Drop for Window {
         // SAFETY: `hwnd` is live and owned by this thread. WM_NCDESTROY clears
         // GWLP_USERDATA before `shared` is freed after this block.
         unsafe { DestroyWindow(self.hwnd) };
+        for &icon in &self.icons {
+            // SAFETY: icons this window made, no longer in use now that it
+            // is destroyed.
+            unsafe { DestroyIcon(icon) };
+        }
         if !self.timer.is_null() {
             // SAFETY: our timer handle, closed once.
             unsafe { CloseHandle(self.timer) };

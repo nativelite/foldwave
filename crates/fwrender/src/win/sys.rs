@@ -130,6 +130,25 @@ pub struct BitmapInfoHeader {
     pub clr_important: u32,
 }
 
+/// `ICONINFO`: an icon made from a colour bitmap and a mask.
+#[repr(C)]
+pub struct IconInfo {
+    pub icon: Bool,
+    pub x_hotspot: u32,
+    pub y_hotspot: u32,
+    pub mask: Hgdiobj,
+    pub color: Hgdiobj,
+}
+
+pub const WM_SETICON: u32 = 0x0080;
+pub const ICON_SMALL: usize = 0;
+pub const ICON_BIG: usize = 1;
+/// `DWMWA_USE_IMMERSIVE_DARK_MODE`, and Windows 11's frame colours.
+pub const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+pub const DWMWA_BORDER_COLOR: u32 = 34;
+pub const DWMWA_CAPTION_COLOR: u32 = 35;
+pub const DWMWA_TEXT_COLOR: u32 = 36;
+
 /// `BITMAPINFO` with its one-entry colour table (unused for 32bpp `BI_RGB`).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -309,6 +328,9 @@ extern "system" {
     /// `mode` is a DEVMODEW (220 bytes); `index` ENUM_CURRENT_SETTINGS
     /// (0xFFFFFFFF) reads the current mode.
     pub fn EnumDisplaySettingsW(device: *const u16, index: u32, mode: *mut c_void) -> Bool;
+    pub fn CreateIconIndirect(info: *const IconInfo) -> Handle;
+    pub fn DestroyIcon(icon: Handle) -> Bool;
+    pub fn SendMessageW(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> isize;
     pub fn AdjustWindowRectExForDpi(
         rect: *mut Rect,
         style: u32,
@@ -332,6 +354,13 @@ extern "system" {
     ) -> Hgdiobj;
     pub fn SelectObject(hdc: Hdc, obj: Hgdiobj) -> Hgdiobj;
     pub fn DeleteObject(obj: Hgdiobj) -> Bool;
+    pub fn CreateBitmap(
+        width: i32,
+        height: i32,
+        planes: u32,
+        bits_per_pixel: u32,
+        data: *const c_void,
+    ) -> Hgdiobj;
     pub fn CreateFontW(
         height: i32,
         width: i32,
@@ -380,6 +409,16 @@ extern "system" {
     /// Test read-back only. Returns a `COLORREF` (`0x00BBGGRR`).
     #[cfg(test)]
     pub fn GetPixel(hdc: Hdc, x: i32, y: i32) -> u32;
+}
+
+#[link(name = "dwmapi")]
+extern "system" {
+    pub fn DwmSetWindowAttribute(
+        hwnd: Hwnd,
+        attribute: u32,
+        value: *const c_void,
+        size: u32,
+    ) -> i32;
 }
 
 #[link(name = "kernel32")]
