@@ -1805,8 +1805,9 @@ only.
   - Catch-up, checked in a window: 200 MB (2,000,000 numbered lines) printed
     while hidden. 150 ms after unzooming the pane was at line 955,121, and it
     ended exactly on line 2,000,000, which puts the replay at roughly 0.6 GB/s.
-- **Memory budget per pane (built 2026-09-29, §4 memory target).** A pane's
-  memory was bounded only by its history's line count (`--history`, 10,000
+- **Memory budget per pane (built 2026-09-29, §4 memory target; accepted by
+  the founder 2026-09-30: it scales with the machine's RAM, so it stands as
+  built).** A pane's memory was bounded only by its history's line count (`--history`, 10,000
   lines). A line's cost depends on its width and colours, so that was no
   budget. Measured on a pane host with 290-column lines coloured cell by
   cell: 66.8 MiB, against 10.5 MiB for typical output.
@@ -2229,7 +2230,7 @@ Founder answers of 2026-09-15.
 | # | Question | Decision | Notes / still open |
 | --- | --- | --- | --- |
 | 1 | Name, product | **foldwave**, a new product | Anime-themed (Macross), picked from vetted shortlists; see Naming below. atrium continues and adopts the engine crates (M2) |
-| 2 | App license | **FSL-1.1-Apache-2.0**, like atrium | Engine crates stay MIT |
+| 2 | App license | **FSL-1.1-Apache-2.0**, like atrium | Engine crates stay MIT. `crates/fwterm` (the app) carries it since 2026-09-30 (its Cargo.toml had said MIT; founder: FSL, which keeps it from simply being picked up); fwrender, resmon and fwcuda (engine) and fwbench, fwprobe (measurement tools) stay MIT |
 | 3 | Reusing open source | **Inspiration over original code.** Copying is a rare exception | Now in [standards/zero-dependency.md](https://github.com/nativelite/ops/blob/main/standards/zero-dependency.md). Inspiration needs no notice; any copied code keeps its MIT/Apache notice (a legal requirement) |
 | 4 | GPU binding | **Our own bindings, not wgpu.** **Founder decision (2026-09-22), after the M3 spike: Vulkan first**, CPU fallback, Metal later | The spike found Vulkan on Windows pixel-exact against the CPU reference, at ~0.2 ms of CPU per frame at any window size (§8.6), so there is no case for D3D11 or D3D12. One thing to watch: FIFO presentation did not pace to the 164 Hz display on the reference machine, and we pace frames ourselves. If pacing or remote desktop ever fall short, a DXGI flip-model present path is the Windows-native answer to test |
 | 5 | Platforms | **Windows first**, groundwork for others | Vulkan and a pane-transport interface keep Linux close; macOS gets Metal later |

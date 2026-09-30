@@ -3,9 +3,12 @@
 A GPU-rendered, high-throughput terminal for agentic work: many agents with heavy
 output, steered by one human.
 
-**Status: design, with M0 underway.** The design lives in [`docs/`](docs/); the
-first code is the M0 measurement harness in [`crates/`](crates/). Building
-happens with [atrium](https://github.com/nativelite/atrium) fleets.
+**Status: M5, the beta, under way.** The M4 alpha is met: every performance
+target in the design is measured in `fwterm`, foldwave's terminal (scorecard in
+[`docs/design.md`](docs/design.md) §10.1). Built for the beta so far: the Mirai
+look, a settings sheet, a first run, and a one-file installer. Next: agent
+events from atrium in the panes. Building happens with
+[atrium](https://github.com/nativelite/atrium) fleets.
 
 One of three products that each own a key piece of agentic development:
 
@@ -30,8 +33,28 @@ The competitive landscape for the whole suite is in
 
 | Crate | Concern | License |
 | --- | --- | --- |
-| [`crates/resmon`](crates/resmon) | attribute CPU, RAM, disk I/O and GPU use to process trees (M0 experiment E3) | MIT |
-| [`crates/fwbench`](crates/fwbench) | M0 harness: pty pane floods, key-echo latency, resource attribution | MIT |
+| [`crates/fwterm`](crates/fwterm) | the terminal: split panes, logs, search, blocks, settings, first run, install | FSL-1.1-Apache-2.0 |
+| [`crates/fwrender`](crates/fwrender) | the renderer: cell frames, glyph atlas, Vulkan and CPU backends, the Win32 window | MIT |
+| [`crates/resmon`](crates/resmon) | CPU, RAM, disk I/O and GPU use by process tree; drives and CPU sets | MIT |
+| [`crates/fwcuda`](crates/fwcuda) | a runtime-loaded binding to the CUDA driver, for the GPU search index | MIT |
+| [`crates/fwbench`](crates/fwbench) | measurement harness: pane floods, key-echo latency, log checks | MIT |
+| [`crates/fwprobe`](crates/fwprobe) | measures any terminal from outside: key-to-screen latency, throughput | MIT |
+
+## Use
+
+| Keys | Does |
+| --- | --- |
+| Ctrl+Comma | settings |
+| Alt+Shift+Plus / Minus / D | split the focused pane right / down / along its longer side |
+| Alt+Arrow, click | move focus between panes |
+| Ctrl+Shift+Z | zoom the focused pane, and back |
+| Ctrl+Shift+W | close the focused pane |
+| Ctrl+Shift+F | search every pane's log, and earlier sessions' |
+| Ctrl+Up / Ctrl+Down | jump between commands' prompts |
+| Ctrl+Shift+O | select a command's output |
+| Ctrl+Shift+[ / ] | fold a command's output, unfold it |
+
+`fwterm --help` lists every option and key.
 
 ## Install (Windows)
 
@@ -66,5 +89,9 @@ There is no CI, so this local check is the sole gate and runs before every push.
 
 ## License
 
-[FSL-1.1-Apache-2.0](LICENSE) (founder decision, 2026-09-15). The engine crates
-foldwave is built on will be MIT, like the rest of nativelite.
+The foldwave app (`crates/fwterm`) is [FSL-1.1-Apache-2.0](LICENSE) (founder
+decision, 2026-09-15): source-available, for any purpose except a competing
+use (making it available in a commercial product or service that substitutes
+for it or offers substantially similar functionality), and each release
+becomes Apache-2.0 two years after it ships. The engine crates it is built on, here and in the other
+nativelite repositories, are MIT, like the rest of nativelite.

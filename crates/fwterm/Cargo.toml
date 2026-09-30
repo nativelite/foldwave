@@ -2,7 +2,9 @@
 name = "nativelite-fwterm"
 version = "0.1.0"
 description = "foldwave's minimal terminal prototype: split panes in one window, each a real shell through ConPTY or a program over pipes, vterm, and the fwrender window - built to be measured against other terminals."
-license = "MIT"
+# The foldwave app: FSL-1.1-Apache-2.0, the repository's LICENSE (design
+# section 11 row 2). The engine crates it is built on stay MIT.
+license-file = "../../LICENSE"
 publish = false
 edition.workspace = true
 rust-version.workspace = true
