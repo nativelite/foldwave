@@ -23,6 +23,11 @@ pub fn processes() -> io::Result<Vec<RawProc>> {
 }
 
 /// Always fails on an unsupported platform.
+pub fn process_links() -> io::Result<Vec<RawProc>> {
+    unsupported()
+}
+
+/// Always fails on an unsupported platform.
 pub fn system_info() -> io::Result<SystemInfo> {
     unsupported()
 }

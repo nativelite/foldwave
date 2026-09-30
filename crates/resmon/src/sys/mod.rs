@@ -12,7 +12,7 @@ mod windows;
 #[cfg(windows)]
 pub use windows::{
     cpu_sets, cpu_times, fixed_volumes, job_assign, job_new, place_current_thread, proc_clock,
-    proc_clock_read, processes, snapshot, system_info, volume, Job, ProcClock,
+    proc_clock_read, process_links, processes, snapshot, system_info, volume, Job, ProcClock,
 };
 
 #[cfg(not(windows))]
@@ -20,5 +20,5 @@ mod unsupported;
 #[cfg(not(windows))]
 pub use unsupported::{
     cpu_sets, cpu_times, fixed_volumes, job_assign, job_new, place_current_thread, proc_clock,
-    proc_clock_read, processes, snapshot, system_info, volume, Job, ProcClock,
+    proc_clock_read, process_links, processes, snapshot, system_info, volume, Job, ProcClock,
 };

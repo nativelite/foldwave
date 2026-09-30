@@ -1,7 +1,8 @@
 //! The instrument strip (design §11 row 17): one row under the title bar
 //! reading out what fwterm is doing, `PANES 04 · FOCUS 1 · CPU 0.1 % · LOG
-//! E: 364.1 GB FREE · INDEX CPU · HOSTS 16/16`. `instruments = off` in the
-//! settings file hides it.
+//! E: 364.1 GB FREE · INDEX CPU · HOSTS 16/16`, and while agents in the panes
+//! wait on a decision (atrium's bus, `agents.rs`), how many and the newest one
+//! not yet looked at. `instruments = off` in the settings file hides it.
 
 /// What the strip reads out.
 #[derive(Debug, Clone, PartialEq)]
@@ -18,6 +19,10 @@ pub struct Readings {
     pub index: &'static str,
     /// Pane hosts running of those started; `None` without any.
     pub hosts: Option<(usize, usize)>,
+    /// Decisions agents in the panes are waiting on.
+    pub decisions: usize,
+    /// The newest of them not yet looked at, as one line.
+    pub ask: Option<String>,
 }
 
 /// How a piece of the strip is drawn.
@@ -56,6 +61,16 @@ pub fn segments(r: &Readings) -> Vec<(String, Kind)> {
         let kind = if up == all { Kind::Good } else { Kind::Bad };
         item("HOSTS", format!("{up}/{all}"), kind);
     }
+    if r.decisions > 0 {
+        item("DECISIONS", r.decisions.to_string(), Kind::Bad);
+    }
+    // The key before the message, so a long message is what gets cut.
+    if let Some(ask) = &r.ask {
+        out.push(("  ·  ".into(), Kind::Label));
+        out.push(("CTRL+SHIFT+J".into(), Kind::Accent));
+        out.push(("  ›  ".into(), Kind::Accent));
+        out.push((ask.clone(), Kind::Value));
+    }
     out
 }
 
@@ -84,6 +99,8 @@ mod tests {
             log: Some(("E:".into(), 364 * (1 << 30))),
             index: "CPU",
             hosts: Some((16, 16)),
+            decisions: 0,
+            ask: None,
         };
         assert_eq!(
             text(&r),
@@ -111,7 +128,34 @@ mod tests {
             log: None,
             index: "OFF",
             hosts: None,
+            decisions: 0,
+            ask: None,
         };
         assert_eq!(text(&r), " PANES 01  ·  FOCUS 1  ·  CPU —  ·  INDEX OFF");
+    }
+
+    #[test]
+    fn decisions_waiting_show_their_count_and_the_newest_unseen() {
+        let r = Readings {
+            panes: 2,
+            focus: 1,
+            cpu: None,
+            log: None,
+            index: "OFF",
+            hosts: None,
+            decisions: 2,
+            ask: Some("dev_1: deploy: merge?".into()),
+        };
+        assert_eq!(
+            text(&r),
+            " PANES 02  ·  FOCUS 1  ·  CPU —  ·  INDEX OFF  ·  DECISIONS 2  ·  \
+             CTRL+SHIFT+J  ›  dev_1: deploy: merge?"
+        );
+        assert!(segments(&r).contains(&("2".into(), Kind::Bad)));
+        let seen = Readings { ask: None, ..r };
+        assert!(
+            text(&seen).ends_with("DECISIONS 2"),
+            "the count stays until answered"
+        );
     }
 }

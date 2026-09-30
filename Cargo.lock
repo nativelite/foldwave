@@ -3,6 +3,13 @@
 version = 3
 
 [[package]]
+name = "nativelite-abus"
+version = "0.2.1"
+dependencies = [
+ "nativelite-json",
+]
+
+[[package]]
 name = "nativelite-ansi"
 version = "0.4.0"
 
@@ -42,6 +49,7 @@ dependencies = [
 name = "nativelite-fwterm"
 version = "0.1.0"
 dependencies = [
+ "nativelite-abus",
  "nativelite-ansi",
  "nativelite-fwbench",
  "nativelite-fwcuda",
@@ -54,6 +62,10 @@ dependencies = [
 
 [[package]]
 name = "nativelite-glyphs"
+version = "0.1.0"
+
+[[package]]
+name = "nativelite-json"
 version = "0.1.0"
 
 [[package]]

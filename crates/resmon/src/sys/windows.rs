@@ -487,6 +487,32 @@ fn enrich(p: &mut RawProc) {
     }
 }
 
+/// Every process's id, parent and name, and nothing more: one Toolhelp
+/// snapshot, no process opened. For finding who runs under whom, often.
+pub fn process_links() -> io::Result<Vec<RawProc>> {
+    // SAFETY: documented call; the invalid value is checked immediately.
+    let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if raw == INVALID_HANDLE_VALUE || raw.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let snap = Snap(raw);
+    let mut entry = ProcessEntry32W::default();
+    let mut out = Vec::new();
+    // SAFETY: entry.dw_size is set by Default, as Process32FirstW requires.
+    let mut ok = unsafe { Process32FirstW(snap.0, &mut entry) } != 0;
+    while ok {
+        out.push(RawProc {
+            pid: entry.th32_process_id,
+            parent_pid: entry.th32_parent_process_id,
+            name: exe_name(&entry.sz_exe_file),
+            ..Default::default()
+        });
+        // SAFETY: same snapshot and entry, iterated as documented.
+        ok = unsafe { Process32NextW(snap.0, &mut entry) } != 0;
+    }
+    Ok(out)
+}
+
 /// Every process the caller can see, with the counters it is allowed to read.
 pub fn processes() -> io::Result<Vec<RawProc>> {
     // SAFETY: documented call; the invalid value is checked immediately.
@@ -546,6 +572,17 @@ pub fn snapshot() -> io::Result<Snapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_links_name_this_process_and_its_parent() {
+        let links = process_links().unwrap();
+        let me = links
+            .iter()
+            .find(|p| p.pid == std::process::id())
+            .expect("this process is listed");
+        assert!(!me.name.is_empty() && me.parent_pid != 0, "{me:?}");
+        assert_eq!(me.cpu_kernel_ns, 0, "nothing beyond the links is read");
+    }
 
     #[test]
     fn only_drives_on_a_disk_count_as_fixed() {

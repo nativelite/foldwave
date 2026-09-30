@@ -19,6 +19,7 @@ panelog = { package = "nativelite-panelog", version = "0.1.0", path = "../../../
 fwrender = { package = "nativelite-fwrender", version = "0.1.0", path = "../fwrender" }
 fwcuda = { package = "nativelite-fwcuda", version = "0.1.0", path = "../fwcuda" }
 resmon = { package = "nativelite-resmon", version = "0.1.0", path = "../resmon" }
+abus = { package = "nativelite-abus", version = "0.2.1", path = "../../../abus" }
 fwbench = { package = "nativelite-fwbench", version = "0.1.0", path = "../fwbench" }
 
 [[bin]]

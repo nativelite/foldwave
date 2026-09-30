@@ -1482,6 +1482,43 @@ measure it.
     reaches is highlighted whole. Not in full-screen programs or the view
     rebuilt from the log; folds of lines memory no longer holds are dropped.
   - Not yet: exit codes in the view rebuilt from the log.
+  - *Agent decisions, first slice (built 2026-09-30,
+    [`agents.rs`](../crates/fwterm/src/agents.rs)).* atrium hosts its agents
+    in its own full-screen window, inside one of fwterm's panes, so an
+    agent has no fwterm pane of its own and nothing can be written into
+    atrium's screen. What surfaces is what needs the human: a
+    `decision_needed` event on atrium's bus that is not yet answered
+    (founder, 2026-09-30: atrium keeps its own event log and bus view).
+    No change to atrium and no channel opened: atrium already keeps each
+    running session's bus beside its session snapshot
+    (`%LOCALAPPDATA%\atrium\sessions\<project>\<pid>-<started ms>.bus.json`,
+    or under `ATRIUM_STATE_DIR`), rewritten at most every 5 s, the snapshot
+    every 15 s as a heartbeat. A thread in the window looks every 2 s while an
+    atrium runs (every 10 s while none does: every 2 s cost an idle window
+    1-1.5 ms of CPU a second, the cold folder listing; idle, 1 pane, 4
+    alternating 60 s runs: 0.13-0.29 % of one core before this slice,
+    0.08-0.34 % with it, means 0.20 % and 0.24 %) for
+    sessions with a fresh heartbeat (60 s, atrium's own staleness), finds
+    the pane each atrium runs under by walking the process tree up to a
+    pane's root process (`resmon::sys::process_links`, one Toolhelp
+    snapshot; read again only for a new session or when the panes change),
+    and reads the open decisions with atrium's own bus code (`abus`,
+    `pending_decisions`), each file again only when it changed. The
+    instrument strip then reads `DECISIONS n · CTRL+SHIFT+J › <who>: <topic>:
+    <message>` (the key before the message, so a long message is what is cut;
+    with several panes, which of fwterm's), a decision leaves when atrium
+    marks it answered, and Ctrl+Shift+J focuses the pane of the newest not
+    yet looked at (zooming to it if another is zoomed), then cycles. Without
+    the strip, the bottom row shows `AGENT ›` instead. Checked in a window with
+    a real atrium 0.37.2 (`--allow-ctl`, a scratch `ATRIUM_STATE_DIR`):
+    `atrium ctl bus pub deploy --decision` typed into its shell showed in the
+    strip within about 9 s, matching atrium's own "1 decision needs you",
+    and `bus resolve` cleared it; with two panes each running atrium, the
+    one raised in the first read `(fwterm pane 1)`. Ctrl+Shift+J's choice is
+    unit-tested; the key itself needs real input and was not pressed. Not in
+    this slice: decisions in the pane log (atrium keeps its own), other
+    events (a failed or finished agent), per-agent status, and an atrium
+    nested inside another atrium's pane, which keeps no session file.
 - **Status:** agent session state from transcripts (`agsess`), shown per pane.
 - **Resource accounting per pane:** CPU, memory, disk and GPU share, and the
   job/cgroup limits and compile pool from atrium.

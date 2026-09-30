@@ -38,6 +38,8 @@
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
 #[cfg_attr(not(windows), allow(dead_code))]
+mod agents;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod blocks;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod emu;
@@ -90,6 +92,7 @@ fn main() {
 
 #[cfg(windows)]
 mod app {
+    use crate::agents;
     use crate::blocks;
     use crate::emu::Emu;
     use crate::fold;
@@ -243,6 +246,8 @@ keys:
                     instrument strip, logs, shell (saved to fwterm.conf)
   Ctrl+Shift+W      close the focused pane (the last one closes the window)
   Ctrl+Shift+Z      zoom the focused pane to the whole window, or back
+  Ctrl+Shift+J      show the pane of an agent waiting on a decision (atrium's
+                    bus; the instrument strip counts them), then the next
   Ctrl+Up/Down      jump to the previous / next command's prompt
   Ctrl+Shift+O      select a command's output (then Ctrl+C copies it)
   Ctrl+Shift+[ / ]  fold that command's output to one line / unfold
@@ -745,6 +750,15 @@ keys:
     }
 
     impl Session {
+        /// The pane's root process: its pane host, or its program. What runs
+        /// in the pane descends from it.
+        fn pid(&self) -> u32 {
+            match self {
+                Session::Console(p) => p.pid(),
+                Session::Pipe { child, .. } | Session::Host { child, .. } => child.id(),
+            }
+        }
+
         fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
             match self {
                 Session::Console(p) => p.write(bytes).map(|_| ()),
@@ -1902,6 +1916,28 @@ keys:
             };
             frame.put(row, col, cell);
         }
+    }
+
+    /// The newest decision not yet looked at, as the strip shows it: who
+    /// raised it (atrium's name for it) and what it asks, and with several
+    /// panes, which of fwterm's it is in.
+    fn newest_ask(
+        decisions: &[agents::Decision],
+        looked_at: &HashSet<(u32, u64, u64)>,
+        panes: &[Pane],
+    ) -> Option<String> {
+        let d = decisions
+            .iter()
+            .rev()
+            .find(|d| !looked_at.contains(&d.key))?;
+        let pane = panes.iter().position(|p| p.id == d.pane)? + 1;
+        let who = d.from.as_deref().unwrap_or("an agent");
+        let place = if panes.len() > 1 {
+            format!(" (fwterm pane {pane})")
+        } else {
+            String::new()
+        };
+        Some(format!("{who}: {}{place}", d.text))
     }
 
     /// Where the panes go in a `rows x cols` grid whose top `strip` rows are
@@ -4382,6 +4418,17 @@ keys:
         let mut paste_warning = settings().1.paste_warning.unwrap_or(true);
         // The settings sheet, while open (Ctrl+,).
         let mut sheet: Option<settings_ui::Form> = None;
+        // Decisions agents in the panes wait on (atrium's bus, design §8.7),
+        // the ones already looked at with Ctrl+Shift+J, and each pane's root
+        // process for the watcher to place atrium's under.
+        let pane_roots: Arc<Mutex<Vec<(PaneId, u32)>>> = Arc::new(Mutex::new(Vec::new()));
+        let decisions_rx = {
+            let waker = surface.window().waker();
+            agents::watch(pane_roots.clone(), move || waker.wake())
+        };
+        let mut decisions: Vec<agents::Decision> = Vec::new();
+        let mut looked_at: HashSet<(u32, u64, u64)> = HashSet::new();
+        let mut roots_checked = Instant::now() - agents::EVERY;
         let mut paste_ask: Option<(PaneId, String, usize)> = None;
         // The instrument strip's last line, when it next reads, and the log
         // drive's free space (read every 5 s).
@@ -4860,6 +4907,25 @@ keys:
                             layout_dirty = true;
                             continue;
                         }
+                        // Ctrl+Shift+J: show the pane of the newest decision
+                        // not yet looked at (else the next one waiting),
+                        // zooming to it if another pane is zoomed.
+                        if vk == 0x4A && ctrl && shift {
+                            let target =
+                                agents::next_to_show(&decisions, &looked_at, focus).cloned();
+                            if let Some(d) = target {
+                                if panes.iter().any(|p| p.id == d.pane) {
+                                    focus = d.pane;
+                                    if zoom.is_some() {
+                                        zoom = Some(d.pane);
+                                    }
+                                    looked_at.insert(d.key);
+                                }
+                            }
+                            layout_dirty = true;
+                            drop_char = true;
+                            continue;
+                        }
                         // Ctrl+Shift+F: search every pane's log, or stop.
                         if vk == 0x46 && ctrl && shift {
                             if find_bar.take().is_some() {
@@ -5242,6 +5308,25 @@ keys:
                     }
                 }
             }
+            // Agents' open decisions, when they change; the panes' root
+            // processes for the watcher, now and then.
+            while let Ok(open) = decisions_rx.try_recv() {
+                looked_at.retain(|k| open.iter().any(|d| d.key == *k));
+                decisions = open;
+                layout_dirty = true;
+            }
+            if roots_checked.elapsed() >= agents::EVERY {
+                roots_checked = Instant::now();
+                let roots: Vec<(PaneId, u32)> = panes
+                    .iter()
+                    .map(|p| (p.id, p.session.lock().unwrap().pid()))
+                    .collect();
+                if let Ok(mut r) = pane_roots.lock() {
+                    if *r != roots {
+                        *r = roots;
+                    }
+                }
+            }
             // Search results, when the search thread has them.
             if let Some(f) = find_bar.as_mut() {
                 if let Some((hits, took, cut)) =
@@ -5377,6 +5462,8 @@ keys:
                     },
                     hosts: (!isolated.is_empty())
                         .then(|| (isolated.iter().filter(|&&up| up).count(), isolated.len())),
+                    decisions: decisions.len(),
+                    ask: newest_ask(&decisions, &looked_at, &panes),
                 };
                 let line = strip::line(&readings);
                 if relayout || line != strip_line {
@@ -5429,6 +5516,22 @@ keys:
                     &mut pen,
                 );
                 drew = true;
+            }
+            // Without the strip, a decision not yet looked at shows on the
+            // bottom row instead (the search and paste bars come first).
+            if strip_rows == 0 && find_bar.is_none() && paste_ask.is_none() {
+                if let Some(ask) = newest_ask(&decisions, &looked_at, &panes) {
+                    let text = format!(" AGENT › Ctrl+Shift+J · {ask}");
+                    draw_bar(
+                        &text,
+                        8,
+                        grid_rows.saturating_sub(1),
+                        grid_cols,
+                        &mut frame,
+                        &mut pen,
+                    );
+                    drew = true;
+                }
             }
             // A paste waiting to be confirmed, over the same row.
             if let Some((_, _, n)) = &paste_ask {

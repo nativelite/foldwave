@@ -6,8 +6,9 @@ output, steered by one human.
 **Status: M5, the beta, under way.** The M4 alpha is met: every performance
 target in the design is measured in `fwterm`, foldwave's terminal (scorecard in
 [`docs/design.md`](docs/design.md) §10.1). Built for the beta so far: the Mirai
-look, a settings sheet, a first run, and a one-file installer. Next: agent
-events from atrium in the panes. Building happens with
+look, a settings sheet, a first run, a one-file installer, and the first slice
+of the agent layer (atrium agents waiting on a decision show in the window).
+Building happens with
 [atrium](https://github.com/nativelite/atrium) fleets.
 
 One of three products that each own a key piece of agentic development:
@@ -48,6 +49,7 @@ The competitive landscape for the whole suite is in
 | Alt+Shift+Plus / Minus / D | split the focused pane right / down / along its longer side |
 | Alt+Arrow, click | move focus between panes |
 | Ctrl+Shift+Z | zoom the focused pane, and back |
+| Ctrl+Shift+J | show the pane of an atrium agent waiting on a decision |
 | Ctrl+Shift+W | close the focused pane |
 | Ctrl+Shift+F | search every pane's log, and earlier sessions' |
 | Ctrl+Up / Ctrl+Down | jump between commands' prompts |
@@ -93,5 +95,6 @@ The foldwave app (`crates/fwterm`) is [FSL-1.1-Apache-2.0](LICENSE) (founder
 decision, 2026-09-15): source-available, for any purpose except a competing
 use (making it available in a commercial product or service that substitutes
 for it or offers substantially similar functionality), and each release
-becomes Apache-2.0 two years after it ships. The engine crates it is built on, here and in the other
-nativelite repositories, are MIT, like the rest of nativelite.
+becomes Apache-2.0 two years after it ships. The engine crates it is built
+on, here and in the other nativelite repositories, are MIT, like the rest of
+nativelite.
