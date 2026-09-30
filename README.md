@@ -33,10 +33,20 @@ The competitive landscape for the whole suite is in
 | [`crates/resmon`](crates/resmon) | attribute CPU, RAM, disk I/O and GPU use to process trees (M0 experiment E3) | MIT |
 | [`crates/fwbench`](crates/fwbench) | M0 harness: pty pane floods, key-echo latency, resource attribution | MIT |
 
+## Install (Windows)
+
+`python dev.py package` builds `dist\foldwave-setup-<version>.exe`, one file
+that carries everything foldwave needs. Run it: it installs for you alone (no
+administrator) into `%LOCALAPPDATA%\Programs\foldwave`, adds foldwave to the
+Start menu and to Apps & features, and opens it on its first run. Uninstall
+from Apps & features, or with `fwterm --uninstall`; settings and logs are kept.
+
 ## Develop
 
 ```
 python dev.py check     # dependency guard + docs gate + cargo fmt --check + tests
+cargo build --release --bin fwterm && target\release\fwterm.exe   # run from source
+python dev.py package   # dist\foldwave-setup-<version>.exe
 ```
 
 There is no CI, so this local check is the sole gate and runs before every push.

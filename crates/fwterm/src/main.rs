@@ -58,6 +58,8 @@ mod icon;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod indexer;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod install;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod layout;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod logstore;
@@ -71,6 +73,9 @@ mod strip;
 mod theme;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod wire;
+// Built into the executable by build.rs; here for its tests.
+#[cfg(test)]
+mod winres;
 
 #[cfg(windows)]
 fn main() {
@@ -97,6 +102,7 @@ mod app {
     use crate::first_run;
     use crate::governor::{self, Hidden, Level, Place};
     use crate::indexer;
+    use crate::install;
     use crate::layout::{neighbor, pane_at, Dir, Layout, PaneId, Placement, Rect, Toward};
     use crate::logstore;
     use crate::select::{self, Point, Selection};
@@ -162,6 +168,13 @@ options:
                 ansi0..ansi15)
   --licenses    show the licenses of what fwterm ships (JetBrains Mono,
                 Microsoft's ConPTY) and exit
+  --install     install foldwave for this user: fwterm.exe and ConPTY into
+                %LOCALAPPDATA%\\Programs\\foldwave, a Start-menu shortcut and
+                an Apps & features entry; then start it. Started as
+                foldwave-setup-<version>.exe it does this by itself
+  --uninstall   remove that install (settings and logs are kept)
+  --quiet       with --install / --uninstall: no window, and --install
+                starts nothing
   --px N        font size in pixels per em (default 16)
   --size WxH    client area in pixels (default 1200x720)
   --no-sharpen  draw the raw glyph outlines (no fitting or stem snapping)
@@ -292,6 +305,9 @@ keys:
         zoom: bool,
         /// Show the licenses of what fwterm ships, then exit.
         licenses: bool,
+        install: bool,
+        uninstall: bool,
+        quiet: bool,
         panes: usize,
         shell: Vec<String>,
         /// The program came after `--`: the settings file's `shell =` is
@@ -333,6 +349,9 @@ keys:
             hidden: Hidden::Always,
             zoom: false,
             licenses: false,
+            install: false,
+            uninstall: false,
+            quiet: false,
             panes: 1,
             shell: vec!["cmd.exe".into()],
             shell_set: false,
@@ -424,6 +443,18 @@ keys:
                 }
                 "--licenses" => {
                     a.licenses = true;
+                    i += 1;
+                }
+                "--install" => {
+                    a.install = true;
+                    i += 1;
+                }
+                "--uninstall" => {
+                    a.uninstall = true;
+                    i += 1;
+                }
+                "--quiet" => {
+                    a.quiet = true;
                     i += 1;
                 }
                 "--hidden" => {
@@ -3718,6 +3749,15 @@ keys:
         if args.choose_log_drive {
             return choose_log_drive(&args);
         }
+        if args.uninstall {
+            return uninstall(&args);
+        }
+        let setup = std::env::current_exe()
+            .ok()
+            .is_some_and(|e| install::is_setup(&e));
+        if args.install || setup {
+            return install_self(&args);
+        }
         if args.pane_host {
             return match host::run(&args) {
                 Ok(code) => code,
@@ -3729,6 +3769,269 @@ keys:
             Err(e) => {
                 say!("fwterm: {e}");
                 1
+            }
+        }
+    }
+
+    /// Microsoft's ConPTY files as `tools/package.py` builds them in (empty
+    /// in other builds: an install then takes them from beside fwterm.exe).
+    const CARRIED: [(&str, &[u8]); 2] = [
+        (
+            "conpty.dll",
+            include_bytes!(concat!(env!("OUT_DIR"), "/conpty.dll")),
+        ),
+        (
+            "OpenConsole.exe",
+            include_bytes!(concat!(env!("OUT_DIR"), "/OpenConsole.exe")),
+        ),
+    ];
+
+    /// Where this user's install goes, from the environment.
+    fn install_places() -> Option<install::Places> {
+        let var = |k| std::env::var_os(k).map(PathBuf::from);
+        Some(install::places(
+            &var("LOCALAPPDATA")?,
+            &var("APPDATA")?,
+            &var("USERPROFILE")?,
+        ))
+    }
+
+    /// `reg.exe` from the system folder, with `args`; its error text if it
+    /// fails.
+    fn reg(args: &[&std::ffi::OsStr]) -> Result<(), String> {
+        let system = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        let out = std::process::Command::new(Path::new(&system).join("System32\\reg.exe"))
+            .args(args)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    }
+
+    /// `--install`, or started as `foldwave-setup-*.exe`: install for this
+    /// user, list it in Apps & features, and start the installed fwterm
+    /// (its first run, on a new machine). A failure is shown in a window.
+    fn install_self(args: &Args) -> i32 {
+        let tell = |title: &str, lines: &[String]| {
+            for l in lines {
+                say!("{l}");
+            }
+            if !args.quiet {
+                if let Err(e) = notice(title, lines) {
+                    say!("fwterm: {e}");
+                }
+            }
+        };
+        let (Some(p), Ok(me)) = (install_places(), std::env::current_exe()) else {
+            tell(
+                "SETUP",
+                &[
+                    "foldwave could not be installed: LOCALAPPDATA, APPDATA or USERPROFILE \
+                   is not set."
+                        .into(),
+                ],
+            );
+            return 1;
+        };
+        let version = env!("CARGO_PKG_VERSION");
+        let bytes = match install::install_files(&p, &me, &CARRIED, logstore::now_ms()) {
+            Ok(b) => b,
+            Err(e) => {
+                tell(
+                    "SETUP",
+                    &[
+                        format!("foldwave could not be installed in {}.", p.dir.display()),
+                        e.to_string(),
+                    ],
+                );
+                return 1;
+            }
+        };
+        // Apps & features, through a .reg file imported by reg.exe.
+        let file = std::env::temp_dir().join(format!("foldwave-{}.reg", std::process::id()));
+        let listed = std::fs::write(
+            &file,
+            install::reg_bytes(&install::uninstall_entry(&p, version, bytes / 1024)),
+        )
+        .map_err(|e| e.to_string())
+        .and_then(|_| reg(&["import".as_ref(), file.as_os_str()]));
+        let _ = std::fs::remove_file(&file);
+        say!(
+            "foldwave {version} installed in {}; Start menu: foldwave",
+            p.dir.display()
+        );
+        if let Err(e) = listed {
+            tell(
+                "SETUP",
+                &[
+                    format!(
+                        "foldwave is installed in {}, but Apps & features could not list it, \
+                         so uninstall it with fwterm --uninstall.",
+                        p.dir.display()
+                    ),
+                    e,
+                ],
+            );
+        }
+        if !args.quiet {
+            let started = std::process::Command::new(&p.exe)
+                .current_dir(&p.home)
+                .spawn();
+            if let Err(e) = started {
+                tell(
+                    "SETUP",
+                    &[
+                        format!(
+                            "foldwave is installed, but {} did not start.",
+                            p.exe.display()
+                        ),
+                        e.to_string(),
+                    ],
+                );
+                return 1;
+            }
+        }
+        0
+    }
+
+    /// `--uninstall` (Apps & features runs it): the entry, the shortcut and
+    /// the install folder's own files go; settings and logs stay. Run from
+    /// the install folder, fwterm.exe is removed just after it exits.
+    fn uninstall(args: &Args) -> i32 {
+        let (Some(p), Ok(me)) = (install_places(), std::env::current_exe()) else {
+            say!("fwterm: LOCALAPPDATA, APPDATA or USERPROFILE is not set");
+            return 1;
+        };
+        let key: &std::ffi::OsStr = install::UNINSTALL_KEY.as_ref();
+        // Not listed (an install that never was) is fine.
+        let _ = reg(&["delete".as_ref(), key, "/f".as_ref()]);
+        let left = install::remove_files(&p, &me);
+        let (running, busy): (Vec<PathBuf>, Vec<PathBuf>) = left
+            .into_iter()
+            .partition(|f| std::fs::canonicalize(f).ok() == std::fs::canonicalize(&me).ok());
+        let (app, conf) = settings();
+        let kept = format!(
+            "Your settings ({}) and pane logs ({}) are kept; delete them by hand to remove \
+             them too.",
+            app.as_deref()
+                .map(|a| logstore::settings_path(a).display().to_string())
+                .unwrap_or_default(),
+            conf.log_dir
+                .as_ref()
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|| "%LOCALAPPDATA%\\foldwave\\logs".into()),
+        );
+        let lines = if busy.is_empty() {
+            vec!["foldwave is uninstalled.".to_string(), kept]
+        } else {
+            vec![
+                "Some of foldwave's files are in use. Close every foldwave window, then \
+                 uninstall again."
+                    .to_string(),
+                busy.iter()
+                    .map(|f| f.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                kept,
+            ]
+        };
+        for l in &lines {
+            say!("{l}");
+        }
+        if !args.quiet {
+            if let Err(e) = notice("UNINSTALL", &lines) {
+                say!("fwterm: {e}");
+            }
+        }
+        if !running.is_empty() {
+            // This program's own file: removed once it has exited, with the
+            // folder if nothing else is left in it.
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            let script = format!(
+                "ping -n 3 127.0.0.1 >nul & del /f /q \"{}\" & rmdir \"{}\"",
+                p.exe.display(),
+                p.dir.display()
+            );
+            let system = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+            let started = std::process::Command::new(Path::new(&system).join("System32\\cmd.exe"))
+                .args(["/d", "/c"])
+                .raw_arg(&script)
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn();
+            if let Err(e) = started {
+                say!("fwterm: {} stays: {e}", p.exe.display());
+            }
+        }
+        i32::from(!busy.is_empty())
+    }
+
+    /// A message in a small window of its own, Mirai-styled like the rest,
+    /// until Enter, Esc or the window is closed.
+    fn notice(title: &str, lines: &[String]) -> io::Result<()> {
+        let mut raster = FontRasterizer::from_family(&fwrender::builtin_default(), 16.0)?;
+        let m = raster.metrics();
+        let window = Window::new("foldwave", 900, 330)?;
+        let (w, h) = window.client_size();
+        let mut atlas = Atlas::new(m, 1024, 1024);
+        let mut surface = Surface::Cpu {
+            window,
+            cpu: CpuRenderer::new(w, h),
+            presenter: CpuPresenter::new(),
+        };
+        let theme = Theme::mirai();
+        let icons: Vec<(u32, Vec<u8>)> = icon::sizes_for(surface.window().dpi())
+            .iter()
+            .map(|&s| (s, icon::reticle(s)))
+            .collect();
+        let _ = surface.window().set_icon(&icons);
+        if let Some(bar) = theme.title_bar {
+            surface
+                .window()
+                .set_frame_colors(bar, theme.palette.fg, theme.rule);
+        }
+        let grid = |w: u32, h: u32| {
+            (
+                (h / m.cell_h).max(1) as usize,
+                (w / m.cell_w).max(1) as usize,
+            )
+        };
+        let (mut rows, mut cols) = grid(w, h);
+        let mut frame = Frame::new();
+        let mut events = Vec::new();
+        loop {
+            frame.set_grid(rows, cols, &theme.palette);
+            let cells =
+                install::notice(title, lines, cols.saturating_sub(2), rows.saturating_sub(1));
+            let mut pen = Pen {
+                palette: &theme.palette,
+                theme: &theme,
+                atlas: &mut atlas,
+                raster: &mut raster,
+            };
+            draw_sheet(&cells, 0, 1, &mut frame, &mut pen);
+            if frame.damaged_rows() > 0 {
+                surface.draw(&frame, &mut atlas)?;
+                frame.clear_damage();
+            }
+            events.clear();
+            surface.window().wait(None, &mut events);
+            for e in &events {
+                match *e {
+                    Event::Char('\r') | Event::Char('\u{1b}') | Event::CloseRequested => {
+                        return Ok(())
+                    }
+                    Event::Resized(w, h) if w > 0 && h > 0 => {
+                        surface.resize(w, h)?;
+                        (rows, cols) = grid(w, h);
+                        frame.damage_all();
+                    }
+                    Event::Paint => frame.damage_all(),
+                    _ => {}
+                }
             }
         }
     }

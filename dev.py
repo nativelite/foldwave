@@ -14,6 +14,7 @@ every push.
   python dev.py guard                 # zero-dependency guard
   python dev.py docs                  # docs-only gate: links and tables
   python dev.py tables                # generated tables are up to date
+  python dev.py package               # dist/foldwave-setup-<version>.exe
   python dev.py run -- [args]         # cargo run --release --bin resmon
 """
 
@@ -60,6 +61,10 @@ def tables() -> int:
     return run(PY, "tools/gen_boxdraw.py", "--check")
 
 
+def package() -> int:
+    return run(PY, "tools/package.py")
+
+
 def run_bin() -> int:
     extra = sys.argv[2:]
     if extra and extra[0] == "--":
@@ -82,6 +87,7 @@ COMMANDS = {
     "guard": guard,
     "docs": docs,
     "tables": tables,
+    "package": package,
     "run": run_bin,
 }
 
