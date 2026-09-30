@@ -38,7 +38,8 @@ The competitive landscape for the whole suite is in
 `python dev.py package` builds `dist\foldwave-setup-<version>.exe`, one file
 that carries everything foldwave needs. Run it: it installs for you alone (no
 administrator) into `%LOCALAPPDATA%\Programs\foldwave`, adds foldwave to the
-Start menu and to Apps & features, and opens it on its first run. Uninstall
+Start menu, to Apps & features and to your PATH (so `fwterm` works in any
+terminal opened afterwards), and opens it on its first run. Uninstall
 from Apps & features, or with `fwterm --uninstall`; settings and logs are kept.
 
 ## Develop

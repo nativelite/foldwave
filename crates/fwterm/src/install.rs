@@ -92,8 +92,7 @@ pub fn shortcut(target: &str, workdir: &str, icon: &str, name: &str) -> io::Resu
     v.extend(0u32.to_le_bytes()); // file size
     v.extend(0i32.to_le_bytes()); // icon index
     v.extend(1u32.to_le_bytes()); // SW_SHOWNORMAL
-                                  // Hot key and reserved fields.
-    v.extend([0u8; 12]);
+    v.extend([0u8; 12]); // hot key, reserved
 
     // LinkTargetIDList: each item is its size and its bytes; a zero ends it.
     let mut items: Vec<Vec<u8>> = vec![[&[0x1F, 0x50][..], &MY_COMPUTER].concat()];
@@ -161,6 +160,115 @@ pub fn uninstall_entry(p: &Places, version: &str, kib: u64) -> String {
 /// `text` as `reg.exe import` reads a version 5 file: UTF-16 with its BOM.
 pub fn reg_bytes(text: &str) -> Vec<u8> {
     [0xFF, 0xFE].into_iter().chain(utf16(text)).collect()
+}
+
+/// A `.reg` file's text (as `reg.exe export` writes it) read back: UTF-16
+/// with its BOM.
+pub fn reg_text(bytes: &[u8]) -> String {
+    let body = bytes.strip_prefix(&[0xFF, 0xFE]).unwrap_or(bytes);
+    let units: Vec<u16> = body
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// The value `name` in an exported `.reg` file: whether it is expandable
+/// (`REG_EXPAND_SZ`, written `hex(2):`) and its text. Read from the UTF-16
+/// bytes the export holds, so no character is lost on the way back.
+pub fn reg_value(export: &str, name: &str) -> Option<(bool, String)> {
+    // Long values continue on the next line after a trailing backslash.
+    let mut lines: Vec<String> = Vec::new();
+    let mut joining = false;
+    for line in export.lines() {
+        let part = if joining { line.trim_start() } else { line };
+        match (joining, lines.last_mut()) {
+            (true, Some(last)) => last.push_str(part.trim_end_matches('\\')),
+            _ => lines.push(part.trim_end_matches('\\').to_string()),
+        }
+        joining = line.ends_with('\\');
+    }
+    let head = format!("\"{name}\"=");
+    let line = lines
+        .iter()
+        .find(|l| l.len() >= head.len() && l[..head.len()].eq_ignore_ascii_case(&head))?;
+    let value = &line[head.len()..];
+    if let Some(hex) = value.strip_prefix("hex(2):") {
+        let bytes: Vec<u8> = hex
+            .split(',')
+            .filter_map(|b| u8::from_str_radix(b.trim(), 16).ok())
+            .collect();
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .take_while(|&u| u != 0)
+            .collect();
+        return Some((true, String::from_utf16_lossy(&units)));
+    }
+    let quoted = value.strip_prefix('"')?.strip_suffix('"')?;
+    let mut out = String::new();
+    let mut chars = quoted.chars();
+    while let Some(c) = chars.next() {
+        out.push(if c == '\\' { chars.next()? } else { c });
+    }
+    Some((false, out))
+}
+
+/// A `.reg` file's text setting the user's environment variable `name`,
+/// expandable (`hex(2)`, UTF-16 as the registry holds it) or not.
+pub fn environment_entry(name: &str, expand: bool, value: &str) -> String {
+    let mut t = format!(
+        "Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\Environment]\r\n\"{name}\"="
+    );
+    if expand {
+        let hex: Vec<String> = utf16(value)
+            .into_iter()
+            .chain([0, 0])
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        t += "hex(2):";
+        for (i, chunk) in hex.chunks(24).enumerate() {
+            if i > 0 {
+                t += ",\\\r\n  ";
+            }
+            t += &chunk.join(",");
+        }
+    } else {
+        t += &format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""));
+    }
+    t + "\r\n"
+}
+
+/// `a` and `b` name the same folder in a PATH (case, non-ASCII letters
+/// too, and a trailing `\` aside).
+fn same_entry(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.trim().trim_end_matches('\\').to_lowercase();
+    norm(a) == norm(b)
+}
+
+/// `path` (a PATH value) with `dir` at its end, or `None` if it is there.
+pub fn with_dir(path: &str, dir: &str) -> Option<String> {
+    if path.split(';').any(|e| same_entry(e, dir)) {
+        return None;
+    }
+    let kept = path.trim_end_matches(';');
+    Some(if kept.is_empty() {
+        dir.to_string()
+    } else {
+        format!("{kept};{dir}")
+    })
+}
+
+/// `path` without `dir`, or `None` if it was not there. Every other entry
+/// is kept as written.
+pub fn without_dir(path: &str, dir: &str) -> Option<String> {
+    let entries: Vec<&str> = path.split(';').collect();
+    let kept: Vec<&str> = entries
+        .iter()
+        .copied()
+        .filter(|e| !same_entry(e, dir))
+        .collect();
+    (kept.len() != entries.len()).then(|| kept.join(";"))
 }
 
 /// Put `bytes` at `path`. The same bytes already there are left alone; a
@@ -468,6 +576,40 @@ mod tests {
         assert!(!p.shortcut.exists() && !p.dir.join("conpty.dll").exists());
         assert!(p.dir.join("notes.txt").exists());
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_path_value_round_trips_through_reg_files_and_gains_or_loses_the_folder() {
+        let dir = r"C:\Users\Zoë\AppData\Local\Programs\foldwave";
+        let path = r"%USERPROFILE%\bin;C:\Tools\Zoë;";
+        // As reg.exe export writes an expandable value: hex, continued lines.
+        let written = environment_entry("Path", true, path);
+        assert!(written.contains("\"Path\"=hex(2):25,00,55,00"), "{written}");
+        assert!(written.contains(",\\\r\n  "), "long values continue");
+        let export = format!("{written}\"TEMP\"=\"C:\\\\Temp\"\r\n");
+        assert_eq!(reg_value(&export, "path"), Some((true, path.to_string())));
+        assert_eq!(
+            reg_value(&export, "TEMP"),
+            Some((false, r"C:\Temp".to_string()))
+        );
+        assert_eq!(reg_value(&export, "Missing"), None);
+        assert_eq!(reg_text(&reg_bytes(&export)), export);
+        // Added once, removed exactly, everything else as written.
+        let added = with_dir(path, dir).unwrap();
+        assert_eq!(added, format!(r"%USERPROFILE%\bin;C:\Tools\Zoë;{dir}"));
+        assert_eq!(with_dir(&added, &format!("{dir}\\")), None, "already there");
+        assert_eq!(with_dir("", dir).unwrap(), dir);
+        assert_eq!(
+            without_dir(&added.to_uppercase(), dir).unwrap(),
+            r"%USERPROFILE%\BIN;C:\TOOLS\ZOË"
+        );
+        assert_eq!(without_dir(path, dir), None, "not there: unchanged");
+        let s = environment_entry("Path", false, r#"C:\a "b""#);
+        assert!(s.ends_with("\"Path\"=\"C:\\\\a \\\"b\\\"\"\r\n"), "{s}");
+        assert_eq!(
+            reg_value(&s, "Path"),
+            Some((false, r#"C:\a "b""#.to_string()))
+        );
     }
 
     #[test]

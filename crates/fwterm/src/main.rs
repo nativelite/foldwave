@@ -3811,6 +3811,38 @@ keys:
         }
     }
 
+    /// Change the user's own PATH (not the machine's) with `change`, which
+    /// returns the new value or `None` to leave it; then tell running
+    /// programs, so terminals opened from now on find `fwterm`. The value
+    /// goes out and back through `.reg` files in UTF-16, so no other entry
+    /// changes, and keeps its type. True if it changed.
+    fn change_user_path(change: impl Fn(&str) -> Option<String>) -> Result<bool, String> {
+        let file = std::env::temp_dir().join(format!("foldwave-env-{}.reg", std::process::id()));
+        let exported = reg(&[
+            "export".as_ref(),
+            r"HKCU\Environment".as_ref(),
+            file.as_os_str(),
+            "/y".as_ref(),
+        ])
+        .and_then(|_| std::fs::read(&file).map_err(|e| e.to_string()));
+        let _ = std::fs::remove_file(&file);
+        let (expand, old) = install::reg_value(&install::reg_text(&exported?), "Path")
+            .unwrap_or((true, String::new()));
+        let Some(new) = change(&old) else {
+            return Ok(false);
+        };
+        let written = std::fs::write(
+            &file,
+            install::reg_bytes(&install::environment_entry("Path", expand, &new)),
+        )
+        .map_err(|e| e.to_string())
+        .and_then(|_| reg(&["import".as_ref(), file.as_os_str()]));
+        let _ = std::fs::remove_file(&file);
+        written?;
+        fwrender::win::announce_environment_change();
+        Ok(true)
+    }
+
     /// `--install`, or started as `foldwave-setup-*.exe`: install for this
     /// user, list it in Apps & features, and start the installed fwterm
     /// (its first run, on a new machine). A failure is shown in a window.
@@ -3876,6 +3908,20 @@ keys:
                 ],
             );
         }
+        // `fwterm` by name in any terminal opened from now on.
+        let dir = p.dir.display().to_string();
+        if let Err(e) = change_user_path(|path| install::with_dir(path, &dir)) {
+            tell(
+                "SETUP",
+                &[
+                    format!(
+                        "foldwave is installed, but {dir} could not be added to your PATH; \
+                         start it from the Start menu or by its full path."
+                    ),
+                    e,
+                ],
+            );
+        }
         if !args.quiet {
             let started = std::process::Command::new(&p.exe)
                 .current_dir(&p.home)
@@ -3908,6 +3954,10 @@ keys:
         let key: &std::ffi::OsStr = install::UNINSTALL_KEY.as_ref();
         // Not listed (an install that never was) is fine.
         let _ = reg(&["delete".as_ref(), key, "/f".as_ref()]);
+        let dir = p.dir.display().to_string();
+        if let Err(e) = change_user_path(|path| install::without_dir(path, &dir)) {
+            say!("fwterm: {dir} stays in your PATH: {e}");
+        }
         let left = install::remove_files(&p, &me);
         let (running, busy): (Vec<PathBuf>, Vec<PathBuf>) = left
             .into_iter()

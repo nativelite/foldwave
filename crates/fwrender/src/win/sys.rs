@@ -331,6 +331,15 @@ extern "system" {
     pub fn CreateIconIndirect(info: *const IconInfo) -> Handle;
     pub fn DestroyIcon(icon: Handle) -> Bool;
     pub fn SendMessageW(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> isize;
+    pub fn SendMessageTimeoutW(
+        hwnd: Hwnd,
+        msg: u32,
+        wparam: usize,
+        lparam: isize,
+        flags: u32,
+        timeout_ms: u32,
+        result: *mut usize,
+    ) -> isize;
     pub fn AdjustWindowRectExForDpi(
         rect: *mut Rect,
         style: u32,

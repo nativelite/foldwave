@@ -854,6 +854,31 @@ pub fn write_parent_console(text: &str) -> bool {
     ok
 }
 
+/// Tell every top-level window, Explorer's among them, that the user's
+/// environment variables changed (`WM_SETTINGCHANGE` with "Environment"), so
+/// programs started from now on see them. Waits up to a second for each
+/// window, skipping hung ones. False if the broadcast failed.
+pub fn announce_environment_change() -> bool {
+    const HWND_BROADCAST: Hwnd = 0xFFFF as Hwnd;
+    const WM_SETTINGCHANGE: u32 = 0x001A;
+    const SMTO_ABORTIFHUNG: u32 = 0x0002;
+    let what: Vec<u16> = "Environment".encode_utf16().chain([0]).collect();
+    let mut result = 0usize;
+    // SAFETY: `what` is a NUL-terminated UTF-16 string that outlives the
+    // call, and `result` is a valid place for the reply.
+    unsafe {
+        SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            0,
+            what.as_ptr() as isize,
+            SMTO_ABORTIFHUNG,
+            1000,
+            &mut result,
+        ) != 0
+    }
+}
+
 /// Whether an Alt key is down now (`GetKeyState`, as [`shift_down`]).
 pub fn alt_down() -> bool {
     // SAFETY: as in `shift_down`.
