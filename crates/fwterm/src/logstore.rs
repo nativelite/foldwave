@@ -78,6 +78,9 @@ pub struct Settings {
     /// `font = <family>` and `px = <size>`, unless `--font` / `--px` say.
     pub font: Option<String>,
     pub px: Option<u32>,
+    /// `shell = <command line>`: what each pane runs, unless `fwterm --`
+    /// names a program (cmd.exe without either).
+    pub shell: Option<String>,
 }
 
 /// `key = value` lines; `#` starts a comment, except at the start of a
@@ -111,6 +114,7 @@ pub fn parse_settings(text: &str) -> Settings {
             "instruments" => s.instruments = on_off(v),
             "font" if !v.is_empty() => s.font = Some(v.to_string()),
             "px" => s.px = v.parse::<u32>().ok().filter(|p| (4..=200).contains(p)),
+            "shell" if !v.is_empty() => s.shell = Some(v.to_string()),
             _ => {}
         }
     }

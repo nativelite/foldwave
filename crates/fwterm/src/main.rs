@@ -46,6 +46,8 @@ mod find;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod find_re;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod first_run;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod fold;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod governor;
@@ -92,6 +94,7 @@ mod app {
 
     mod host;
     use crate::find;
+    use crate::first_run;
     use crate::governor::{self, Hidden, Level, Place};
     use crate::indexer;
     use crate::layout::{neighbor, pane_at, Dir, Layout, PaneId, Placement, Rect, Toward};
@@ -137,7 +140,8 @@ mod app {
     const USAGE: &str = "\
 fwterm - foldwave's minimal terminal prototype
 
-usage: fwterm [options] [-- SHELL [ARGS...]]   (default shell: cmd.exe)
+usage: fwterm [options] [-- SHELL [ARGS...]]   (default shell: shell = in the
+       settings file, else cmd.exe)
 
 options:
   --backend B   vulkan (default; falls back to cpu if Vulkan cannot start) or cpu
@@ -182,6 +186,9 @@ options:
   --choose-log-drive   measure how fast each fixed drive takes durable writes,
                 save the fastest with room as log_dir in the settings file,
                 and exit
+  --first-run   show the first-run steps (shell, logs, look) before the
+                panes start. They show by themselves while there is no
+                settings file, unless --pipe or --stats is given
   --place P     where pane readers and the UI thread run: off (default: where
                 the OS puts them) or fast (the fast cores of a hybrid CPU,
                 CPU 0 left out; measured no better on an i5-12600K)
@@ -220,7 +227,7 @@ keys:
   Alt+Shift+D       split it along its longer side
   Alt+Arrow, click  focus the pane in that direction / under the pointer
   Ctrl+,            settings: theme, font, size, the paste question, the
-                    instrument strip, logs (saved to fwterm.conf)
+                    instrument strip, logs, shell (saved to fwterm.conf)
   Ctrl+Shift+W      close the focused pane (the last one closes the window)
   Ctrl+Shift+Z      zoom the focused pane to the whole window, or back
   Ctrl+Up/Down      jump to the previous / next command's prompt
@@ -241,6 +248,7 @@ keys:
   Shift+PgUp/PgDn, wheel   scroll the focused pane back / forward
 ";
 
+    #[derive(Clone)]
     struct Args {
         backend: String,
         conpty: Option<String>,
@@ -260,6 +268,8 @@ keys:
         log_cap: Option<u64>,
         no_log: bool,
         choose_log_drive: bool,
+        /// Show the first-run steps even with a settings file.
+        first_run: bool,
         place: Place,
         governor: bool,
         gpu_index: bool,
@@ -284,6 +294,9 @@ keys:
         licenses: bool,
         panes: usize,
         shell: Vec<String>,
+        /// The program came after `--`: the settings file's `shell =` is
+        /// not used.
+        shell_set: bool,
     }
 
     fn parse(argv: &[String]) -> Result<Args, String> {
@@ -304,6 +317,7 @@ keys:
             log_cap: None,
             no_log: false,
             choose_log_drive: false,
+            first_run: false,
             place: Place::Off,
             governor: true,
             gpu_index: true,
@@ -321,6 +335,7 @@ keys:
             licenses: false,
             panes: 1,
             shell: vec!["cmd.exe".into()],
+            shell_set: false,
         };
         let mut i = 0;
         let value = |i: &mut usize, flag: &str| -> Result<String, String> {
@@ -488,6 +503,10 @@ keys:
                     a.choose_log_drive = true;
                     i += 1;
                 }
+                "--first-run" => {
+                    a.first_run = true;
+                    i += 1;
+                }
                 "--panes" => {
                     let v = value(&mut i, "--panes")?;
                     a.panes = v
@@ -503,6 +522,7 @@ keys:
                 "--" => {
                     if i + 1 < argv.len() {
                         a.shell = argv[i + 1..].to_vec();
+                        a.shell_set = true;
                     }
                     break;
                 }
@@ -1352,9 +1372,10 @@ keys:
     }
 
     /// Durable appends to a scratch log at `root`: MiB/s and the p99 of one
-    /// 1 MiB write, in ms.
-    fn probe_drive(root: &Path) -> io::Result<(f64, f64)> {
-        const WRITES: usize = 128;
+    /// 1 MiB write, in ms. `on_write` hears how many writes are done after
+    /// each, and stops the measurement by returning false.
+    fn probe_drive(root: &Path, on_write: &mut dyn FnMut(u32) -> bool) -> io::Result<(f64, f64)> {
+        const WRITES: usize = first_run::PROBE_WRITES as usize;
         let dir = root.join(format!(
             "foldwave-drive-probe-{}-{}",
             logstore::now_ms(),
@@ -1370,11 +1391,14 @@ keys:
                 .collect();
             let mut times = Vec::with_capacity(WRITES);
             let start = Instant::now();
-            for _ in 0..WRITES {
+            for n in 1..=WRITES {
                 let t = Instant::now();
                 w.append(&chunk, 0)?;
                 w.flush()?;
                 times.push(t.elapsed().as_secs_f64() * 1e3);
+                if !on_write(n as u32) {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "stopped"));
+                }
             }
             let secs = start.elapsed().as_secs_f64();
             times.sort_by(f64::total_cmp);
@@ -1400,7 +1424,7 @@ keys:
                 continue;
             };
             let budget = logstore::budget(cap, 0, v.free, v.total);
-            match probe_drive(&root) {
+            match probe_drive(&root, &mut |_| true) {
                 Ok((rate, p99)) => {
                     let room = if budget.squeezed {
                         format!(
@@ -1452,6 +1476,205 @@ keys:
                 1
             }
         }
+    }
+
+    /// How the first run ended.
+    enum FirstRunEnd {
+        /// Finished or skipped: the panes start.
+        Go,
+        /// The window was closed.
+        Closed,
+    }
+
+    /// The first run (design M5, the Mirai-06 board): its steps drawn in the
+    /// window before any pane starts, every fixed drive measured meanwhile
+    /// on a thread of its own. Finish saves to the settings file, other
+    /// lines kept; Skip saves nothing.
+    fn ask_first_run(
+        mut surface: Surface,
+        atlas: &mut Atlas,
+        raster: &mut FontRasterizer,
+        gpu_faults: &mut GpuFaults,
+    ) -> io::Result<(Surface, FirstRunEnd)> {
+        use crate::first_run::{Action, Key as K, Probe};
+        let m = raster.metrics();
+        let (app, conf) = settings();
+        let var = |k: &str| std::env::var(k).ok();
+        let shells = first_run::find_shells(&var, &|p: &Path| p.is_file());
+        let drives: Vec<first_run::Drive> = resmon::volume::fixed()
+            .iter()
+            .filter_map(|root| resmon::volume::of(root).ok())
+            .map(|v| first_run::Drive {
+                root: v.root,
+                free: v.free,
+                total: v.total,
+                probe: Probe::Waiting,
+            })
+            .collect();
+        let mut fr = first_run::FirstRun::new(shells, drives, &conf);
+        // One drive at a time (together they would share the disks and
+        // each measure slower), stopped when the first run ends.
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, Probe)>();
+        let measuring = {
+            let roots: Vec<PathBuf> = fr.drives.iter().map(|d| d.root.clone()).collect();
+            let (stop, waker) = (stop.clone(), surface.window().waker());
+            std::thread::spawn(move || {
+                for (i, root) in roots.iter().enumerate() {
+                    let send = |p: Probe| {
+                        let sent = tx.send((i, p)).is_ok();
+                        waker.wake();
+                        sent
+                    };
+                    if stop.load(Ordering::Acquire) || !send(Probe::Measuring(0)) {
+                        return;
+                    }
+                    // Every eighth write moves the meter.
+                    let result = probe_drive(root, &mut |n| {
+                        !stop.load(Ordering::Acquire) && (n % 8 != 0 || send(Probe::Measuring(n)))
+                    });
+                    let probe = match result {
+                        Ok((rate, p99)) => Probe::Done(rate, p99),
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => return,
+                        Err(e) => Probe::Failed(e.to_string()),
+                    };
+                    if !send(probe) {
+                        return;
+                    }
+                }
+            })
+        };
+        // The theme chosen is the one drawn, title bar too.
+        let theme_for = |name: &str| {
+            let mut t = Theme::named(name).unwrap_or_else(Theme::mirai);
+            t.apply(&conf.colors);
+            t
+        };
+        let frame_colors = |surface: &mut Surface, t: &Theme| match t.title_bar {
+            Some(bar) => {
+                surface.window().set_frame_colors(bar, t.palette.fg, t.rule);
+            }
+            None => surface.window().reset_frame_colors(),
+        };
+        let mut shown = fr.theme_name();
+        let mut theme = theme_for(shown);
+        frame_colors(&mut surface, &theme);
+        let grid = |w: u32, h: u32| {
+            (
+                (h / m.cell_h).max(1) as usize,
+                (w / m.cell_w).max(1) as usize,
+            )
+        };
+        let (w, h) = surface.window().client_size();
+        let (mut rows, mut cols) = grid(w, h);
+        let mut frame = Frame::new();
+        let mut events = Vec::new();
+        let end = 'run: loop {
+            if fr.theme_name() != shown {
+                shown = fr.theme_name();
+                theme = theme_for(shown);
+                frame_colors(&mut surface, &theme);
+            }
+            frame.set_grid(rows, cols, &theme.palette);
+            let cells = first_run::render(
+                &fr,
+                cols.saturating_sub(4).min(104),
+                rows.saturating_sub(2).min(28),
+            );
+            let (top, left) = (
+                rows.saturating_sub(cells.len()) / 2,
+                cols.saturating_sub(cells[0].len()) / 2,
+            );
+            let mut pen = Pen {
+                palette: &theme.palette,
+                theme: &theme,
+                atlas: &mut *atlas,
+                raster: &mut *raster,
+            };
+            draw_sheet(&cells, top, left, &mut frame, &mut pen);
+            if frame.damaged_rows() > 0 {
+                if let Err(e) = surface.draw(&frame, atlas) {
+                    surface = after_draw_error(surface, e, atlas, gpu_faults)?;
+                    frame.damage_all();
+                    surface.draw(&frame, atlas)?;
+                }
+                frame.clear_damage();
+            }
+            events.clear();
+            surface.window().wait(None, &mut events);
+            for e in &events {
+                let key = match *e {
+                    Event::Char('\r') => K::Enter,
+                    Event::Char('\u{1b}') => K::Esc,
+                    Event::Char('\u{8}') => K::Backspace,
+                    Event::Char(c) => K::Char(c),
+                    Event::Key {
+                        vk: 0x26,
+                        down: true,
+                    } => K::Up,
+                    Event::Key {
+                        vk: 0x28,
+                        down: true,
+                    } => K::Down,
+                    Event::Key {
+                        vk: 0x25,
+                        down: true,
+                    } => K::Left,
+                    Event::Key {
+                        vk: 0x27,
+                        down: true,
+                    } => K::Right,
+                    Event::Resized(w, h) if w > 0 && h > 0 => {
+                        if let Err(e) = surface.resize(w, h) {
+                            surface = after_draw_error(surface, e, atlas, gpu_faults)?;
+                        }
+                        (rows, cols) = grid(w, h);
+                        frame.damage_all();
+                        continue;
+                    }
+                    Event::Paint => {
+                        frame.damage_all();
+                        continue;
+                    }
+                    Event::CloseRequested => break 'run FirstRunEnd::Closed,
+                    _ => continue,
+                };
+                match fr.key(key) {
+                    Action::None => {}
+                    Action::Skip => break 'run FirstRunEnd::Go,
+                    Action::Finish(values) => {
+                        let Some(app) = app.as_deref() else {
+                            say!("fwterm: no LOCALAPPDATA: the first run's choices were not saved");
+                            break 'run FirstRunEnd::Go;
+                        };
+                        let path = logstore::settings_path(app);
+                        let old = std::fs::read_to_string(&path).unwrap_or_default();
+                        let old = if old.trim().is_empty() {
+                            "# fwterm settings. Ctrl+, in fwterm changes them, and\n\
+                             # fwterm --first-run asks the first-run questions again.\n"
+                                .to_string()
+                        } else {
+                            old
+                        };
+                        let saved = std::fs::create_dir_all(app).and_then(|_| {
+                            std::fs::write(&path, settings_ui::merged(&old, &values))
+                        });
+                        if let Err(e) = saved {
+                            say!("fwterm: could not save {}: {e}", path.display());
+                        }
+                        break 'run FirstRunEnd::Go;
+                    }
+                }
+            }
+            while let Ok((i, probe)) = rx.try_recv() {
+                fr.update(i, probe);
+            }
+        };
+        // It stops after its current 1 MiB write and removes its scratch
+        // folder, before a closed window ends the process.
+        stop.store(true, Ordering::Release);
+        let _ = measuring.join();
+        Ok((surface, end))
     }
 
     /// Lines of a log a regex is tried on, from the index's hits for the
@@ -1712,6 +1935,10 @@ keys:
                     P::Corner | P::Title | P::NavOn | P::Button => t.accent,
                     P::Nav | P::Note | P::Hint => t.dim,
                     P::Label | P::Value => t.palette.fg,
+                    P::Meter => t.accent,
+                    P::Track => t.rule,
+                    P::Warn => t.error,
+                    P::Swatch(i) => t.palette.indexed[usize::from(i)],
                 };
                 let key = GlyphKey {
                     ch,
@@ -3682,6 +3909,39 @@ keys:
         };
 
         let mut gpu_faults = GpuFaults::default();
+        // foldwave's icon, drawn at the sizes a window icon may need.
+        let icons: Vec<(u32, Vec<u8>)> = icon::sizes_for(surface.window().dpi())
+            .iter()
+            .map(|&s| (s, icon::reticle(s)))
+            .collect();
+        if let Err(e) = surface.window().set_icon(&icons) {
+            say!("fwterm: could not set the window's icon: {e}");
+        }
+        // The first run: asked for, or no settings file yet (not for
+        // --pipe or --stats, which tests and benchmarks use).
+        let fresh = logstore::app_dir(std::env::var_os("LOCALAPPDATA"))
+            .is_some_and(|a| !logstore::settings_path(&a).exists());
+        if args.first_run || (fresh && !args.pipe && args.stats.is_none()) {
+            let (s, end) = ask_first_run(surface, &mut atlas, &mut raster, &mut gpu_faults)?;
+            surface = s;
+            if let FirstRunEnd::Closed = end {
+                return Ok(0);
+            }
+        }
+        let (w, h) = surface.window().client_size();
+        // Each pane runs the program after `--`, else the settings file's
+        // `shell =`, else cmd.exe.
+        let resolved;
+        let args = match settings().1.shell.as_deref().map(first_run::split_command) {
+            Some(shell) if !args.shell_set && !shell.is_empty() => {
+                resolved = Args {
+                    shell,
+                    ..args.clone()
+                };
+                &resolved
+            }
+            _ => args,
+        };
         // A test hook: FOLDWAVE_TEST_GPU_LOSS=<seconds>[,<seconds>...] takes
         // the first Vulkan frame drawn after each of those times as a lost
         // device.
@@ -3800,15 +4060,7 @@ keys:
             );
         }
         let mut palette = theme.palette.clone();
-        // foldwave's icon, drawn at the sizes a window icon may need, and
-        // the title bar in the theme's colours (Windows 11).
-        let icons: Vec<(u32, Vec<u8>)> = icon::sizes_for(surface.window().dpi())
-            .iter()
-            .map(|&s| (s, icon::reticle(s)))
-            .collect();
-        if let Err(e) = surface.window().set_icon(&icons) {
-            say!("fwterm: could not set the window's icon: {e}");
-        }
+        // The title bar in the theme's colours (Windows 11).
         if let Some(bar) = theme.title_bar {
             surface
                 .window()

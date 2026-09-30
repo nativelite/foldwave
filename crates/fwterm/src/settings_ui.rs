@@ -50,7 +50,7 @@ pub enum Key {
     Char(char),
 }
 
-pub const SECTIONS: [&str; 3] = ["Appearance", "Paste", "Logs"];
+pub const SECTIONS: [&str; 4] = ["Appearance", "Paste", "Logs", "Shell"];
 
 /// The sheet: its fields, then the Save and Cancel buttons.
 #[derive(Debug, Clone, PartialEq)]
@@ -137,6 +137,13 @@ impl Form {
                         1,
                         100_000,
                     ),
+                    false,
+                ),
+                f(
+                    "Shell",
+                    "Program in each pane",
+                    "shell",
+                    Value::Text(s.shell.clone().unwrap_or_default()),
                     false,
                 ),
             ],
@@ -255,6 +262,7 @@ impl Form {
             Value::Text(t) if t.is_empty() => match f.key {
                 "font" => "JetBrains Mono (built in)".into(),
                 "log_dir" => "%LOCALAPPDATA%\\foldwave\\logs".into(),
+                "shell" => "cmd.exe".into(),
                 _ => "—".into(),
             },
             Value::Text(t) => t.clone(),
@@ -347,6 +355,7 @@ mod tests {
                 ("paste_warning", Some("on".into())),
                 ("log_dir", None),
                 ("log_cap_gib", Some("10".into())),
+                ("shell", None),
             ]
         );
     }
@@ -401,25 +410,30 @@ pub enum Paint {
     Note,
     Hint,
     Button,
+    /// A meter's filled part, and the rest of its track.
+    Meter,
+    Track,
+    /// Something wrong: a drive too full, one that cannot be written.
+    Warn,
+    /// A block of terminal colour `n` (the theme's `ansi<n>`).
+    Swatch(u8),
 }
 
 /// One cell: its character, paint, and whether it is on the focused row.
 pub type Cell = (char, Paint, bool);
 
-/// The sheet drawn `w x h` cells: a frame with accent corners, the sections
-/// down the left, the focused section's fields on the right, the buttons
-/// and a line of keys at the bottom.
-pub fn render(form: &Form, w: usize, h: usize) -> Vec<Vec<Cell>> {
-    let (w, h) = (w.max(40), h.max(12));
-    let mut g: Vec<Vec<Cell>> = vec![vec![(' ', Paint::Label, false); w]; h];
-    let put = |g: &mut Vec<Vec<Cell>>, r: usize, c: usize, text: &str, p: Paint, sel: bool| {
-        for (i, ch) in text.chars().enumerate() {
-            if let Some(cell) = g.get_mut(r).and_then(|row| row.get_mut(c + i)) {
-                *cell = (ch, p, sel);
-            }
+/// Write `text` from cell `(r, c)` on, cut at the grid's edge.
+pub fn put(g: &mut [Vec<Cell>], r: usize, c: usize, text: &str, p: Paint, sel: bool) {
+    for (i, ch) in text.chars().enumerate() {
+        if let Some(cell) = g.get_mut(r).and_then(|row| row.get_mut(c + i)) {
+            *cell = (ch, p, sel);
         }
-    };
-    // The frame.
+    }
+}
+
+/// A `w x h` panel: hairline edges, accent corners, `title` in the top edge.
+pub fn panel(w: usize, h: usize, title: &str) -> Vec<Vec<Cell>> {
+    let mut g: Vec<Vec<Cell>> = vec![vec![(' ', Paint::Label, false); w]; h];
     for c in 1..w - 1 {
         put(&mut g, 0, c, "─", Paint::Rule, false);
         put(&mut g, h - 1, c, "─", Paint::Rule, false);
@@ -432,7 +446,16 @@ pub fn render(form: &Form, w: usize, h: usize) -> Vec<Vec<Cell>> {
     put(&mut g, 0, w - 3, "──┐", Paint::Corner, false);
     put(&mut g, h - 1, 0, "└──", Paint::Corner, false);
     put(&mut g, h - 1, w - 3, "──┘", Paint::Corner, false);
-    put(&mut g, 0, 3, " [ SETTINGS ] ", Paint::Title, false);
+    put(&mut g, 0, 3, title, Paint::Title, false);
+    g
+}
+
+/// The sheet drawn `w x h` cells: a frame with accent corners, the sections
+/// down the left, the focused section's fields on the right, the buttons
+/// and a line of keys at the bottom.
+pub fn render(form: &Form, w: usize, h: usize) -> Vec<Vec<Cell>> {
+    let (w, h) = (w.max(40), h.max(12));
+    let mut g = panel(w, h, " [ SETTINGS ] ");
     // The sections, and the line between them and the fields.
     let nav = 20;
     for r in 2..h - 4 {
