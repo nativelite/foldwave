@@ -239,7 +239,7 @@ keys:
   Alt+Shift+Minus   split it, the new one below
   Alt+Shift+D       split it along its longer side
   Alt+Arrow, click  focus the pane in that direction / under the pointer
-  Ctrl+,            settings: theme, font, size, the paste question, the
+  Ctrl+Comma        settings: theme, font, size, the paste question, the
                     instrument strip, logs, shell (saved to fwterm.conf)
   Ctrl+Shift+W      close the focused pane (the last one closes the window)
   Ctrl+Shift+Z      zoom the focused pane to the whole window, or back
@@ -1214,6 +1214,9 @@ keys:
     const CYAN: &str = "\x1b[36m";
     const DIM: &str = "\x1b[90m";
     const RESET: &str = "\x1b[0m";
+    /// On each pane's first line: how to reach the settings. Spelled out,
+    /// since "Ctrl+," reads as Ctrl and plus.
+    const SETTINGS_HINT: &str = " · settings: Ctrl+Comma";
 
     /// How often retention re-measures the volume and trims the logs.
     const RETENTION_EVERY: Duration = Duration::from_secs(2);
@@ -1373,7 +1376,8 @@ keys:
                         format!("up to {}", logstore::human(budget.bytes))
                     };
                     let mut s = format!(
-                        "{DIM}fwterm {version} · pane logs in {}, keeping {keeping}{RESET}\r\n",
+                        "{DIM}fwterm {version} · pane logs in {}, keeping {keeping}\
+                         {SETTINGS_HINT}{RESET}\r\n",
                         store.root.display(),
                     );
                     if let (true, Some(v)) = (budget.squeezed, volume) {
@@ -1394,10 +1398,13 @@ keys:
                 }
                 (None, Some(problem)) => {
                     format!(
-                        "{DIM}fwterm {version}{RESET}\r\n{RED}Logging is off: {problem}{RESET}\r\n"
+                        "{DIM}fwterm {version}{SETTINGS_HINT}{RESET}\r\n\
+                         {RED}Logging is off: {problem}{RESET}\r\n"
                     )
                 }
-                (None, None) => format!("{DIM}fwterm {version} · logging off{RESET}\r\n"),
+                (None, None) => {
+                    format!("{DIM}fwterm {version} · logging off{SETTINGS_HINT}{RESET}\r\n")
+                }
             }
         }
     }
@@ -1681,7 +1688,7 @@ keys:
                         let path = logstore::settings_path(app);
                         let old = std::fs::read_to_string(&path).unwrap_or_default();
                         let old = if old.trim().is_empty() {
-                            "# fwterm settings. Ctrl+, in fwterm changes them, and\n\
+                            "# fwterm settings. Ctrl+Comma in fwterm changes them, and\n\
                              # fwterm --first-run asks the first-run questions again.\n"
                                 .to_string()
                         } else {

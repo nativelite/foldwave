@@ -3,11 +3,12 @@
 
 use super::sys::*;
 use crate::cpu::CpuRenderer;
-use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::io;
 use std::ops::Range;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{mpsc, Arc, Mutex, Once, Weak};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// What happened to a [`Window`].
@@ -61,42 +62,85 @@ pub enum Event {
     Woken,
 }
 
-/// Per-window state the window procedure writes to. Boxed so its address is
-/// stable; the procedure finds it through `GWLP_USERDATA`.
+/// Per-window state the window procedure writes to, on the window's own
+/// thread, and [`Window::wait`] reads from the caller's. The procedure
+/// finds it through `GWLP_USERDATA`.
 struct Shared {
-    events: RefCell<Vec<Event>>,
-    size: Cell<(u32, u32)>,
+    events: Mutex<Vec<Event>>,
+    size: Mutex<(u32, u32)>,
     /// A high surrogate from a `WM_CHAR` waiting for its low half.
-    surrogate: Cell<Option<u16>>,
+    surrogate: Mutex<Option<u16>>,
+    /// An auto-reset event, set whenever an event is queued: what `wait`
+    /// sleeps on.
+    ready: Handle,
 }
 
-/// `WM_APP`: the message a [`Waker`] posts.
-const WM_WAKE: u32 = WM_APP;
+// SAFETY: `ready` is a kernel event handle, usable from any thread; the rest
+// is behind mutexes.
+unsafe impl Send for Shared {}
+// SAFETY: as above.
+unsafe impl Sync for Shared {}
+
+impl Shared {
+    /// Queue `e` and wake a waiting [`Window::wait`]. Never blocks for long
+    /// and never panics: it runs inside the window procedure.
+    fn push(&self, e: Event) {
+        match self.events.lock() {
+            Ok(mut q) => q.push(e),
+            Err(p) => p.into_inner().push(e),
+        }
+        // SAFETY: `ready` lives as long as `self` (closed in `drop`).
+        unsafe { SetEvent(self.ready) };
+    }
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        // SAFETY: our event handle, closed once, after every user is gone.
+        unsafe { CloseHandle(self.ready) };
+    }
+}
+
+/// `WM_APP + 1`: [`Window`]'s drop asks the window thread to destroy the
+/// window and end its message loop.
+const WM_CLOSE_WINDOW: u32 = WM_APP + 1;
+
+/// `WM_APP + 2`, tests only: hold the window thread busy.
+#[cfg(test)]
+pub(crate) const WM_TEST_STALL: u32 = WM_APP + 2;
 
 const CLASS_NAME: &str = "nativelite.fwrender.Window";
 
+/// Shift, Ctrl and Alt as of the last key or mouse message a window
+/// received (bits 1, 2, 4), read on the window's thread where the key state
+/// lives, for [`shift_down`], [`ctrl_down`] and [`alt_down`]. One for the
+/// process: with several windows it is the latest message's, as the one
+/// thread's key state was when windows shared their creator's thread.
+static MODIFIERS: AtomicU8 = AtomicU8::new(0);
+
 /// A top-level window.
 ///
-/// Events are gathered by [`Window::poll`] (never blocks) or
-/// [`Window::wait`] (sleeps in `MsgWaitForMultipleObjectsEx` until a message
-/// or a [`Waker`] arrives, so an idle window costs no CPU). Both pump every
-/// message of the calling thread, so events for other windows on the thread
-/// are queued for those windows, not lost.
+/// The window and its messages live on a thread of its own, so the caller
+/// never runs Windows' modal loops: while the user drags an edge or the
+/// title bar, Windows loops inside that thread until the mouse is released,
+/// and events ([`Event::Resized`] among them) keep arriving here, so the
+/// caller keeps drawing at the new size. Events are gathered by
+/// [`Window::poll`] (never blocks) or [`Window::wait`] (sleeps until one
+/// arrives or a [`Waker`] wakes it, so an idle window costs no CPU).
 ///
 /// The process is made per-monitor DPI aware (V2) the first time a window is
 /// created, so sizes are physical pixels and GDI output is never bitmap
 /// scaled. If the process already chose an awareness (e.g. in its manifest)
 /// that choice stands.
 ///
-/// A window belongs to the thread that created it and is neither `Send` nor
-/// `Sync`; dropping it destroys it.
+/// A window is used from the thread that created it (it is neither `Send`
+/// nor `Sync`); dropping it destroys it and ends its thread.
 pub struct Window {
     hwnd: Hwnd,
     hinstance: Hinstance,
-    shared: Box<Shared>,
-    /// The hwnd as seen by wakers; zeroed (under the lock) before the window
-    /// is destroyed, so a waker never posts to a dead or reused handle.
-    wake_target: Arc<Mutex<usize>>,
+    shared: Arc<Shared>,
+    /// The window's own thread, running its message loop.
+    thread: Option<JoinHandle<()>>,
     /// A high-resolution waitable timer for [`Window::wait`]'s deadline, so a
     /// frame can be paced to well under the ~15.6 ms default timer tick that
     /// a plain wait timeout rounds to. Null when the system has none (before
@@ -108,32 +152,34 @@ pub struct Window {
 
 impl std::fmt::Debug for Window {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let size = *self.shared.size.lock().unwrap_or_else(|p| p.into_inner());
         f.debug_struct("Window")
             .field("hwnd", &self.hwnd)
-            .field("size", &self.shared.size.get())
+            .field("size", &size)
             .finish()
     }
 }
 
 /// Wakes a [`Window`] blocked in [`Window::wait`] from any thread; the window
-/// then reports [`Event::Woken`]. Waking a dropped window does nothing.
+/// then reports [`Event::Woken`]. It goes straight to the waiting thread, not
+/// through the window's messages, so it works while the window thread is in
+/// a modal loop. Waking a dropped window does nothing.
 #[derive(Debug, Clone)]
 pub struct Waker {
-    target: Arc<Mutex<usize>>,
+    target: Weak<Shared>,
+}
+
+impl std::fmt::Debug for Shared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shared").finish_non_exhaustive()
+    }
 }
 
 impl Waker {
-    /// Post the wake message. Cheap and non-blocking.
+    /// Queue [`Event::Woken`]. Cheap and non-blocking.
     pub fn wake(&self) {
-        let hwnd = match self.target.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        if *hwnd != 0 {
-            // SAFETY: the handle is live: `Window::drop` zeroes it under this
-            // same lock before destroying the window. PostMessageW may be
-            // called from any thread and does not wait for the target.
-            unsafe { PostMessageW(*hwnd as Hwnd, WM_WAKE, 0, 0) };
+        if let Some(shared) = self.target.upgrade() {
+            shared.push(Event::Woken);
         }
     }
 }
@@ -233,33 +279,63 @@ fn register_class(hinstance: Hinstance) -> io::Result<()> {
     Ok(())
 }
 
-impl Window {
-    /// Create and show a window whose client area is `width x height`
-    /// physical pixels.
-    pub fn new(title: &str, width: u32, height: u32) -> io::Result<Window> {
-        // SAFETY: a null name returns the executable's module handle.
-        let hinstance = unsafe { GetModuleHandleW(std::ptr::null()) };
-        register_class(hinstance)?;
+/// Size `hwnd` so its client area is `width x height` physical pixels, at
+/// the DPI of the monitor it is on.
+fn size_client(hwnd: Hwnd, width: u32, height: u32) -> io::Result<()> {
+    let mut r = Rect {
+        left: 0,
+        top: 0,
+        right: width.min(i32::MAX as u32) as i32,
+        bottom: height.min(i32::MAX as u32) as i32,
+    };
+    // SAFETY: `hwnd` is live; `r` is a valid in/out RECT.
+    let ok = unsafe {
+        let dpi = GetDpiForWindow(hwnd);
+        AdjustWindowRectExForDpi(&mut r, WS_OVERLAPPEDWINDOW, 0, 0, dpi) != 0
+            && SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                r.right - r.left,
+                r.bottom - r.top,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            ) != 0
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(last_error("sizing the window"))
+    }
+}
 
-        let shared = Box::new(Shared {
-            events: RefCell::new(Vec::new()),
-            size: Cell::new((0, 0)),
-            surrogate: Cell::new(None),
-        });
+/// On the window's own thread: create and show the window, report it (or
+/// the failure) on `made`, then run its message loop until
+/// `WM_CLOSE_WINDOW` ends it.
+fn window_thread(
+    shared: Arc<Shared>,
+    hinstance: usize,
+    title: String,
+    width: u32,
+    height: u32,
+    made: mpsc::Sender<io::Result<usize>>,
+) {
+    let hinstance = hinstance as Hinstance;
+    let create = || -> io::Result<Hwnd> {
+        register_class(hinstance)?;
         let class = wide(CLASS_NAME);
-        let title = wide(title);
-        let style = WS_OVERLAPPEDWINDOW;
+        let title = wide(&title);
         // SAFETY: strings are NUL-terminated and outlive the call; the class
         // is registered; `shared` is passed as the create parameter and the
-        // window procedure stores it in GWLP_USERDATA on WM_NCCREATE. The box
-        // is owned by the returned `Window`, which destroys the window
-        // (clearing the pointer) before the box is freed.
+        // window procedure stores it in GWLP_USERDATA on WM_NCCREATE. This
+        // thread holds `shared` until its loop ends, after WM_NCDESTROY has
+        // cleared the pointer.
         let hwnd = unsafe {
             CreateWindowExW(
                 0,
                 class.as_ptr(),
                 title.as_ptr(),
-                style,
+                WS_OVERLAPPEDWINDOW,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
@@ -267,17 +343,92 @@ impl Window {
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 hinstance,
-                &*shared as *const Shared as *mut c_void,
+                Arc::as_ptr(&shared) as *mut c_void,
             )
         };
         if hwnd.is_null() {
             return Err(last_error("CreateWindowExW"));
         }
-        let window = Window {
+        if let Err(e) = size_client(hwnd, width, height) {
+            // SAFETY: our window, on its own thread.
+            unsafe { DestroyWindow(hwnd) };
+            return Err(e);
+        }
+        // SAFETY: `hwnd` is live. The return value is the previous visibility.
+        unsafe { ShowWindow(hwnd, SW_SHOW) };
+        Ok(hwnd)
+    };
+    match create() {
+        Ok(hwnd) => {
+            if made.send(Ok(hwnd as usize)).is_err() {
+                // SAFETY: our window; nobody is left to use it.
+                unsafe { DestroyWindow(hwnd) };
+                return;
+            }
+        }
+        Err(e) => {
+            let _ = made.send(Err(e));
+            return;
+        }
+    }
+    // Keys and clicks reach the window here first: answer them promptly.
+    raise_thread_priority();
+    // SAFETY: `Msg` is plain data, all-zero is a valid value.
+    let mut msg: Msg = unsafe { std::mem::zeroed() };
+    // SAFETY: `msg` is a valid out MSG; a null hwnd takes every message of
+    // this thread. GetMessageW returns 0 on WM_QUIT and -1 on error; both
+    // end the loop.
+    unsafe {
+        while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    drop(shared);
+}
+
+impl Window {
+    /// Create and show a window whose client area is `width x height`
+    /// physical pixels, on a thread of its own.
+    pub fn new(title: &str, width: u32, height: u32) -> io::Result<Window> {
+        // SAFETY: a null name returns the executable's module handle.
+        let hinstance = unsafe { GetModuleHandleW(std::ptr::null()) };
+        // SAFETY: no attributes or name; auto-reset, not signalled.
+        let ready = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+        if ready.is_null() {
+            return Err(last_error("CreateEventW"));
+        }
+        let shared = Arc::new(Shared {
+            events: Mutex::new(Vec::new()),
+            size: Mutex::new((0, 0)),
+            surrogate: Mutex::new(None),
+            ready,
+        });
+        let (made, created) = mpsc::channel();
+        let for_thread = Arc::clone(&shared);
+        let title = title.to_string();
+        let module = hinstance as usize;
+        let thread = std::thread::Builder::new()
+            .name("fwrender window".into())
+            .spawn(move || window_thread(for_thread, module, title, width, height, made))?;
+        let hwnd = match created.recv() {
+            Ok(Ok(hwnd)) => hwnd as Hwnd,
+            Ok(Err(e)) => {
+                let _ = thread.join();
+                return Err(e);
+            }
+            Err(_) => {
+                let _ = thread.join();
+                return Err(io::Error::other(
+                    "the window thread ended before the window was made",
+                ));
+            }
+        };
+        Ok(Window {
             hwnd,
             hinstance,
             shared,
-            wake_target: Arc::new(Mutex::new(hwnd as usize)),
+            thread: Some(thread),
             // SAFETY: no attributes, no name; a null result is handled.
             timer: unsafe {
                 CreateWaitableTimerExW(
@@ -288,43 +439,19 @@ impl Window {
                 )
             },
             icons: Vec::new(),
-        };
-
-        window.set_client_size(width, height)?;
-        // SAFETY: `hwnd` is live. The return value is the previous visibility.
-        unsafe { ShowWindow(hwnd, SW_SHOW) };
-        Ok(window)
+        })
     }
 
     /// Resize the window so its client area is `width x height` physical
     /// pixels, at the DPI of the monitor it is on. The resulting
-    /// [`Event::Resized`] arrives with the next `poll` / `wait`.
+    /// [`Event::Resized`] arrives with a later `poll` / `wait`.
+    ///
+    /// This and [`Window::set_icon`] are handled by the window's thread and
+    /// wait for it. Windows' drag loop still handles them, so they return
+    /// promptly during a resize; only a window thread that is stuck would
+    /// hold them.
     pub fn set_client_size(&self, width: u32, height: u32) -> io::Result<()> {
-        let mut r = Rect {
-            left: 0,
-            top: 0,
-            right: width.min(i32::MAX as u32) as i32,
-            bottom: height.min(i32::MAX as u32) as i32,
-        };
-        // SAFETY: `hwnd` is live; `r` is a valid in/out RECT.
-        let ok = unsafe {
-            let dpi = GetDpiForWindow(self.hwnd);
-            AdjustWindowRectExForDpi(&mut r, WS_OVERLAPPEDWINDOW, 0, 0, dpi) != 0
-                && SetWindowPos(
-                    self.hwnd,
-                    std::ptr::null_mut(),
-                    0,
-                    0,
-                    r.right - r.left,
-                    r.bottom - r.top,
-                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-                ) != 0
-        };
-        if ok {
-            Ok(())
-        } else {
-            Err(last_error("sizing the window"))
-        }
+        size_client(self.hwnd, width, height)
     }
 
     /// Set the window's icon from square images, each its size and its
@@ -420,7 +547,7 @@ impl Window {
                 (r.bottom - r.top).max(0) as u32,
             )
         } else {
-            self.shared.size.get()
+            *self.shared.size.lock().unwrap_or_else(|p| p.into_inner())
         }
     }
 
@@ -483,14 +610,12 @@ impl Window {
 
     pub fn waker(&self) -> Waker {
         Waker {
-            target: Arc::clone(&self.wake_target),
+            target: Arc::downgrade(&self.shared),
         }
     }
 
-    /// Handle every pending message without blocking and append the
-    /// resulting events.
+    /// Append every event that has arrived, without blocking.
     pub fn poll(&mut self, events: &mut Vec<Event>) {
-        pump();
         self.drain(events);
     }
 
@@ -500,12 +625,11 @@ impl Window {
     pub fn wait(&mut self, timeout: Option<Duration>, events: &mut Vec<Event>) {
         let deadline = timeout.and_then(|t| Instant::now().checked_add(t));
         loop {
-            pump();
             if self.drain(events) {
                 return;
             }
             let mut millis = INFINITE;
-            let mut handles = 0;
+            let mut handles = 1;
             if let Some(d) = deadline {
                 let left = d.saturating_duration_since(Instant::now());
                 if left.is_zero() {
@@ -520,7 +644,7 @@ impl Window {
                         SetWaitableTimer(self.timer, &due, 0, std::ptr::null(), std::ptr::null(), 0)
                     } != 0;
                 if armed {
-                    handles = 1;
+                    handles = 2;
                 } else {
                     // Round up so a sub-millisecond remainder still sleeps.
                     let ms = (left.as_nanos() + 999_999) / 1_000_000;
@@ -530,57 +654,47 @@ impl Window {
                 // A timeout too large to represent: wait without one.
                 millis = INFINITE;
             }
-            // SAFETY: `handles` is 0 (null array) or 1 (our armed timer).
-            let r = unsafe {
-                MsgWaitForMultipleObjectsEx(
-                    handles,
-                    &self.timer,
-                    millis,
-                    QS_ALLINPUT,
-                    MWMO_INPUTAVAILABLE,
-                )
-            };
+            let wait_on = [self.shared.ready, self.timer];
+            // SAFETY: the first `handles` entries are live handles: the event
+            // always, the armed timer when there are two.
+            let r = unsafe { WaitForMultipleObjects(handles, wait_on.as_ptr(), 0, millis) };
             if r == WAIT_FAILED {
                 // Cannot happen with these arguments; never spin if it does.
                 std::thread::sleep(Duration::from_millis(1));
             }
-            // Loop: a message that produced no event (mouse move, timer, ...)
-            // goes back to sleep until the deadline.
+            // Loop: the event may have been set for events already drained,
+            // and the timer means the deadline is checked again.
         }
     }
 
     fn drain(&self, events: &mut Vec<Event>) -> bool {
-        let mut q = self.shared.events.borrow_mut();
+        let mut q = self.shared.events.lock().unwrap_or_else(|p| p.into_inner());
         let any = !q.is_empty();
         events.append(&mut q);
         any
     }
 }
 
-/// Dispatch every queued message of this thread.
-fn pump() {
-    // SAFETY: `Msg` is plain data, all-zero is a valid value.
-    let mut msg: Msg = unsafe { std::mem::zeroed() };
-    // SAFETY: `msg` is a valid out MSG; a null hwnd takes every message of
-    // the thread. Dispatch runs window procedures, which only touch their
-    // own `Shared` through short-lived borrows.
-    unsafe {
-        while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
-}
-
 impl Drop for Window {
     fn drop(&mut self) {
-        match self.wake_target.lock() {
-            Ok(mut g) => *g = 0,
-            Err(p) => *p.into_inner() = 0,
+        // The window thread destroys its window and ends its loop. Posting
+        // fails only while its queue is full (10,000 messages), so try for
+        // a second; after that the thread is left running rather than
+        // waited on forever.
+        let mut asked = false;
+        for _ in 0..100 {
+            // SAFETY: `hwnd` is live until the thread handles this message.
+            asked = unsafe { PostMessageW(self.hwnd, WM_CLOSE_WINDOW, 0, 0) } != 0;
+            if asked {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
-        // SAFETY: `hwnd` is live and owned by this thread. WM_NCDESTROY clears
-        // GWLP_USERDATA before `shared` is freed after this block.
-        unsafe { DestroyWindow(self.hwnd) };
+        if let Some(thread) = self.thread.take() {
+            if asked {
+                let _ = thread.join();
+            }
+        }
         for &icon in &self.icons {
             // SAFETY: icons this window made, no longer in use now that it
             // is destroyed.
@@ -616,31 +730,49 @@ unsafe extern "system" fn wnd_proc(hwnd: Hwnd, msg: u32, wparam: usize, lparam: 
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     };
     // Never panic here: unwinding out of an `extern "system"` fn aborts.
-    let push = |e: Event| {
-        if let Ok(mut q) = shared.events.try_borrow_mut() {
-            q.push(e);
-        }
-    };
+    let push = |e: Event| shared.push(e);
+    if matches!(
+        msg,
+        WM_KEYDOWN
+            | WM_KEYUP
+            | WM_SYSKEYDOWN
+            | WM_SYSKEYUP
+            | WM_CHAR
+            | WM_LBUTTONDOWN
+            | WM_LBUTTONDBLCLK
+            | WM_LBUTTONUP
+            | WM_MOUSEWHEEL
+    ) {
+        // SAFETY: GetKeyState takes a virtual-key code and has no
+        // preconditions; this thread's key state is the one that matters.
+        let down = |vk: i32| u8::from(unsafe { GetKeyState(vk) } < 0);
+        MODIFIERS.store(
+            down(0x10) | down(0x11) << 1 | down(0x12) << 2,
+            Ordering::Relaxed,
+        );
+    }
+    let surrogate = || shared.surrogate.lock().unwrap_or_else(|p| p.into_inner());
     match msg {
         WM_SIZE => {
             let (w, h) = ((lparam & 0xFFFF) as u32, ((lparam >> 16) & 0xFFFF) as u32);
-            shared.size.set((w, h));
+            *shared.size.lock().unwrap_or_else(|p| p.into_inner()) = (w, h);
             push(Event::Resized(w, h));
             0
         }
         WM_CHAR => {
             let unit = wparam as u16;
             match unit {
-                0xD800..=0xDBFF => shared.surrogate.set(Some(unit)),
+                0xD800..=0xDBFF => *surrogate() = Some(unit),
                 0xDC00..=0xDFFF => {
-                    if let Some(hi) = shared.surrogate.take() {
+                    let high = surrogate().take();
+                    if let Some(hi) = high {
                         if let Some(Ok(c)) = char::decode_utf16([hi, unit]).next() {
                             push(Event::Char(c));
                         }
                     }
                 }
                 _ => {
-                    shared.surrogate.set(None);
+                    *surrogate() = None;
                     if let Some(c) = char::from_u32(u32::from(unit)) {
                         push(Event::Char(c));
                     }
@@ -710,8 +842,20 @@ unsafe extern "system" fn wnd_proc(hwnd: Hwnd, msg: u32, wparam: usize, lparam: 
             push(Event::Paint);
             0
         }
-        WM_WAKE => {
-            push(Event::Woken);
+        WM_CLOSE_WINDOW => {
+            // SAFETY: our window, destroyed on its own thread; the loop ends
+            // with the WM_QUIT posted after it.
+            unsafe {
+                DestroyWindow(hwnd);
+                PostQuitMessage(0);
+            }
+            0
+        }
+        // Tests hold the window thread busy for `wparam` ms, as a modal
+        // resize loop would.
+        #[cfg(test)]
+        WM_TEST_STALL => {
+            std::thread::sleep(Duration::from_millis(wparam as u64));
             0
         }
         WM_NCDESTROY => {
@@ -826,11 +970,10 @@ pub fn raise_thread_priority() -> bool {
     unsafe { SetThreadPriority(GetCurrentThread(), 1) != 0 }
 }
 
-/// Whether a Shift key is down now (`GetKeyState`, as of the message being
-/// handled), for key combinations such as Shift+PageUp.
+/// Whether a Shift key was down at the last key or mouse message a window
+/// received, for key combinations such as Shift+PageUp.
 pub fn shift_down() -> bool {
-    // SAFETY: GetKeyState takes a virtual-key code and has no preconditions.
-    unsafe { GetKeyState(0x10) < 0 }
+    MODIFIERS.load(Ordering::Relaxed) & 1 != 0
 }
 
 /// Write `text` to the console of the process that started this one, for a
@@ -879,17 +1022,15 @@ pub fn announce_environment_change() -> bool {
     }
 }
 
-/// Whether an Alt key is down now (`GetKeyState`, as [`shift_down`]).
+/// Whether an Alt key was down (as [`shift_down`]).
 pub fn alt_down() -> bool {
-    // SAFETY: as in `shift_down`.
-    unsafe { GetKeyState(0x12) < 0 }
+    MODIFIERS.load(Ordering::Relaxed) & 4 != 0
 }
 
-/// Whether a Ctrl key is down now (`GetKeyState`, as [`shift_down`]). Note
+/// Whether a Ctrl key was down (as [`shift_down`]). Note
 /// that AltGr reports as Ctrl+Alt.
 pub fn ctrl_down() -> bool {
-    // SAFETY: as in `shift_down`.
-    unsafe { GetKeyState(0x11) < 0 }
+    MODIFIERS.load(Ordering::Relaxed) & 2 != 0
 }
 
 /// The clipboard, open for this window until dropped. Another program may

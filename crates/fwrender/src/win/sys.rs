@@ -195,8 +195,6 @@ pub const SWP_NOMOVE: u32 = 0x0002;
 pub const SWP_NOZORDER: u32 = 0x0004;
 pub const SWP_NOACTIVATE: u32 = 0x0010;
 
-pub const PM_REMOVE: u32 = 0x0001;
-
 pub const WM_SIZE: u32 = 0x0005;
 pub const WM_PAINT: u32 = 0x000F;
 pub const WM_CLOSE: u32 = 0x0010;
@@ -223,13 +221,6 @@ pub const GMEM_MOVEABLE: u32 = 0x0002;
 pub const WM_MOUSEWHEEL: u32 = 0x020A;
 pub const WM_APP: u32 = 0x8000;
 
-/// `QS_ALLINPUT` for Windows 8 and later: `QS_INPUT` (mouse, key, raw input,
-/// touch, pointer = 0x1C07) | `QS_POSTMESSAGE` | `QS_TIMER` | `QS_PAINT` |
-/// `QS_HOTKEY` | `QS_SENDMESSAGE` = 0x1CFF. Values from the `GetQueueStatus`
-/// page on learn.microsoft.com.
-pub const QS_ALLINPUT: u32 = 0x1CFF;
-/// Return even when input was already seen by `PeekMessage` but not removed.
-pub const MWMO_INPUTAVAILABLE: u32 = 0x0004;
 pub const INFINITE: u32 = 0xFFFF_FFFF;
 pub const WAIT_FAILED: u32 = 0xFFFF_FFFF;
 /// `CreateWaitableTimerExW` flag, Windows 10 1803+ (learn.microsoft.com,
@@ -299,7 +290,8 @@ extern "system" {
     pub fn SetWindowLongPtrW(hwnd: Hwnd, index: i32, value: isize) -> isize;
     pub fn GetWindowLongPtrW(hwnd: Hwnd, index: i32) -> isize;
     pub fn LoadCursorW(instance: Hinstance, name: *const u16) -> Handle;
-    pub fn PeekMessageW(msg: *mut Msg, hwnd: Hwnd, min: u32, max: u32, remove: u32) -> Bool;
+    pub fn GetMessageW(msg: *mut Msg, hwnd: Hwnd, min: u32, max: u32) -> Bool;
+    pub fn PostQuitMessage(code: i32);
     pub fn TranslateMessage(msg: *const Msg) -> Bool;
     pub fn DispatchMessageW(msg: *const Msg) -> isize;
     pub fn PostMessageW(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> Bool;
@@ -313,13 +305,6 @@ extern "system" {
     /// On success the system owns `data`; on failure the caller still does.
     pub fn SetClipboardData(format: u32, data: Handle) -> Handle;
     pub fn GetClipboardData(format: u32) -> Handle;
-    pub fn MsgWaitForMultipleObjectsEx(
-        count: u32,
-        handles: *const Handle,
-        millis: u32,
-        wake_mask: u32,
-        flags: u32,
-    ) -> u32;
     pub fn GetDC(hwnd: Hwnd) -> Hdc;
     pub fn ReleaseDC(hwnd: Hwnd, hdc: Hdc) -> i32;
     // Windows 10 1607+ (1703+ for the V2 context); foldwave targets Windows 11.
@@ -453,6 +438,19 @@ extern "system" {
         resume: i32,
     ) -> i32;
     pub fn CloseHandle(handle: Handle) -> i32;
+    pub fn CreateEventW(
+        attributes: *const c_void,
+        manual_reset: Bool,
+        initial: Bool,
+        name: *const u16,
+    ) -> Handle;
+    pub fn SetEvent(event: Handle) -> Bool;
+    pub fn WaitForMultipleObjects(
+        count: u32,
+        handles: *const Handle,
+        wait_all: Bool,
+        millis: u32,
+    ) -> u32;
     pub fn GlobalAlloc(flags: u32, bytes: usize) -> Handle;
     pub fn GlobalLock(mem: Handle) -> *mut c_void;
     pub fn GlobalUnlock(mem: Handle) -> Bool;

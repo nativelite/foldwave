@@ -176,3 +176,105 @@ fn alt_alone_does_not_open_the_menu_but_alt_space_does() {
     // Other system commands pass through.
     assert!(!alt_alone_menu(0xF060, 0)); // SC_CLOSE
 }
+
+/// How long a typed character takes from the message queue to `wait`
+/// returning it: posted from another thread, 2,000 times. A measurement,
+/// not a check; run it by hand (release):
+/// `cargo test -p nativelite-fwrender --release --lib -- --ignored --nocapture input_to_wait`
+#[test]
+#[ignore = "timing; run by hand"]
+fn input_to_wait_latency() {
+    use std::sync::mpsc;
+    let mut w = Window::new("fwrender latency", 200, 100).expect("window");
+    let hwnd = w.hwnd() as usize;
+    let mut events = Vec::new();
+    for _ in 0..5 {
+        w.poll(&mut events);
+    }
+    let (go, went) = mpsc::channel::<()>();
+    let (sent_tx, sent_rx) = mpsc::channel::<Instant>();
+    let sender = std::thread::spawn(move || {
+        while went.recv().is_ok() {
+            std::thread::sleep(Duration::from_millis(1));
+            let at = Instant::now();
+            // SAFETY (test): the window is live until the sender is joined.
+            unsafe { sys::PostMessageW(hwnd as sys::Hwnd, sys::WM_CHAR, 'x' as usize, 0) };
+            sent_tx.send(at).unwrap();
+        }
+    });
+    let mut samples = Vec::new();
+    for _ in 0..2000 {
+        events.clear();
+        go.send(()).unwrap();
+        while !events.contains(&Event::Char('x')) {
+            w.wait(Some(Duration::from_secs(1)), &mut events);
+        }
+        let got = Instant::now();
+        samples.push(got - sent_rx.recv().unwrap());
+    }
+    drop(go);
+    sender.join().unwrap();
+    samples.sort();
+    let us = |d: Duration| d.as_secs_f64() * 1e6;
+    let n = samples.len();
+    println!(
+        "input to wait: median {:.1} us, p90 {:.1} us, p99 {:.1} us, max {:.1} us (n = {n})",
+        us(samples[n / 2]),
+        us(samples[n * 90 / 100]),
+        us(samples[n * 99 / 100]),
+        us(samples[n - 1])
+    );
+}
+
+/// The caller's side never waits on the window's thread: while that thread
+/// is held busy (as Windows' modal loop holds it while an edge is dragged),
+/// a waker still ends `wait` at once, and the events queued meanwhile (here
+/// a resize) arrive when the thread is free again.
+#[test]
+fn waiting_goes_on_while_the_window_thread_is_busy() {
+    use super::window::WM_TEST_STALL;
+    let mut w = Window::new("fwrender busy", 240, 120).expect("window");
+    let hwnd = w.hwnd();
+    let mut events = Vec::new();
+    for _ in 0..5 {
+        w.poll(&mut events);
+    }
+    // SAFETY (test): the window is live; the message only sleeps.
+    unsafe { sys::PostMessageW(hwnd, WM_TEST_STALL, 600, 0) };
+    std::thread::sleep(Duration::from_millis(50));
+    let waker = w.waker();
+    let start = Instant::now();
+    std::thread::spawn(move || waker.wake());
+    events.clear();
+    while !events.contains(&Event::Woken) && start.elapsed() < Duration::from_secs(2) {
+        w.wait(Some(Duration::from_secs(2)), &mut events);
+    }
+    let took = start.elapsed();
+    assert!(events.contains(&Event::Woken), "{events:?}");
+    assert!(
+        took < Duration::from_millis(200),
+        "woke after {took:?} while the window thread slept 600 ms"
+    );
+    // A resize asked for now is handled once the thread is free.
+    w.set_client_size(300, 150).unwrap();
+    let start = Instant::now();
+    events.clear();
+    while !events.contains(&Event::Resized(300, 150)) && start.elapsed() < Duration::from_secs(2) {
+        w.wait(Some(Duration::from_secs(2)), &mut events);
+    }
+    assert!(events.contains(&Event::Resized(300, 150)), "{events:?}");
+    assert_eq!(w.client_size(), (300, 150));
+}
+
+/// The clipboard works from the caller's thread although the window lives on
+/// its own. It replaces the clipboard's contents, so it runs only by hand,
+/// with the clipboard saved and restored around it:
+/// `cargo test -p nativelite-fwrender --lib -- --ignored clipboard_from`
+#[test]
+#[ignore = "replaces the clipboard; run by hand"]
+fn clipboard_from_the_callers_thread() {
+    let w = Window::new("fwrender clipboard", 200, 100).expect("window");
+    let text = "foldwave clipboard check: Zoë ✓";
+    w.set_clipboard(text).expect("set");
+    assert_eq!(w.clipboard().expect("get").as_deref(), Some(text));
+}

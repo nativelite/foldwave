@@ -495,7 +495,7 @@ pub fn render(fr: &FirstRun, w: usize, h: usize) -> Vec<Vec<Cell>> {
     let (heading, why) = match fr.step {
         Step::Shell => (
             "Which shell opens in each pane?",
-            "Each new pane runs it. Change it later in Ctrl+, or run any \
+            "Each new pane runs it. Change it later with Ctrl+Comma, or run any \
              program with fwterm -- <program>.",
         ),
         Step::Logs => (
