@@ -537,6 +537,15 @@ impl Window {
         self.hinstance
     }
 
+    /// Where the mouse pointer is, in client pixels (it may be outside the
+    /// client area); `None` if Windows cannot say.
+    pub fn pointer(&self) -> Option<(i32, i32)> {
+        let mut p = Point::default();
+        // SAFETY: `p` is a valid out POINT; `hwnd` is live.
+        let ok = unsafe { GetCursorPos(&mut p) != 0 && ScreenToClient(self.hwnd, &mut p) != 0 };
+        ok.then_some((p.x, p.y))
+    }
+
     /// The current client-area size in physical pixels.
     pub fn client_size(&self) -> (u32, u32) {
         let mut r = Rect::default();

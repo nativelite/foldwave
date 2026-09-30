@@ -56,6 +56,9 @@ The competitive landscape for the whole suite is in
 | Ctrl+Shift+O | select a command's output |
 | Ctrl+Shift+[ / ] | fold a command's output, unfold it |
 
+While a program asks for the mouse (atrium with Ctrl+A m, vim, htop), clicks
+and the wheel go to it; hold Shift to select or scroll in foldwave instead.
+
 `fwterm --help` lists every option and key.
 
 ## Install (Windows)

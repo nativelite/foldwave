@@ -40,6 +40,8 @@
 #[cfg_attr(not(windows), allow(dead_code))]
 mod agents;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod altscreen;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod blocks;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod emu;
@@ -65,6 +67,8 @@ mod install;
 mod layout;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod logstore;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod mouse;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod select;
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -93,6 +97,7 @@ fn main() {
 #[cfg(windows)]
 mod app {
     use crate::agents;
+    use crate::altscreen;
     use crate::blocks;
     use crate::emu::Emu;
     use crate::fold;
@@ -108,6 +113,7 @@ mod app {
     use crate::install;
     use crate::layout::{neighbor, pane_at, Dir, Layout, PaneId, Placement, Rect, Toward};
     use crate::logstore;
+    use crate::mouse;
     use crate::select::{self, Point, Selection};
     use crate::settings_ui;
     use crate::strip;
@@ -257,6 +263,8 @@ keys:
                     /pattern/ is a regular expression (. [a-z] \\d \\w \\s
                     * + ? {m,n} | ( ) ^ $), case ignored like text
   drag, double-click   select text in a pane / select a word
+                    (a program that asked for the mouse gets clicks, drags
+                    and the wheel instead; Shift keeps them foldwave's)
   Ctrl+Shift+C      copy the selection (Ctrl+C too while there is one;
                     otherwise Ctrl+C goes to the program)
   Ctrl+V, Ctrl+Shift+V   paste; several lines into a program that did not
@@ -1918,6 +1926,86 @@ keys:
         }
     }
 
+    /// Send a mouse event at client pixel `(x, y)` to `p`'s program, as the
+    /// cell under it (kept inside the pane, for a drag that leaves it), if
+    /// the program asked for the mouse; true if sent. Shift held keeps the
+    /// mouse fwterm's (selecting, scrolling), and so does a view scrolled
+    /// back from the live screen.
+    fn report_mouse(
+        p: &Pane,
+        button: mouse::Button,
+        action: mouse::Action,
+        x: i32,
+        y: i32,
+        m: Metrics,
+    ) -> bool {
+        if fwrender::win::shift_down() || p.back != 0 || p.deep.is_some() {
+            return false;
+        }
+        let (tracking, sgr) = p.shared.term.lock().unwrap().mouse();
+        let within = |v: i32, cell: u32, start: usize, len: usize| {
+            (v.div_euclid(cell as i32) - start as i32).clamp(0, len.max(1) as i32 - 1) as usize
+        };
+        let row = within(y, m.cell_h, p.rect.top, p.rect.rows);
+        let col = within(x, m.cell_w, p.rect.left, p.rect.cols);
+        let mods = mouse::Mods {
+            shift: false,
+            alt: fwrender::win::alt_down(),
+            ctrl: fwrender::win::ctrl_down(),
+        };
+        match mouse::report(tracking, sgr, button, action, row, col, mods) {
+            Some(bytes) => {
+                let _ = p.session.lock().unwrap().write(&bytes);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The wheel for the program in the pane under the pointer (else the
+    /// focused one): as mouse reports if it asked for the mouse, else as
+    /// arrow keys on the alternate screen, which has no history to scroll.
+    /// False leaves the wheel to scroll back through history.
+    fn wheel_to_program(
+        panes: &[Pane],
+        placement: &Placement,
+        focus: PaneId,
+        pointer: Option<(i32, i32)>,
+        delta: i32,
+        m: Metrics,
+    ) -> bool {
+        let over = pointer
+            .and_then(|(x, y)| {
+                let row = y.max(0) as usize / m.cell_h as usize;
+                let col = x.max(0) as usize / m.cell_w as usize;
+                pane_at(&placement.panes, row, col)
+            })
+            .unwrap_or(focus);
+        let Some(p) = panes.iter().find(|p| p.id == over) else {
+            return false;
+        };
+        let (x, y) = pointer.unwrap_or((0, 0));
+        let notches = (delta.unsigned_abs() as usize / 120).max(1);
+        let button = if delta > 0 {
+            mouse::Button::WheelUp
+        } else {
+            mouse::Button::WheelDown
+        };
+        if report_mouse(p, button, mouse::Action::Press, x, y, m) {
+            for _ in 1..notches {
+                report_mouse(p, button, mouse::Action::Press, x, y, m);
+            }
+            return true;
+        }
+        let alt = p.shared.term.lock().unwrap().in_alternate_screen();
+        if alt && !fwrender::win::shift_down() && p.back == 0 {
+            let keys = mouse::wheel_as_arrows(delta > 0, notches * 3);
+            let _ = p.session.lock().unwrap().write(&keys);
+            return true;
+        }
+        false
+    }
+
     /// The newest decision not yet looked at, as the strip shows it: who
     /// raised it (atrium's name for it) and what it asks, and with several
     /// panes, which of fwterm's it is in.
@@ -2095,6 +2183,9 @@ keys:
         /// The log ends lines with bare line feeds: a pipe pane's, perhaps
         /// from another session in another lane, replayed as one.
         bare_lf: bool,
+        /// What full-screen programs drew, as line ranges: scrolling back
+        /// skips them (`altscreen`), search still reaches them.
+        alt: Vec<(u64, u64)>,
     }
 
     /// Whether most line breaks in `bytes` are bare line feeds, as a pipe
@@ -2127,13 +2218,46 @@ keys:
             let n = gens
                 .last()
                 .map_or(0, |(r, _)| r.read_at(0, &mut head).unwrap_or(0));
+            // Where full-screen programs started and stopped, in log lines.
+            let mut switches = Vec::new();
+            for (reader, start) in &gens {
+                let Ok(marks) = reader.marks_in(0..reader.len()) else {
+                    continue;
+                };
+                for m in marks {
+                    let enter = match m.kind {
+                        altscreen::ENTER => true,
+                        altscreen::LEAVE => false,
+                        _ => continue,
+                    };
+                    if let Ok(line) = reader.line_of(m.offset) {
+                        switches.push((start + line, enter));
+                    }
+                }
+            }
             Ok(Deep {
                 gens,
                 total,
                 at: u64::MAX,
                 term: Term::new(1, 1),
                 bare_lf: bare_line_feeds(&head[..n]),
+                alt: altscreen::spans(&switches, total),
             })
+        }
+
+        /// Lines scrolling back can reach: those no full-screen program drew.
+        fn visible(&self) -> u64 {
+            altscreen::visible(self.total, &self.alt)
+        }
+
+        /// The log line a view `back` lines above live ends before.
+        fn line_back(&self, back: u64) -> u64 {
+            altscreen::line_back(self.total, &self.alt, back)
+        }
+
+        /// How far back a view ending before `line` is.
+        fn back_of(&self, line: u64) -> u64 {
+            altscreen::back_of(self.total, &self.alt, line)
         }
 
         /// The last prompt (a shell's `A` mark) on a line before `line`, in
@@ -2715,11 +2839,12 @@ keys:
                     self.deep = self.pane_dir.as_deref().and_then(|f| Deep::open(f).ok());
                 }
                 if let Some(d) = self.deep.as_mut() {
-                    self.back = self.back.min(d.total as usize);
+                    self.back = self.back.min(d.visible() as usize);
                     // The view's bottom is `back` lines above live, in log
                     // lines (a wrapped line counts once here, once per row in
-                    // memory, so the hand-over is approximate).
-                    let end = d.total.saturating_sub(self.back as u64);
+                    // memory, so the hand-over is approximate), not counting
+                    // what full-screen programs drew.
+                    let end = d.line_back(self.back as u64);
                     let _ = d.rebuild(end.max(1), rows, cols, pipe);
                     let s = d.term.screen();
                     let highlight = log_selection(selection, d, rows, cols);
@@ -3128,6 +3253,7 @@ keys:
             let mut buf = vec![0u8; 64 * 1024];
             let mut watcher = fwbench::terminal::Watcher::new();
             let mut scanner = ansi::MarkScanner::new();
+            let mut alt_scanner = altscreen::Scanner::default();
             let mut found = Vec::new();
             loop {
                 let n = match source(&mut buf) {
@@ -3187,13 +3313,33 @@ keys:
                     }
                     if let Some(log) = &log {
                         let chunk_at = shared.gen_bytes.load(Ordering::Acquire);
-                        for m in &found {
-                            let _ = log.tx.send(LogMsg::Mark(panelog::Mark {
+                        // Shell marks, and where a full-screen program starts
+                        // and stops (what scrolling back skips), in offset
+                        // order as the log takes them.
+                        let mut marks: Vec<panelog::Mark> = found
+                            .iter()
+                            .map(|m| panelog::Mark {
                                 offset: chunk_at + at_in_chunk(m) as u64,
                                 kind: m.kind.letter(),
                                 value: m.exit_code.map_or(-1, i64::from),
                                 time_ns: now,
-                            }));
+                            })
+                            .collect();
+                        marks.extend(alt_scanner.feed(&buf[..n]).into_iter().map(|(at, enter)| {
+                            panelog::Mark {
+                                offset: chunk_at + at as u64,
+                                kind: if enter {
+                                    altscreen::ENTER
+                                } else {
+                                    altscreen::LEAVE
+                                },
+                                value: 0,
+                                time_ns: now,
+                            }
+                        }));
+                        marks.sort_by_key(|m| m.offset);
+                        for m in marks {
+                            let _ = log.tx.send(LogMsg::Mark(m));
                         }
                     }
                     // Checkpoint at a point the replay can resume from; roll
@@ -4486,6 +4632,9 @@ keys:
         // may become a drag started.
         let mut selection: Option<(PaneId, Selection)> = None;
         let mut press: Option<(PaneId, Point)> = None;
+        // A button held down over a pane whose program takes the mouse: the
+        // drag and release go to it too, wherever the pointer moves.
+        let mut mouse_to: Option<PaneId> = None;
         // A drag held past a pane's top or bottom: the pointer (client
         // pixels), and when the view last scrolled for it.
         let mut drag_edge: Option<(i32, i32)> = None;
@@ -5036,14 +5185,14 @@ keys:
                                     }
                                     if let Some(d) = pane.deep.as_ref() {
                                         let rows = pane.rect.rows as u64;
-                                        let top = d.total.saturating_sub(pane.back as u64 + rows);
+                                        let top = d.line_back(pane.back as u64 + rows);
                                         let to = if up {
                                             d.prev_prompt(top)
                                         } else {
                                             d.next_prompt(top)
                                         };
                                         if let Some(line) = to {
-                                            let back = d.total.saturating_sub(line + rows);
+                                            let back = d.back_of(line + rows);
                                             pane.back = (back as usize).max(held + 1);
                                         }
                                     }
@@ -5145,6 +5294,21 @@ keys:
                                 focus = id;
                                 layout_dirty = true;
                             }
+                            // A program that asked for the mouse gets the
+                            // press (a double-click is a second press to it).
+                            if let Some(p) = panes.iter().find(|p| p.id == id) {
+                                if report_mouse(
+                                    p,
+                                    mouse::Button::Left,
+                                    mouse::Action::Press,
+                                    x,
+                                    y,
+                                    m,
+                                ) {
+                                    mouse_to = Some(id);
+                                    continue;
+                                }
+                            }
                             let pane = panes.iter().find(|p| p.id == id);
                             if let Some((pane, at)) =
                                 pane.and_then(|p| Some((p, p.point(x, y, m)?)))
@@ -5161,6 +5325,12 @@ keys:
                         }
                     }
                     Event::Drag(x, y) => {
+                        if let Some(id) = mouse_to {
+                            if let Some(p) = panes.iter().find(|p| p.id == id) {
+                                report_mouse(p, mouse::Button::Left, mouse::Action::Drag, x, y, m);
+                            }
+                            continue;
+                        }
                         if let Some((id, anchor)) = press {
                             if let Some(pane) = panes.iter().find(|p| p.id == id) {
                                 let row = y.div_euclid(m.cell_h as i32) - pane.rect.top as i32;
@@ -5176,10 +5346,34 @@ keys:
                             }
                         }
                     }
-                    Event::Release(..) => {
+                    Event::Release(x, y) => {
+                        if let Some(id) = mouse_to.take() {
+                            if let Some(p) = panes.iter().find(|p| p.id == id) {
+                                report_mouse(
+                                    p,
+                                    mouse::Button::Left,
+                                    mouse::Action::Release,
+                                    x,
+                                    y,
+                                    m,
+                                );
+                            }
+                        }
                         press = None;
                         drag_edge = None;
                     }
+                    // The wheel over a pane whose program asked for the
+                    // mouse goes to it; over a full-screen program that did
+                    // not, it becomes arrow keys; else it scrolls back.
+                    Event::Wheel(delta)
+                        if wheel_to_program(
+                            &panes,
+                            &placement,
+                            focus,
+                            surface.window().pointer(),
+                            delta,
+                            m,
+                        ) => {}
                     Event::Wheel(delta) => {
                         // Scrolling leaves a search hit for the live view.
                         if panes[fi].find_view.take().is_some() {
@@ -5790,6 +5984,79 @@ keys:
         }
 
         #[test]
+        fn scrolling_back_skips_what_a_full_screen_program_drew() {
+            let pane = std::env::temp_dir().join(format!("fwterm-alt-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&pane);
+            // The shell's L0..L9, a full-screen program's 20 lines, then the
+            // shell again: L30..L34.
+            let shell = lines(0..10);
+            let mut prog = b"\x1b[?1049h".to_vec();
+            prog.extend(lines(10..30));
+            prog.extend(b"\x1b[?1049l");
+            let after = lines(30..35);
+            {
+                let mut w = panelog::Writer::create(
+                    &pane.join(logstore::gen_name(1, 0)),
+                    panelog::Config::default(),
+                )
+                .unwrap();
+                let mut scanner = altscreen::Scanner::default();
+                let mut at = 0u64;
+                for chunk in [&shell, &prog, &after] {
+                    // The bytes first: a mark may only point into the log.
+                    w.append(chunk, 0).unwrap();
+                    for (off, enter) in scanner.feed(chunk) {
+                        w.mark(panelog::Mark {
+                            offset: at + off as u64,
+                            kind: if enter {
+                                altscreen::ENTER
+                            } else {
+                                altscreen::LEAVE
+                            },
+                            value: 0,
+                            time_ns: 0,
+                        })
+                        .unwrap();
+                    }
+                    at += chunk.len() as u64;
+                }
+            }
+            let mut d = Deep::open(&pane).unwrap();
+            assert_eq!(d.alt.len(), 1, "one stretch: {:?}", d.alt);
+            let (a, b) = d.alt[0];
+            assert_eq!(b - a, 20, "the program's 20 lines");
+            assert_eq!(d.visible(), d.total - 20);
+            // Five lines back is still after the program; six is the shell
+            // before it.
+            let rebuilt_top = |d: &mut Deep, back: u64| {
+                let end = d.line_back(back);
+                d.rebuild(end.max(1), 4, 10, false).unwrap();
+                (0..4)
+                    .map(|r| {
+                        (0..10)
+                            .map(|c| d.term.screen().cell(r, c).ch)
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|")
+            };
+            let near = rebuilt_top(&mut d, 5);
+            assert!(
+                near.contains("L30") && !near.contains("L29"),
+                "after it: {near}"
+            );
+            let before = rebuilt_top(&mut d, 6);
+            assert!(
+                before.contains("L9") && !before.contains("L1") && !before.contains("L2"),
+                "the shell before it: {before}"
+            );
+            for back in 0..=d.visible() {
+                assert_eq!(d.back_of(d.line_back(back)), back, "round trip {back}");
+            }
+            std::fs::remove_dir_all(&pane).unwrap();
+        }
+
+        #[test]
         fn scrollback_continues_across_log_generations() {
             let pane = std::env::temp_dir().join(format!("fwterm-deep-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&pane);
@@ -5945,6 +6212,7 @@ keys:
                 at: 3,
                 term,
                 bare_lf: false,
+                alt: Vec::new(),
             };
             let pt = |line, col| Point { line, col };
             // From "line" on row 0 to "界" on row 1 (a wide glyph: once).

@@ -95,6 +95,9 @@ pub struct Update {
     /// (`?2004h`).
     pub cursor_visible: bool,
     pub bracketed_paste: bool,
+    /// The mouse reporting it asked for (`?1000`/`?1002`/`?1003`, `?1006`).
+    pub mouse: vterm::MouseTracking,
+    pub mouse_sgr: bool,
     /// Every row's wrap mark (it ran on into the next row), top first.
     pub wrapped: Vec<bool>,
     /// Rows that changed, with their cells.
@@ -155,6 +158,8 @@ impl Sender {
             alt,
             cursor_visible: term.cursor_visible(),
             bracketed_paste: term.bracketed_paste(),
+            mouse: term.mouse_tracking(),
+            mouse_sgr: term.mouse_sgr(),
             wrapped: (0..rows).map(|r| screen.row_wrapped(r)).collect(),
             rows: changed,
             cursor: (c.row as u16, c.col as u16),
@@ -202,6 +207,8 @@ pub struct Mirror {
     /// The program's modes, as the host's emulator last had them.
     pub cursor_visible: bool,
     pub bracketed_paste: bool,
+    pub mouse: vterm::MouseTracking,
+    pub mouse_sgr: bool,
 }
 
 impl Mirror {
@@ -214,6 +221,8 @@ impl Mirror {
             held: 0,
             cursor_visible: true,
             bracketed_paste: false,
+            mouse: vterm::MouseTracking::Off,
+            mouse_sgr: false,
         }
     }
 
@@ -245,6 +254,8 @@ impl Mirror {
         self.in_alt = u.alt;
         self.cursor_visible = u.cursor_visible;
         self.bracketed_paste = u.bracketed_paste;
+        self.mouse = u.mouse;
+        self.mouse_sgr = u.mouse_sgr;
         let screen = if u.alt {
             &mut self.alt
         } else {
@@ -459,9 +470,20 @@ impl FromHost {
         let tag = match self {
             FromHost::Update(u) => {
                 b.extend_from_slice(&u.scrolled.to_le_bytes());
-                // Flags: the alternate screen, the cursor shown, bracketed paste.
+                // Flags: the alternate screen, the cursor shown, bracketed
+                // paste, the mouse tracking (two bits) and its SGR encoding.
+                let tracking = match u.mouse {
+                    vterm::MouseTracking::Off => 0u8,
+                    vterm::MouseTracking::Click => 1,
+                    vterm::MouseTracking::Drag => 2,
+                    vterm::MouseTracking::Motion => 3,
+                };
                 b.push(
-                    u.alt as u8 | (u.cursor_visible as u8) << 1 | (u.bracketed_paste as u8) << 2,
+                    u.alt as u8
+                        | (u.cursor_visible as u8) << 1
+                        | (u.bracketed_paste as u8) << 2
+                        | tracking << 3
+                        | (u.mouse_sgr as u8) << 5,
                 );
                 b.extend_from_slice(&u.size.0.to_le_bytes());
                 b.extend_from_slice(&u.size.1.to_le_bytes());
@@ -555,6 +577,13 @@ impl FromHost {
                     alt,
                     cursor_visible: flags & 2 != 0,
                     bracketed_paste: flags & 4 != 0,
+                    mouse: match (flags >> 3) & 3 {
+                        0 => vterm::MouseTracking::Off,
+                        1 => vterm::MouseTracking::Click,
+                        2 => vterm::MouseTracking::Drag,
+                        _ => vterm::MouseTracking::Motion,
+                    },
+                    mouse_sgr: flags & 32 != 0,
                     wrapped,
                     rows,
                     cursor,
@@ -859,6 +888,8 @@ mod tests {
             // Not the defaults: they must survive the trip.
             cursor_visible: false,
             bracketed_paste: true,
+            mouse: vterm::MouseTracking::Drag,
+            mouse_sgr: true,
             wrapped: vec![true],
             rows: vec![(
                 0,
@@ -874,6 +905,11 @@ mod tests {
         match FromHost::read(&mut b.as_slice()).unwrap() {
             FromHost::Update(back) => {
                 assert!(!back.cursor_visible && back.bracketed_paste, "modes kept");
+                assert_eq!(
+                    (back.mouse, back.mouse_sgr),
+                    (vterm::MouseTracking::Drag, true),
+                    "mouse modes kept"
+                );
                 assert_eq!(back.held, 9_999, "history held kept");
                 assert_eq!(back.wrapped, [true], "wrap marks kept");
                 assert_eq!(back.rows, u.rows);

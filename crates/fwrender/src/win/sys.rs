@@ -298,6 +298,8 @@ extern "system" {
     /// High bit set (negative) while the key is down.
     pub fn GetKeyState(vk: i32) -> i16;
     pub fn SetCapture(hwnd: Hwnd) -> Hwnd;
+    pub fn GetCursorPos(point: *mut Point) -> Bool;
+    pub fn ScreenToClient(hwnd: Hwnd, point: *mut Point) -> Bool;
     pub fn ReleaseCapture() -> Bool;
     pub fn OpenClipboard(owner: Hwnd) -> Bool;
     pub fn CloseClipboard() -> Bool;

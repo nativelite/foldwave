@@ -78,6 +78,14 @@ impl Emu {
         }
     }
 
+    /// The mouse reporting the program asked for, and whether in SGR.
+    pub fn mouse(&self) -> (vterm::MouseTracking, bool) {
+        match self {
+            Emu::Local(t) => (t.mouse_tracking(), t.mouse_sgr()),
+            Emu::Remote(m) => (m.mouse, m.mouse_sgr),
+        }
+    }
+
     pub fn in_alternate_screen(&self) -> bool {
         match self {
             Emu::Local(t) => t.in_alternate_screen(),
