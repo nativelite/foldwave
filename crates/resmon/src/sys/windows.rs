@@ -144,6 +144,7 @@ extern "system" {
     ) -> Bool;
     fn GetLogicalDrives() -> u32;
     fn GetDriveTypeW(root: *const u16) -> u32;
+    fn QueryDosDeviceW(name: *const u16, target: *mut u16, max: u32) -> u32;
     fn GetSystemCpuSetInformation(
         info: *mut u8,
         len: u32,
@@ -332,20 +333,43 @@ pub fn volume(path: &Path) -> io::Result<Volume> {
 }
 
 /// The roots of the machine's fixed drives (`C:\`, `E:\`, ...), in letter
-/// order: where a log could live.
+/// order: where a log could live. Only drives on a disk count: a virtual
+/// drive that calls itself fixed (Google Drive for desktop's, a RAM disk)
+/// is not durable storage, and is left out.
 pub fn fixed_volumes() -> Vec<PathBuf> {
     // SAFETY: no arguments; returns a bitmask of drive letters.
     let mask = unsafe { GetLogicalDrives() };
     (0..26u8)
         .filter(|i| mask & (1 << i) != 0)
-        .map(|i| PathBuf::from(format!("{}:\\", (b'A' + i) as char)))
-        .filter(|root| {
-            let w = wide(root.as_os_str());
+        .filter(|i| {
+            let letter = (b'A' + i) as char;
+            let w = wide(format!("{letter}:\\").as_ref());
             // SAFETY: `w` is a NUL-terminated root path.
             let kind = unsafe { GetDriveTypeW(w.as_ptr()) };
-            kind == DRIVE_FIXED
+            kind == DRIVE_FIXED && on_disk(&dos_device(letter))
         })
+        .map(|i| PathBuf::from(format!("{}:\\", (b'A' + i) as char)))
         .collect()
+}
+
+/// The device a drive letter names (`\Device\HarddiskVolume4`), or empty.
+fn dos_device(letter: char) -> String {
+    let name = wide(format!("{letter}:").as_ref());
+    let mut buf = vec![0u16; 1024];
+    // SAFETY: `name` is NUL-terminated and `buf` holds `buf.len()` units.
+    let n = unsafe { QueryDosDeviceW(name.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+    // The first of the NUL-separated names, as many as were written.
+    let units = &buf[..n as usize];
+    let first = units.split(|&u| u == 0).next().unwrap_or(&[]);
+    String::from_utf16_lossy(first)
+}
+
+/// A partition on a disk: basic (`\Device\HarddiskVolumeN`) or dynamic
+/// (`\Device\HarddiskDmVolumes\...`). Virtual file systems name devices of
+/// their own (Google Drive: `\Device\Volume{...}`).
+fn on_disk(device: &str) -> bool {
+    device.starts_with(r"\Device\HarddiskVolume")
+        || device.starts_with(r"\Device\HarddiskDmVolumes")
 }
 
 /// A process's CPU time and whether it has ended, through a handle of our own.
@@ -522,6 +546,23 @@ pub fn snapshot() -> io::Result<Snapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_drives_on_a_disk_count_as_fixed() {
+        assert!(on_disk(r"\Device\HarddiskVolume4"));
+        assert!(on_disk(
+            r"\Device\HarddiskDmVolumes\PhysicalDmVolumes\BlockVolume1"
+        ));
+        assert!(!on_disk(
+            r"\Device\Volume{f5ae2bcb-da01-3bf2-8935-408102040811}"
+        ));
+        assert!(!on_disk(r"\Device\ImDisk0"));
+        assert!(!on_disk(""));
+        // The system drive is on a disk wherever the tests run.
+        let system = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        let letter = system.chars().next().unwrap();
+        assert!(on_disk(&dos_device(letter)), "{}", dos_device(letter));
+    }
 
     #[test]
     fn filetime_combines_its_halves() {

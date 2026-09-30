@@ -958,7 +958,7 @@ M4, [`logstore.rs`](../crates/fwterm/src/logstore.rs)).**
 - **Suggest the fastest drive.** `fwterm --choose-log-drive` writes 128 MiB
   durably to each fixed drive, prints MiB/s, p99 and free space, and saves the
   fastest drive with room for the cap as `log_dir`. Since 2026-09-29 fwterm's
-  first run (M5, §11 row 16) makes the same measurement in the window; the
+  first run (M5, §11 row 16) makes the same measurement in the window. Only drives on a disk are offered (2026-09-30, `resmon::volume::fixed`: a drive letter whose device is a disk partition): Google Drive for desktop mounts a virtual G: that calls itself fixed, which the founder's first run listed as a drive that could not be written; the
   banner still suggests the command while logs sit in the default place
   (the first run skipped). First run on the reference machine: C: 215 MiB/s
   (too full), D: 134, E: 451 (p99 2.8 ms), so E: was chosen.
