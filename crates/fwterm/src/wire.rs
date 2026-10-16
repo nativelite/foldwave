@@ -108,12 +108,27 @@ pub struct Update {
 }
 
 /// Works out updates from the host's emulator.
+///
+/// It keeps a copy of every row as last sent and compares the screen with it
+/// in place: no row is read or copied more than once an update, and a row
+/// that did not change costs a compare and nothing else. Scrolling rotates
+/// the copies as the mirror scrolls, so they stay right without being
+/// rebuilt. An update that would change nothing on the mirror is not made
+/// (`None`), so quiet output (a mark, a mode set twice) costs the window
+/// nothing.
 #[derive(Debug, Default)]
 pub struct Sender {
+    /// Row `r` as the mirror shows it: exactly `cols` cells each.
     sent: Vec<Vec<Cell>>,
+    wrapped: Vec<bool>,
     scrolled: u64,
+    held: u64,
     alt: bool,
     size: (usize, usize),
+    cursor: (u16, u16),
+    modes: (bool, bool, vterm::MouseTracking, bool),
+    /// Nothing sent yet.
+    fresh: bool,
 }
 
 fn row_of(s: &Screen, r: usize) -> Vec<Cell> {
@@ -128,41 +143,84 @@ impl Sender {
         let (rows, cols) = (screen.rows(), screen.cols());
         let alt = term.in_alternate_screen();
         let scrolled = history.scrolled_lines().saturating_sub(self.scrolled);
+        let first = !self.fresh;
         let resized = (rows, cols) != self.size;
         let switched = alt != self.alt;
-        // What the mirror shows after it scrolls the same way.
-        if resized || switched {
-            self.sent.clear();
-        } else if !alt {
-            let k = (scrolled as usize).min(self.sent.len());
-            self.sent.drain(..k);
-        }
-        let mut changed = Vec::new();
-        for r in 0..rows {
-            let now = row_of(screen, r);
-            if self.sent.get(r) != Some(&now) {
-                changed.push((r as u16, now));
+        // Bring the copies to what the mirror shows after it applies the
+        // same scroll: blank rows come in at the bottom, as they do there.
+        let blank = Cell::default();
+        if resized || first {
+            self.sent = (0..rows).map(|_| vec![blank; cols]).collect();
+        } else if !alt && scrolled > 0 {
+            let k = (scrolled as usize).min(rows);
+            self.sent.rotate_left(k);
+            for row in &mut self.sent[rows - k..] {
+                row.fill(blank);
             }
         }
-        self.sent = (0..rows).map(|r| row_of(screen, r)).collect();
-        self.scrolled = history.scrolled_lines();
-        self.alt = alt;
-        self.size = (rows, cols);
-        if changed.is_empty() && scrolled == 0 && !resized && !switched {
-            // The cursor alone moved: still worth sending.
+        // The other screen on the mirror may hold anything: send every row.
+        let force = switched || first;
+        let mut changed = Vec::new();
+        for (r, sent) in self.sent.iter_mut().enumerate() {
+            // The row as one slice and the blank past it: compared whole,
+            // copied only where it differs.
+            let (written, fill) = screen.row_cells(r);
+            let n = written.len().min(cols);
+            let same = sent[..n] == written[..n] && sent[n..].iter().all(|c| *c == fill);
+            if same && !force {
+                continue;
+            }
+            sent[..n].copy_from_slice(&written[..n]);
+            sent[n..].fill(fill);
+            changed.push((r as u16, sent.clone()));
         }
         let c = screen.cursor();
+        let cursor = (c.row as u16, c.col as u16);
+        let modes = (
+            term.cursor_visible(),
+            term.bracketed_paste(),
+            term.mouse_tracking(),
+            term.mouse_sgr(),
+        );
+        let held = history.history_len() as u64;
+        let mut wrapped_same = !first && self.wrapped.len() == rows;
+        if wrapped_same {
+            wrapped_same = (0..rows).all(|r| self.wrapped[r] == screen.row_wrapped(r));
+        }
+        if changed.is_empty()
+            && scrolled == 0
+            && !resized
+            && !switched
+            && cursor == self.cursor
+            && modes == self.modes
+            && held == self.held
+            && wrapped_same
+        {
+            return None;
+        }
+        if !wrapped_same {
+            self.wrapped.clear();
+            self.wrapped
+                .extend((0..rows).map(|r| screen.row_wrapped(r)));
+        }
+        self.scrolled = history.scrolled_lines();
+        self.held = held;
+        self.alt = alt;
+        self.size = (rows, cols);
+        self.cursor = cursor;
+        self.modes = modes;
+        self.fresh = true;
         Some(Update {
             scrolled,
-            held: history.history_len() as u64,
+            held,
             alt,
-            cursor_visible: term.cursor_visible(),
-            bracketed_paste: term.bracketed_paste(),
-            mouse: term.mouse_tracking(),
-            mouse_sgr: term.mouse_sgr(),
-            wrapped: (0..rows).map(|r| screen.row_wrapped(r)).collect(),
+            cursor_visible: modes.0,
+            bracketed_paste: modes.1,
+            mouse: modes.2,
+            mouse_sgr: modes.3,
+            wrapped: self.wrapped.clone(),
             rows: changed,
-            cursor: (c.row as u16, c.col as u16),
+            cursor,
             size: (rows as u16, cols as u16),
         })
     }
@@ -328,24 +386,39 @@ fn put_run(out: &mut Vec<u8>, count: u16, c: &Cell) {
 }
 
 /// A row as runs of style then its text: trailing blank cells dropped.
+/// Written straight into `out`, the counts patched in afterwards, so a row
+/// costs no allocation.
 fn put_row(out: &mut Vec<u8>, cells: &[Cell]) {
     let blank = Cell::default();
     let n = cells.iter().rposition(|c| *c != blank).map_or(0, |i| i + 1);
     let cells = &cells[..n.min(u16::MAX as usize)];
-    let mut runs: Vec<(u16, Cell)> = Vec::new();
-    for c in cells {
-        match runs.last_mut() {
-            Some((k, r)) if r.style == c.style && r.width == c.width && *k < u16::MAX => *k += 1,
-            _ => runs.push((1, *c)),
+    let count_at = out.len();
+    out.extend_from_slice(&[0, 0]);
+    let mut runs: u16 = 0;
+    let mut i = 0;
+    while i < cells.len() {
+        let c = &cells[i];
+        let mut k = 1;
+        while i + k < cells.len()
+            && k < u16::MAX as usize
+            && cells[i + k].style == c.style
+            && cells[i + k].width == c.width
+        {
+            k += 1;
         }
+        put_run(out, k as u16, c);
+        runs += 1;
+        i += k;
     }
-    out.extend_from_slice(&(runs.len() as u16).to_le_bytes());
-    for (k, c) in &runs {
-        put_run(out, *k, c);
+    out[count_at..count_at + 2].copy_from_slice(&runs.to_le_bytes());
+    let len_at = out.len();
+    out.extend_from_slice(&[0; 4]);
+    let mut utf8 = [0u8; 4];
+    for c in cells {
+        out.extend_from_slice(c.ch.encode_utf8(&mut utf8).as_bytes());
     }
-    let text: String = cells.iter().map(|c| c.ch).collect();
-    out.extend_from_slice(&(text.len() as u32).to_le_bytes());
-    out.extend_from_slice(text.as_bytes());
+    let len = (out.len() - len_at - 4) as u32;
+    out[len_at..len_at + 4].copy_from_slice(&len.to_le_bytes());
 }
 
 /// Reads a message body, checking every length.
@@ -444,12 +517,13 @@ impl Body<'_> {
     }
 }
 
-fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(5 + body.len());
-    out.push(tag);
-    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-    out.extend_from_slice(body);
-    out
+/// Writes one message: its tag, its length, its body. A `BufWriter` takes
+/// the three writes as one.
+fn write_frame(w: &mut impl Write, tag: u8, body: &[u8]) -> io::Result<()> {
+    let mut head = [tag, 0, 0, 0, 0];
+    head[1..].copy_from_slice(&(body.len() as u32).to_le_bytes());
+    w.write_all(&head)?;
+    w.write_all(body)
 }
 
 fn read_frame(r: &mut impl Read) -> io::Result<(u8, Vec<u8>)> {
@@ -466,7 +540,15 @@ fn read_frame(r: &mut impl Read) -> io::Result<(u8, Vec<u8>)> {
 
 impl FromHost {
     pub fn write(&self, w: &mut impl Write) -> io::Result<()> {
-        let mut b = Vec::new();
+        // Sized for the rows an update carries, so the body grows once.
+        let guess = match self {
+            FromHost::Update(u) => 64 + u.rows.iter().map(|(_, c)| 16 + c.len() * 2).sum::<usize>(),
+            FromHost::History { lines, .. } => {
+                16 + lines.iter().map(|c| 16 + c.len() * 2).sum::<usize>()
+            }
+            _ => 32,
+        };
+        let mut b = Vec::with_capacity(guess);
         let tag = match self {
             FromHost::Update(u) => {
                 b.extend_from_slice(&u.scrolled.to_le_bytes());
@@ -541,7 +623,7 @@ impl FromHost {
                 T_BLOCK
             }
         };
-        w.write_all(&frame(tag, &b))
+        write_frame(w, tag, &b)
     }
 
     pub fn read(r: &mut impl Read) -> io::Result<FromHost> {
@@ -667,7 +749,7 @@ impl ToHost {
                 (T_SIG, b)
             }
         };
-        w.write_all(&frame(tag, &b))
+        write_frame(w, tag, &b)
     }
 
     pub fn read(r: &mut impl Read) -> io::Result<ToHost> {
@@ -756,13 +838,16 @@ mod tests {
                 term.feed(&data[at..at + n]);
                 at += n;
                 if x % 3 == 0 || at == data.len() {
-                    let u = sender.update(&term).unwrap();
-                    // Through the encoding, as it would travel.
-                    let mut bytes = Vec::new();
-                    FromHost::Update(u).write(&mut bytes).unwrap();
-                    match FromHost::read(&mut bytes.as_slice()).unwrap() {
-                        FromHost::Update(u) => mirror.apply(&u),
-                        other => panic!("{other:?}"),
+                    // Through the encoding, as it would travel. A chunk that
+                    // changed nothing visible (part of a sequence) makes no
+                    // update.
+                    if let Some(u) = sender.update(&term) {
+                        let mut bytes = Vec::new();
+                        FromHost::Update(u).write(&mut bytes).unwrap();
+                        match FromHost::read(&mut bytes.as_slice()).unwrap() {
+                            FromHost::Update(u) => mirror.apply(&u),
+                            other => panic!("{other:?}"),
+                        }
                     }
                     assert_eq!(
                         screen_rows(mirror.screen()),
@@ -776,6 +861,49 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn nothing_changed_makes_no_update_and_a_switch_resends_every_row() {
+        let mut term = vterm::Term::with_history(5, 20, 50);
+        let mut sender = Sender::default();
+        let mut mirror = Mirror::new(5, 20);
+        term.feed(b"one\r\ntwo");
+        let u = sender.update(&term).expect("the first update");
+        assert_eq!(u.rows.len(), 5, "every row the first time, blank or not");
+        mirror.apply(&u);
+        assert!(sender.update(&term).is_none(), "nothing changed");
+        // A sequence that changes nothing visible: still nothing.
+        term.feed(b"\x1b[0m");
+        assert!(sender.update(&term).is_none());
+        // The cursor alone moved: an update with no rows.
+        term.feed(b"\x1b[1;1H");
+        let u = sender.update(&term).expect("the cursor moved");
+        assert!(u.rows.is_empty() && u.cursor == (0, 0));
+        mirror.apply(&u);
+        assert!(sender.update(&term).is_none());
+        // A mode alone changed.
+        term.feed(b"\x1b[?25l");
+        let u = sender.update(&term).expect("the cursor hid");
+        assert!(!u.cursor_visible && u.rows.is_empty());
+        mirror.apply(&u);
+        // Into the full-screen buffer and back: the mirror's other screen
+        // may hold anything, so every row travels, blank ones included.
+        term.feed(b"\x1b[?1049h\x1b[2Jfull");
+        let u = sender.update(&term).expect("switched");
+        assert!(u.alt && u.rows.len() == 5);
+        mirror.apply(&u);
+        term.feed(b"\x1b[?1049l");
+        let u = sender.update(&term).expect("switched back");
+        assert!(!u.alt && u.rows.len() == 5);
+        mirror.apply(&u);
+        assert_eq!(screen_rows(mirror.screen()), screen_rows(term.screen()));
+        // One more line: one changed row, and the scroll count.
+        term.feed(b"\x1b[5;1Hlast\r\nnext");
+        let u = sender.update(&term).expect("scrolled");
+        assert_eq!(u.scrolled, 1);
+        mirror.apply(&u);
+        assert_eq!(screen_rows(mirror.screen()), screen_rows(term.screen()));
     }
 
     #[test]
@@ -922,5 +1050,171 @@ mod tests {
         b[at] = 0xFF; // not UTF-8
         assert!(FromHost::read(&mut b.as_slice()).is_err());
         u.rows.clear();
+    }
+}
+
+/// Timing, not asserting. Prints what one screen update costs on a
+/// 47x177 pane (the design's reference pane) in three states: a flood (every
+/// row changes), a keystroke (one row changes) and quiet (nothing changes).
+/// Run in release:
+/// `cargo test --release -p nativelite-fwterm wire::bench -- --ignored --nocapture`
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    const ROWS: usize = 47;
+    const COLS: usize = 177;
+
+    /// Agent-like output: lines of 20-170 characters, a sixth of them
+    /// coloured, with the odd carriage-return progress line.
+    fn agent_output(bytes: usize, seed: u32) -> Vec<u8> {
+        let mut x = seed.max(1);
+        let mut out = Vec::with_capacity(bytes + 256);
+        let mut i = 0u32;
+        while out.len() < bytes {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let len = 20 + (x % 150) as usize;
+            match x % 6 {
+                0 => {
+                    out.extend_from_slice(format!("\x1b[3{}m", 1 + x % 7).as_bytes());
+                    for k in 0..len {
+                        out.push(b'a' + ((k as u32 + x) % 26) as u8);
+                    }
+                    out.extend_from_slice(b"\x1b[0m\r\n");
+                }
+                1 => out.extend_from_slice(format!("\rstep {i} of 1000 [{}%]", x % 100).as_bytes()),
+                _ => {
+                    out.extend_from_slice(format!("{i:>6} ").as_bytes());
+                    for k in 0..len {
+                        out.push(b' ' + ((k as u32 * 7 + x) % 90) as u8);
+                    }
+                    out.extend_from_slice(b"\r\n");
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    #[derive(Default)]
+    struct Phase {
+        update: Vec<Duration>,
+        encode: Vec<Duration>,
+        decode: Vec<Duration>,
+        apply: Vec<Duration>,
+        bytes: Vec<usize>,
+        rows: Vec<usize>,
+        skipped: usize,
+    }
+
+    fn one(p: &mut Phase, sender: &mut Sender, term: &vterm::Term, mirror: &mut Mirror) {
+        let t = Instant::now();
+        let u = sender.update(term);
+        p.update.push(t.elapsed());
+        let Some(u) = u else {
+            p.skipped += 1;
+            return;
+        };
+        let t = Instant::now();
+        let mut b = Vec::new();
+        FromHost::Update(u).write(&mut b).unwrap();
+        p.encode.push(t.elapsed());
+        p.bytes.push(b.len());
+        let t = Instant::now();
+        let u = match FromHost::read(&mut b.as_slice()).unwrap() {
+            FromHost::Update(u) => u,
+            other => panic!("{other:?}"),
+        };
+        p.decode.push(t.elapsed());
+        p.rows.push(u.rows.len());
+        let t = Instant::now();
+        mirror.apply(&u);
+        p.apply.push(t.elapsed());
+    }
+
+    fn med<T: Copy + Ord>(v: &mut [T]) -> Option<T> {
+        v.sort();
+        v.get(v.len() / 2).copied()
+    }
+
+    fn report(name: &str, p: &mut Phase) {
+        let us = |v: &mut Vec<Duration>| {
+            let n = v.len();
+            let m = med(v).unwrap_or_default().as_secs_f64() * 1e6;
+            let p99 = v
+                .get(n.saturating_sub(1) * 99 / 100)
+                .copied()
+                .unwrap_or_default()
+                .as_secs_f64()
+                * 1e6;
+            format!("{m:7.1} / {p99:7.1}")
+        };
+        let total = |p: &Phase| {
+            let sum: Duration = p.update.iter().sum::<Duration>()
+                + p.encode.iter().sum::<Duration>()
+                + p.decode.iter().sum::<Duration>()
+                + p.apply.iter().sum::<Duration>();
+            sum.as_secs_f64() * 1e6 / p.update.len().max(1) as f64
+        };
+        println!(
+            "{name}: {} updates, {} skipped as unchanged",
+            p.update.len(),
+            p.skipped
+        );
+        println!("  (median / p99, microseconds)");
+        println!("  Sender::update       {}", us(&mut p.update));
+        println!("  encode               {}", us(&mut p.encode));
+        println!("  decode               {}", us(&mut p.decode));
+        println!("  Mirror::apply        {}", us(&mut p.apply));
+        println!("  mean total per update {:8.1} us", total(p));
+        println!(
+            "  bytes per update     {:>7} median, rows carried {:>3} median",
+            med(&mut p.bytes).unwrap_or(0),
+            med(&mut p.rows).unwrap_or(0)
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn update_cost_by_state() {
+        let data = agent_output(64 << 20, 7);
+        let mut term = vterm::Term::with_history(ROWS, COLS, 10_000);
+        let mut sender = Sender::default();
+        let mut mirror = Mirror::new(ROWS, COLS);
+        for round in 0..2 {
+            // A flood: 64 KiB between updates, as a 1 GB/min pane leaves
+            // for one 4 ms interval.
+            let mut flood = Phase::default();
+            for chunk in data.chunks(64 * 1024) {
+                term.feed(chunk);
+                one(&mut flood, &mut sender, &term, &mut mirror);
+            }
+            // Typing: one character between updates.
+            let mut key = Phase::default();
+            for i in 0..2000 {
+                term.feed(if i % 60 == 59 { b"\r\n" } else { b"x" });
+                one(&mut key, &mut sender, &term, &mut mirror);
+            }
+            // Quiet: nothing between updates.
+            let mut quiet = Phase::default();
+            for _ in 0..2000 {
+                one(&mut quiet, &mut sender, &term, &mut mirror);
+            }
+            println!("--- round {round}, {ROWS}x{COLS} ---");
+            report("flood (64 KiB per update)", &mut flood);
+            report("keystroke (1 char per update)", &mut key);
+            report("quiet (no output)", &mut quiet);
+            assert_eq!(
+                (0..ROWS)
+                    .map(|r| row_of(mirror.screen(), r))
+                    .collect::<Vec<_>>(),
+                (0..ROWS)
+                    .map(|r| row_of(term.screen(), r))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 }

@@ -130,6 +130,8 @@ pub struct Frame {
     damage: Vec<bool>,
     background: u32,
     scratch: Vec<CellInstance>,
+    /// The source row being resolved, fetched whole.
+    row_cells: Vec<ansi::Cell>,
 }
 
 impl Frame {
@@ -142,6 +144,7 @@ impl Frame {
             damage: Vec::new(),
             background: 0,
             scratch: Vec::new(),
+            row_cells: Vec::new(),
         }
     }
 
@@ -206,7 +209,11 @@ impl Frame {
             screen.rows(),
             screen.cols(),
             at,
-            |r, c| screen.cell(r, c),
+            |r, out: &mut Vec<ansi::Cell>| {
+                let (written, fill) = screen.row_cells(r);
+                out.extend_from_slice(written);
+                out.resize(screen.cols(), fill);
+            },
             palette,
             atlas,
             raster,
@@ -238,11 +245,13 @@ impl Frame {
             rows,
             screen.cols(),
             at,
-            |r, c| {
+            |r, out: &mut Vec<ansi::Cell>| {
                 if r < back {
-                    old[r].get(c).copied().unwrap_or_default()
+                    out.extend_from_slice(&old[r]);
                 } else {
-                    screen.cell(r - back, c)
+                    let (written, fill) = screen.row_cells(r - back);
+                    out.extend_from_slice(written);
+                    out.resize(screen.cols(), fill);
                 }
             },
             palette,
@@ -306,11 +315,13 @@ impl Frame {
             screen.cols(),
             at,
             highlight,
-            |r, c| {
+            |r, out: &mut Vec<ansi::Cell>| {
                 if r < back {
-                    old[r].get(c).copied().unwrap_or_default()
+                    out.extend_from_slice(&old[r]);
                 } else {
-                    screen.cell(r - back, c)
+                    let (written, fill) = screen.row_cells(r - back);
+                    out.extend_from_slice(written);
+                    out.resize(screen.cols(), fill);
                 }
             },
             palette,
@@ -338,7 +349,16 @@ impl Frame {
         raster: &mut dyn Rasterizer,
     ) -> usize {
         self.paint(
-            top, left, rows, cols, cursor, highlight, cell_at, palette, atlas, raster,
+            top,
+            left,
+            rows,
+            cols,
+            cursor,
+            highlight,
+            |r, out: &mut Vec<ansi::Cell>| out.extend((0..cols).map(|c| cell_at(r, c))),
+            palette,
+            atlas,
+            raster,
         )
     }
 
@@ -368,17 +388,19 @@ impl Frame {
         rows: usize,
         cols: usize,
         at: Option<ansi::Cursor>,
-        cell_at: impl Fn(usize, usize) -> ansi::Cell,
+        row_at: impl FnMut(usize, &mut Vec<ansi::Cell>),
         palette: &Palette,
         atlas: &mut Atlas,
         raster: &mut dyn Rasterizer,
     ) -> usize {
         let newly = self.set_grid(rows, cols, palette);
-        newly + self.paint(0, 0, rows, cols, at, None, cell_at, palette, atlas, raster)
+        newly + self.paint(0, 0, rows, cols, at, None, row_at, palette, atlas, raster)
     }
 
-    /// Resolve `rows x cols` cells from `cell_at` into the frame at
-    /// `(top, left)`, clipped to the frame; returns rows newly damaged.
+    /// Resolve `rows x cols` cells into the frame at `(top, left)`, clipped
+    /// to the frame; returns rows newly damaged. `row_at(r, out)` appends
+    /// row `r`'s cells to `out` (fewer than `cols` and the rest are blank);
+    /// a row is fetched once, not a cell at a time.
     #[allow(clippy::too_many_arguments)]
     fn paint(
         &mut self,
@@ -388,7 +410,7 @@ impl Frame {
         cols: usize,
         at: Option<ansi::Cursor>,
         highlight: Option<Highlight>,
-        cell_at: impl Fn(usize, usize) -> ansi::Cell,
+        mut row_at: impl FnMut(usize, &mut Vec<ansi::Cell>),
         palette: &Palette,
         atlas: &mut Atlas,
         raster: &mut dyn Rasterizer,
@@ -396,11 +418,14 @@ impl Frame {
         let mut newly = 0;
         let rows = rows.min(self.rows.saturating_sub(top));
         let cols = cols.min(self.cols.saturating_sub(left));
+        let mut source = std::mem::take(&mut self.row_cells);
         for r in 0..rows {
             self.scratch.clear();
+            source.clear();
+            row_at(r, &mut source);
             let mut lead = ' ';
             for c in 0..cols {
-                let cell = cell_at(r, c);
+                let cell = source.get(c).copied().unwrap_or_default();
                 let s = cell.style;
                 let mut fg = palette.resolve(s.fg, palette.fg, s.bold);
                 let mut bg = palette.resolve(s.bg, palette.bg, false);
@@ -452,6 +477,7 @@ impl Frame {
                 }
             }
         }
+        self.row_cells = source;
         newly
     }
 }
@@ -670,5 +696,140 @@ mod tests {
         let row = f.row(0);
         assert_eq!(row[2].glyph, row[1].glyph + 1);
         assert_eq!(row[3].glyph, 0, "an orphan half draws blank");
+    }
+}
+
+/// Timing, not asserting: what composing one 47x177 pane into the frame
+/// costs, per frame, when every row changed (a flood scrolling), when one
+/// row changed (a keystroke) and when nothing did. Run in release:
+/// `cargo test --release -p nativelite-fwrender frame::bench -- --ignored --nocapture`
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use crate::atlas::{Metrics, TestRasterizer};
+    use ansi::{Cell, Color, Screen, Style};
+    use std::time::{Duration, Instant};
+
+    const ROWS: usize = 47;
+    const COLS: usize = 177;
+
+    fn line(i: usize) -> Vec<Cell> {
+        let style = if i % 6 == 0 {
+            Style {
+                fg: Color::Indexed(1 + (i % 7) as u8),
+                ..Style::default()
+            }
+        } else {
+            Style::default()
+        };
+        let len = 20 + (i * 37) % 150;
+        (0..len)
+            .map(|k| Cell::new((b' ' + ((k * 7 + i) % 90) as u8) as char, style))
+            .collect()
+    }
+
+    fn med(v: &mut [Duration]) -> f64 {
+        v.sort();
+        v[v.len() / 2].as_secs_f64() * 1e6
+    }
+
+    fn p99(v: &mut [Duration]) -> f64 {
+        v.sort();
+        v[(v.len() - 1) * 99 / 100].as_secs_f64() * 1e6
+    }
+
+    #[test]
+    #[ignore]
+    fn compose_cost_by_state() {
+        let m = Metrics {
+            cell_w: 10,
+            cell_h: 20,
+            baseline: 15,
+        };
+        let palette = Palette::default();
+        let mut atlas = Atlas::new(m, 2048, 2048);
+        let mut raster = TestRasterizer { metrics: m };
+        let mut screen = Screen::with_history(ROWS, COLS, 1000);
+        let mut frame = Frame::new();
+        frame.set_grid(ROWS, COLS, &palette);
+        let mut i = 0;
+        for round in 0..2 {
+            let mut flood = Vec::new();
+            for _ in 0..1000 {
+                // A flood: a screen's worth of lines scrolled in per frame.
+                for _ in 0..ROWS {
+                    screen.scroll_rows_up(0, ROWS - 1, 1, Cell::default());
+                    screen.copy_cells(ROWS - 1, 0, &line(i));
+                    i += 1;
+                }
+                let t = Instant::now();
+                frame.update_view_at(
+                    0,
+                    0,
+                    &screen,
+                    &screen,
+                    0,
+                    true,
+                    None,
+                    &palette,
+                    &mut atlas,
+                    &mut raster,
+                );
+                flood.push(t.elapsed());
+                frame.clear_damage();
+            }
+            let mut key = Vec::new();
+            for k in 0..2000 {
+                screen.set(ROWS - 1, k % COLS, Cell::new('x', Style::default()));
+                let t = Instant::now();
+                frame.update_view_at(
+                    0,
+                    0,
+                    &screen,
+                    &screen,
+                    0,
+                    true,
+                    None,
+                    &palette,
+                    &mut atlas,
+                    &mut raster,
+                );
+                key.push(t.elapsed());
+                frame.clear_damage();
+            }
+            let mut quiet = Vec::new();
+            for _ in 0..2000 {
+                let t = Instant::now();
+                frame.update_view_at(
+                    0,
+                    0,
+                    &screen,
+                    &screen,
+                    0,
+                    true,
+                    None,
+                    &palette,
+                    &mut atlas,
+                    &mut raster,
+                );
+                quiet.push(t.elapsed());
+            }
+            println!("--- round {round}, {ROWS}x{COLS}, microseconds per frame (median / p99) ---");
+            println!(
+                "  flood (every row new)   {:7.1} / {:7.1}",
+                med(&mut flood),
+                p99(&mut flood)
+            );
+            println!(
+                "  keystroke (one cell)    {:7.1} / {:7.1}",
+                med(&mut key),
+                p99(&mut key)
+            );
+            println!(
+                "  quiet (no change)       {:7.1} / {:7.1}",
+                med(&mut quiet),
+                p99(&mut quiet)
+            );
+        }
     }
 }

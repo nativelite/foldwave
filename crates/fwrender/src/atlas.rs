@@ -104,6 +104,10 @@ pub struct Atlas {
     capacity: u32,
     pixels: Vec<u8>,
     map: HashMap<GlyphKey, u32>,
+    /// Slot + 1 for a single-width printable ASCII character, by style
+    /// bits then character: the cells of almost every row, found without
+    /// hashing. 0: not rasterized yet.
+    ascii: Box<[[u32; 128]; 4]>,
     next: u32,
     misses: u64,
     /// Pixel rows written since the last [`Atlas::take_dirty`].
@@ -129,6 +133,7 @@ impl Atlas {
             capacity,
             pixels: vec![0; (width * height) as usize],
             map: HashMap::new(),
+            ascii: Box::new([[0; 128]; 4]),
             next: 1,
             misses: 0,
             dirty: None,
@@ -187,7 +192,13 @@ impl Atlas {
     /// The slot for `key`, rasterizing it on first use. A `Left` or `Right`
     /// key rasterizes the whole wide glyph and fills both halves.
     pub fn slot(&mut self, key: GlyphKey, raster: &mut dyn Rasterizer) -> u32 {
-        if let Some(&s) = self.map.get(&key) {
+        let plain = (key.ch as u32) < 128 && key.part == GlyphPart::Single && key.style < 4;
+        if plain {
+            let s = self.ascii[key.style as usize][key.ch as usize];
+            if s != 0 {
+                return s - 1;
+            }
+        } else if let Some(&s) = self.map.get(&key) {
             return s;
         }
         let wide = key.part != GlyphPart::Single;
@@ -224,10 +235,18 @@ impl Atlas {
             self.map.insert(k, first);
             k.part = GlyphPart::Right;
             self.map.insert(k, first + 1);
+            return if key.part == GlyphPart::Left {
+                first
+            } else {
+                first + 1
+            };
+        }
+        if plain {
+            self.ascii[key.style as usize][key.ch as usize] = first + 1;
         } else {
             self.map.insert(key, first);
         }
-        self.map[&key]
+        first
     }
 }
 
@@ -261,6 +280,53 @@ mod tests {
             let row = ((oy + y) * 64 + ox) as usize;
             assert_eq!(&a.pixels()[row..row + 8], &expect[(y * 8) as usize..][..8]);
         }
+    }
+
+    #[test]
+    fn ascii_and_other_glyphs_keep_distinct_stable_slots_per_style() {
+        let mut r = TestRasterizer { metrics: M };
+        let mut a = Atlas::new(M, 128, 128);
+        let plain = a.slot(key('x', GlyphPart::Single), &mut r);
+        let bold = a.slot(
+            GlyphKey {
+                ch: 'x',
+                style: BOLD,
+                part: GlyphPart::Single,
+            },
+            &mut r,
+        );
+        let both = a.slot(
+            GlyphKey {
+                ch: 'x',
+                style: BOLD | ITALIC,
+                part: GlyphPart::Single,
+            },
+            &mut r,
+        );
+        let other = a.slot(key('é', GlyphPart::Single), &mut r);
+        let slots = [plain, bold, both, other];
+        assert!(slots.iter().all(|&s| s != 0), "{slots:?}");
+        assert_eq!(
+            slots.iter().collect::<std::collections::HashSet<_>>().len(),
+            4
+        );
+        // Asked again, each comes back the same without rasterizing.
+        a.take_dirty();
+        assert_eq!(a.slot(key('x', GlyphPart::Single), &mut r), plain);
+        assert_eq!(
+            a.slot(
+                GlyphKey {
+                    ch: 'x',
+                    style: BOLD | ITALIC,
+                    part: GlyphPart::Single,
+                },
+                &mut r
+            ),
+            both
+        );
+        assert_eq!(a.slot(key('é', GlyphPart::Single), &mut r), other);
+        assert_eq!(a.take_dirty(), None);
+        assert_eq!(a.used(), 5);
     }
 
     #[test]

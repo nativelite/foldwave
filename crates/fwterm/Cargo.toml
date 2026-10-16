@@ -13,7 +13,7 @@ repository.workspace = true
 # nativelite core rule: ZERO third-party dependencies; org crates only.
 [dependencies]
 pty = { package = "nativelite-pty", version = "0.4.1", path = "../../../pty-rs" }
-ansi = { package = "nativelite-ansi", version = "0.4.0", path = "../../../ansi-rs" }
+ansi = { package = "nativelite-ansi", version = "0.4.1", path = "../../../ansi-rs" }
 vterm = { package = "nativelite-vterm", version = "0.5.3", path = "../../../vterm-rs" }
 panelog = { package = "nativelite-panelog", version = "0.1.0", path = "../../../panelog-rs" }
 fwrender = { package = "nativelite-fwrender", version = "0.1.0", path = "../fwrender" }
