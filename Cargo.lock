@@ -11,7 +11,7 @@ dependencies = [
 
 [[package]]
 name = "nativelite-ansi"
-version = "0.4.0"
+version = "0.4.1"
 
 [[package]]
 name = "nativelite-fwbench"
@@ -54,6 +54,7 @@ dependencies = [
  "nativelite-fwbench",
  "nativelite-fwcuda",
  "nativelite-fwrender",
+ "nativelite-json",
  "nativelite-panelog",
  "nativelite-pty",
  "nativelite-resmon",

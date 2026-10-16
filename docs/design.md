@@ -1433,6 +1433,22 @@ measure it.
       p99 < 5 ms check on the local display or a 240 fps camera stays
       available, but it is not blocking.
 
+**Composing a pane into the frame, cheaper (2026-10-16).** The frame
+resolved every cell of every visible pane on every frame through
+`Screen::cell` (a row-map and written-count lookup each) and found each
+non-blank glyph's atlas slot through a `HashMap` with std's SipHash. Now a
+row is fetched once as a slice (`ansi::Screen::row_cells`), and printable
+ASCII in the four style combinations is looked up in a direct table; other
+characters and wide glyphs still use the map. Measured with
+`cargo test --release -p nativelite-fwrender frame::bench -- --ignored --nocapture`
+on a 47x177 pane with the test rasterizer, medians over 1,000-2,000 frames,
+**on a Linux VM (not the reference machine)**: a frame with every row new
+167 → 66 µs; one cell changed 175 → 74; nothing changed 174 → 73. The
+remaining cost is per cell (two palette resolves, the cursor and highlight
+checks, the instance compare), so 16 panes at 130 fps compose in ~14 % of a
+core instead of ~35 %. Not yet done: skipping rows the emulator did not
+touch, which the mirror knows exactly and a local `Term` only as a whole.
+
 ### 8.7 The agent layer
 - **Blocks:** prompt, command, output and exit status from shell-integration
   marks (OSC 133 family), plus agent events from a side channel (atrium's bus is
@@ -1519,6 +1535,42 @@ measure it.
     this slice: decisions in the pane log (atrium keeps its own), other
     events (a failed or finished agent), per-agent status, and an atrium
     nested inside another atrium's pane, which keeps no session file.
+  - *Presences, and finished or failed agents (built 2026-10-16; not yet
+    checked in a window, which needs the reference machine: the drawing and
+    the keys below are type-checked for Windows and every pure piece is
+    unit-tested).* The founder's background-agents idea, first cut. The
+    watcher now reads each live atrium's snapshot too (`panes[].role`, the
+    agents atrium lists) and, from its bus, the latest `status=` each agent
+    posted (atrium's fleet rules have agents post `status=done`; `blocked`
+    and `failed` are read as failed, `done` and `completed` as finished,
+    any other word as working). The strip shows `AGENTS 1 ●●◆  3 ✓✗`: one
+    glyph per agent, by fwterm pane, working (plain), waiting on a decision
+    (red ◆), finished (green ✓), failed (red ✗), so an agent behind a zoomed
+    pane is still present. What needs the human is now an *ask* of three
+    kinds: a decision (as before), an agent that finished, an agent that
+    failed; the strip's line names it (`dev_2 finished: work: commit=abc ·
+    item=A (fwterm pane 3)`) and Ctrl+Shift+J focuses its pane, newest not
+    yet looked at first, then cycles. `DECISIONS n` still counts decisions
+    only. No animation yet (the founder's sketch had a small animated
+    presence): a presence changes only when its agent's status does, so an
+    idle window still draws nothing. Open: the glyphs and the status
+    vocabulary are a proposal; an atrium nested inside another atrium's
+    pane keeps no session file and is not seen; a `status=` word in a pane
+    other than its agent's is not placed.
+  - *The activity ribbon (built 2026-10-16, same caveat;
+    [`ribbon.rs`](../crates/fwterm/src/ribbon.rs)).* One column at each
+    pane's right edge (`place_panes` keeps it; the program sees one column
+    fewer), mapping the lines the pane holds in memory onto the pane's rows:
+    a cell per run of lines, `━` in the accent colour where a command
+    started, `█` in the error colour where one failed, and the view's lines
+    on the surface colour, so sixteen panes read at a glance: which is
+    flooding, where the failures are, where you are looking. It is drawn
+    from the pane's blocks, so it costs one pass over them per frame of
+    that pane and nothing when the pane is not drawn; blank while a
+    full-screen program draws. `ribbon = off` (settings file or sheet)
+    hides it. Open: a click on the ribbon jumping the view to those lines;
+    the ribbon while the view is rebuilt from the log (beyond memory, where
+    it marks nothing); output rate as brightness.
 - **Status:** agent session state from transcripts (`agsess`), shown per pane.
 - **Resource accounting per pane:** CPU, memory, disk and GPU share, and the
   job/cgroup limits and compile pool from atrium.
@@ -1966,6 +2018,41 @@ take the ship down.
     through pane hosts: `exit 3` on a scrolled-back command, Ctrl+Up exact
     across a wrapped line, a live fold with the lines above it, and a drag
     past the top edge scrolling back.
+  - **Updates made cheaper (2026-10-16).** Every pane is a host by default
+    (§11 row 11), so what one update costs is paid 16 times, up to 250 a
+    second each under a flood. The host-side diff (`wire::Sender::update`)
+    read every cell of the screen twice through `Screen::cell`, allocated
+    every row twice (one copy to compare, one to keep) and made an update
+    even when nothing had changed; the encoder allocated a run list and a
+    string per row and copied each message once more to frame it. Now the
+    kept rows are compared and updated in place as slices
+    (`ansi::Screen::row_cells`, ansi-rs 0.4.1: the written cells and the
+    row's blank, no copy), scrolling rotates them as the mirror scrolls,
+    rows are written straight into the body, and an update that would
+    change nothing on the mirror (rows, scroll, cursor, modes, wrap marks,
+    held lines all the same) is not sent. Measured with
+    `cargo test --release -p nativelite-fwterm wire::bench -- --ignored --nocapture`
+    on a 47x177 pane, medians over 1,000-2,000 updates, **on a Linux VM
+    (not the reference machine; to be re-measured there, with
+    `fwbench --emit` through `--isolate` for the end-to-end figure)**:
+
+    | per update, µs | before | after |
+    | --- | --- | --- |
+    | diff, flood (every row new, 64 KiB fed) | 126 | 27 |
+    | diff, one keystroke | 148 | 23 |
+    | diff, nothing changed | 150 | 21, and no message |
+    | encode a full screen (47 rows, 5.7 KB) | 39 | 39 |
+    | decode + apply on the window, full screen | 26 | 25 |
+
+    What that is worth: at 250 updates a second a flooding host spent
+    ~3.7 % of a core diffing and now spends ~0.7 %; a quiet host that was
+    woken (a mark, a mode set again) costs the window no decode, apply or
+    redraw. Encoding is unchanged at ~0.85 µs a row and is the next item on
+    this path; the other is pacing updates to the window's frame interval
+    during a sustained flood (the window draws at most once a refresh, so
+    3 of every 4 updates at 60 Hz are applied and never drawn), which
+    trades up to a frame of output latency and needs the reference machine
+    to decide.
   - **The GPU fails alone (2026-09-29).** Until then a failed Vulkan draw
     ended fwterm's loop, and the window and every pane host with it.
     - Renderer: a draw or resize that fails on Vulkan (a lost device or

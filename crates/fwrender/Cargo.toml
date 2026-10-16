@@ -13,7 +13,7 @@ repository.workspace = true
 # (vulkan-1.dll and the Win32 DLLs are loaded or linked from the OS; nothing is
 # redistributed.)
 [dependencies]
-ansi = { package = "nativelite-ansi", version = "0.4.0", path = "../../../ansi-rs" }
+ansi = { package = "nativelite-ansi", version = "0.4.1", path = "../../../ansi-rs" }
 glyphs = { package = "nativelite-glyphs", version = "0.1.0", path = "../../../glyphs-rs" }
 
 [lib]
