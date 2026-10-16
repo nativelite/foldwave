@@ -54,6 +54,7 @@ dependencies = [
  "nativelite-fwbench",
  "nativelite-fwcuda",
  "nativelite-fwrender",
+ "nativelite-json",
  "nativelite-panelog",
  "nativelite-pty",
  "nativelite-resmon",

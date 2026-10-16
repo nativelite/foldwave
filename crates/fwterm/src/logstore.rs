@@ -75,6 +75,9 @@ pub struct Settings {
     pub colors: Vec<(String, String)>,
     /// `instruments = off` hides the instrument strip (on by default).
     pub instruments: Option<bool>,
+    /// `ribbon = off` hides the activity ribbon at each pane's right edge
+    /// (on by default).
+    pub ribbon: Option<bool>,
     /// `font = <family>` and `px = <size>`, unless `--font` / `--px` say.
     pub font: Option<String>,
     pub px: Option<u32>,
@@ -112,6 +115,7 @@ pub fn parse_settings(text: &str) -> Settings {
             }
             "paste_warning" => s.paste_warning = on_off(v),
             "instruments" => s.instruments = on_off(v),
+            "ribbon" => s.ribbon = on_off(v),
             "font" if !v.is_empty() => s.font = Some(v.to_string()),
             "px" => s.px = v.parse::<u32>().ok().filter(|p| (4..=200).contains(p)),
             "shell" if !v.is_empty() => s.shell = Some(v.to_string()),
@@ -542,6 +546,8 @@ mod tests {
             Some(false)
         );
         assert_eq!(parse_settings("").instruments, None);
+        assert_eq!(parse_settings("ribbon = off\n").ribbon, Some(false));
+        assert_eq!(parse_settings("").ribbon, None);
     }
 
     #[test]

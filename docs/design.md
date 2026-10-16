@@ -1535,6 +1535,42 @@ touch, which the mirror knows exactly and a local `Term` only as a whole.
     this slice: decisions in the pane log (atrium keeps its own), other
     events (a failed or finished agent), per-agent status, and an atrium
     nested inside another atrium's pane, which keeps no session file.
+  - *Presences, and finished or failed agents (built 2026-10-16; not yet
+    checked in a window, which needs the reference machine: the drawing and
+    the keys below are type-checked for Windows and every pure piece is
+    unit-tested).* The founder's background-agents idea, first cut. The
+    watcher now reads each live atrium's snapshot too (`panes[].role`, the
+    agents atrium lists) and, from its bus, the latest `status=` each agent
+    posted (atrium's fleet rules have agents post `status=done`; `blocked`
+    and `failed` are read as failed, `done` and `completed` as finished,
+    any other word as working). The strip shows `AGENTS 1 ●●◆  3 ✓✗`: one
+    glyph per agent, by fwterm pane, working (plain), waiting on a decision
+    (red ◆), finished (green ✓), failed (red ✗), so an agent behind a zoomed
+    pane is still present. What needs the human is now an *ask* of three
+    kinds: a decision (as before), an agent that finished, an agent that
+    failed; the strip's line names it (`dev_2 finished: work: commit=abc ·
+    item=A (fwterm pane 3)`) and Ctrl+Shift+J focuses its pane, newest not
+    yet looked at first, then cycles. `DECISIONS n` still counts decisions
+    only. No animation yet (the founder's sketch had a small animated
+    presence): a presence changes only when its agent's status does, so an
+    idle window still draws nothing. Open: the glyphs and the status
+    vocabulary are a proposal; an atrium nested inside another atrium's
+    pane keeps no session file and is not seen; a `status=` word in a pane
+    other than its agent's is not placed.
+  - *The activity ribbon (built 2026-10-16, same caveat;
+    [`ribbon.rs`](../crates/fwterm/src/ribbon.rs)).* One column at each
+    pane's right edge (`place_panes` keeps it; the program sees one column
+    fewer), mapping the lines the pane holds in memory onto the pane's rows:
+    a cell per run of lines, `━` in the accent colour where a command
+    started, `█` in the error colour where one failed, and the view's lines
+    on the surface colour, so sixteen panes read at a glance: which is
+    flooding, where the failures are, where you are looking. It is drawn
+    from the pane's blocks, so it costs one pass over them per frame of
+    that pane and nothing when the pane is not drawn; blank while a
+    full-screen program draws. `ribbon = off` (settings file or sheet)
+    hides it. Open: a click on the ribbon jumping the view to those lines;
+    the ribbon while the view is rebuilt from the log (beyond memory, where
+    it marks nothing); output rate as brightness.
 - **Status:** agent session state from transcripts (`agsess`), shown per pane.
 - **Resource accounting per pane:** CPU, memory, disk and GPU share, and the
   job/cgroup limits and compile pool from atrium.

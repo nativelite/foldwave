@@ -70,6 +70,8 @@ mod logstore;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod mouse;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod ribbon;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod select;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod settings_ui;
@@ -114,6 +116,7 @@ mod app {
     use crate::layout::{neighbor, pane_at, Dir, Layout, PaneId, Placement, Rect, Toward};
     use crate::logstore;
     use crate::mouse;
+    use crate::ribbon;
     use crate::select::{self, Point, Selection};
     use crate::settings_ui;
     use crate::strip;
@@ -169,7 +172,9 @@ options:
                 any installed one; an unknown name lists the monospaced
                 families found
   (instruments = off in the settings file hides the strip of readings
-  under the title bar)
+  under the title bar; ribbon = off hides the activity ribbon at each
+  pane's right edge, which maps the lines the pane holds onto its rows:
+  where commands started, in red where one failed, and where the view is)
   --theme T     colours: mirai (default, foldwave's own) or classic; any
                 colour can be changed in the settings file with
                 color.<name> = #rrggbb (bg, fg, selection, dim, accent,
@@ -2010,22 +2015,38 @@ keys:
     /// raised it (atrium's name for it) and what it asks, and with several
     /// panes, which of fwterm's it is in.
     fn newest_ask(
-        decisions: &[agents::Decision],
+        asks: &[agents::Ask],
         looked_at: &HashSet<(u32, u64, u64)>,
         panes: &[Pane],
     ) -> Option<String> {
-        let d = decisions
-            .iter()
-            .rev()
-            .find(|d| !looked_at.contains(&d.key))?;
+        let d = asks.iter().rev().find(|d| !looked_at.contains(&d.key))?;
         let pane = panes.iter().position(|p| p.id == d.pane)? + 1;
-        let who = d.from.as_deref().unwrap_or("an agent");
         let place = if panes.len() > 1 {
             format!(" (fwterm pane {pane})")
         } else {
             String::new()
         };
-        Some(format!("{who}: {}{place}", d.text))
+        Some(format!("{}{place}", d.label()))
+    }
+
+    /// The agents by pane for the strip: each pane's number (from 1) and
+    /// its agents' statuses, in pane order; panes without agents left out.
+    fn agents_by_pane(
+        agents: &[agents::Agent],
+        panes: &[Pane],
+    ) -> Vec<(usize, Vec<agents::Status>)> {
+        panes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| {
+                let statuses: Vec<agents::Status> = agents
+                    .iter()
+                    .filter(|a| a.pane == p.id)
+                    .map(|a| a.status)
+                    .collect();
+                (!statuses.is_empty()).then_some((i + 1, statuses))
+            })
+            .collect()
     }
 
     /// Where the panes go in a `rows x cols` grid whose top `strip` rows are
@@ -2036,10 +2057,15 @@ keys:
         rows: usize,
         cols: usize,
         strip: usize,
+        ribbon: bool,
     ) -> Placement {
         let mut p = layout.place_zoomed(zoom, rows.saturating_sub(strip).max(1), cols);
         for (_, r) in &mut p.panes {
             r.top += strip;
+            // The activity ribbon takes the pane's rightmost column.
+            if ribbon && r.cols > 1 {
+                r.cols -= 1;
+            }
         }
         for d in &mut p.dividers {
             d.0 += strip;
@@ -2764,6 +2790,7 @@ keys:
             focused: bool,
             selection: Option<&Selection>,
             pipe: bool,
+            ribbon: bool,
             frame: &mut Frame,
             pen: &mut Pen,
         ) {
@@ -3079,6 +3106,57 @@ keys:
                             frame.put(row, r.left + start + i, cell);
                         }
                     }
+                }
+            }
+            // The activity ribbon, in the column right of the pane's cells
+            // (`place_panes` keeps it): what memory holds mapped onto the
+            // rows, commands marked, failed ones in red, the view's lines on
+            // the surface colour. Blank while a full-screen program draws.
+            // A pane of one column kept it (nothing was reserved), so the
+            // ribbon needs two.
+            if ribbon && rows > 0 && r.cols >= 2 {
+                let col = r.left + r.cols;
+                let oldest = scrolled - held as u64;
+                let end = scrolled + rows as u64;
+                let view_top = scrolled.saturating_sub(self.back as u64);
+                let cells = {
+                    let blocks = shared.blocks.lock().unwrap();
+                    ribbon::cells(rows, oldest, end, view_top, blocks.commands())
+                };
+                let alt = term.in_alternate_screen();
+                for (i, c) in cells.iter().enumerate() {
+                    let (ch, fg) = match (alt, c.failed, c.prompt) {
+                        (true, _, _) | (false, false, false) => (' ', pen.theme.dim),
+                        (false, true, _) => ('\u{2588}', pen.theme.error),
+                        (false, false, true) => ('\u{2501}', pen.theme.accent),
+                    };
+                    let glyph = if ch == ' ' {
+                        0
+                    } else {
+                        pen.atlas.slot(
+                            GlyphKey {
+                                ch,
+                                style: 0,
+                                part: GlyphPart::Single,
+                            },
+                            pen.raster,
+                        )
+                    };
+                    let bg = if c.in_view && !alt {
+                        pen.theme.surface
+                    } else {
+                        pen.palette.bg
+                    };
+                    frame.put(
+                        r.top + i,
+                        col,
+                        CellInstance {
+                            glyph,
+                            fg,
+                            bg,
+                            flags: 0,
+                        },
+                    );
                 }
             }
         }
@@ -4517,6 +4595,7 @@ keys:
         let hosts = Arc::new(Mutex::new(governor::Family::default()));
         // The instrument strip takes the grid's top row (design §11 row 17).
         let mut strip_rows = usize::from(settings().1.instruments.unwrap_or(true));
+        let mut ribbon = settings().1.ribbon.unwrap_or(true);
         let cpu_share = Arc::new(AtomicU64::new(NO_READING));
         let busy = if args.governor || strip_rows > 0 {
             let wake = (strip_rows > 0).then(|| surface.window().waker());
@@ -4547,7 +4626,7 @@ keys:
         };
         let ids: Vec<PaneId> = (0..args.panes).collect();
         let mut layout = Layout::grid(&ids);
-        let mut placement = place_panes(&layout, None, grid_rows, grid_cols, strip_rows);
+        let mut placement = place_panes(&layout, None, grid_rows, grid_cols, strip_rows, ribbon);
         let mut panes = placement
             .panes
             .iter()
@@ -4572,7 +4651,7 @@ keys:
             let waker = surface.window().waker();
             agents::watch(pane_roots.clone(), move || waker.wake())
         };
-        let mut decisions: Vec<agents::Decision> = Vec::new();
+        let mut report = agents::Report::default();
         let mut looked_at: HashSet<(u32, u64, u64)> = HashSet::new();
         let mut roots_checked = Instant::now() - agents::EVERY;
         let mut paste_ask: Option<(PaneId, String, usize)> = None;
@@ -4584,7 +4663,7 @@ keys:
         let mut log_free: Option<(Instant, Option<(String, u64)>)> = None;
         // Every pane starts at its real size; a zoom then hides the rest.
         if zoom.is_some() {
-            placement = place_panes(&layout, zoom, grid_rows, grid_cols, strip_rows);
+            placement = place_panes(&layout, zoom, grid_rows, grid_cols, strip_rows, ribbon);
             place_all(&mut panes, &placement);
         }
 
@@ -4786,10 +4865,12 @@ keys:
                                 }
                                 paste_warning = conf.paste_warning.unwrap_or(true);
                                 let rows = usize::from(conf.instruments.unwrap_or(true));
-                                if rows != strip_rows {
+                                let rib = conf.ribbon.unwrap_or(true);
+                                if rows != strip_rows || rib != ribbon {
                                     strip_rows = rows;
+                                    ribbon = rib;
                                     placement = place_panes(
-                                        &layout, zoom, grid_rows, grid_cols, strip_rows,
+                                        &layout, zoom, grid_rows, grid_cols, strip_rows, ribbon,
                                     );
                                     place_all(&mut panes, &placement);
                                 }
@@ -5056,12 +5137,13 @@ keys:
                             layout_dirty = true;
                             continue;
                         }
-                        // Ctrl+Shift+J: show the pane of the newest decision
-                        // not yet looked at (else the next one waiting),
+                        // Ctrl+Shift+J: show the pane of the newest thing
+                        // not yet looked at (a decision waiting, an agent
+                        // finished or failed; else the next one waiting),
                         // zooming to it if another pane is zoomed.
                         if vk == 0x4A && ctrl && shift {
                             let target =
-                                agents::next_to_show(&decisions, &looked_at, focus).cloned();
+                                agents::next_to_show(&report.asks, &looked_at, focus).cloned();
                             if let Some(d) = target {
                                 if panes.iter().any(|p| p.id == d.pane) {
                                     focus = d.pane;
@@ -5234,8 +5316,9 @@ keys:
                         };
                         // Splitting or moving the focus shows every pane again.
                         if (dir.is_some() || toward.is_some()) && zoom.take().is_some() {
-                            placement =
-                                place_panes(&layout, zoom, grid_rows, grid_cols, strip_rows);
+                            placement = place_panes(
+                                &layout, zoom, grid_rows, grid_cols, strip_rows, ribbon,
+                            );
                             place_all(&mut panes, &placement);
                             layout_dirty = true;
                         }
@@ -5249,8 +5332,9 @@ keys:
                             let id = next_id;
                             if room >= 3 && layout.split(focus, dir, id) {
                                 next_id += 1;
-                                placement =
-                                    place_panes(&layout, zoom, grid_rows, grid_cols, strip_rows);
+                                placement = place_panes(
+                                    &layout, zoom, grid_rows, grid_cols, strip_rows, ribbon,
+                                );
                                 let rect = placement
                                     .panes
                                     .iter()
@@ -5266,7 +5350,7 @@ keys:
                                         say!("fwterm: new pane: {e}");
                                         layout.remove(id);
                                         placement = place_panes(
-                                            &layout, zoom, grid_rows, grid_cols, strip_rows,
+                                            &layout, zoom, grid_rows, grid_cols, strip_rows, ribbon,
                                         );
                                     }
                                 }
@@ -5395,7 +5479,8 @@ keys:
                             surface = after_draw_error(surface, e, &atlas, &mut gpu_faults)?;
                         }
                         (grid_rows, grid_cols) = grid(w, h);
-                        placement = place_panes(&layout, zoom, grid_rows, grid_cols, strip_rows);
+                        placement =
+                            place_panes(&layout, zoom, grid_rows, grid_cols, strip_rows, ribbon);
                         place_all(&mut panes, &placement);
                         frame.damage_all();
                         layout_dirty = true;
@@ -5505,8 +5590,8 @@ keys:
             // Agents' open decisions, when they change; the panes' root
             // processes for the watcher, now and then.
             while let Ok(open) = decisions_rx.try_recv() {
-                looked_at.retain(|k| open.iter().any(|d| d.key == *k));
-                decisions = open;
+                looked_at.retain(|k| open.asks.iter().any(|d| d.key == *k));
+                report = open;
                 layout_dirty = true;
             }
             if roots_checked.elapsed() >= agents::EVERY {
@@ -5544,7 +5629,7 @@ keys:
                 }
             }
             if layout_dirty {
-                placement = place_panes(&layout, zoom, grid_rows, grid_cols, strip_rows);
+                placement = place_panes(&layout, zoom, grid_rows, grid_cols, strip_rows, ribbon);
                 place_all(&mut panes, &placement);
             }
             // Hidden panes stop parsing when the governor says so, and catch
@@ -5601,7 +5686,7 @@ keys:
                         .as_ref()
                         .filter(|(id, _)| *id == p.id)
                         .map(|(_, s)| s);
-                    p.draw(p.id == focus, sel, args.pipe, &mut frame, &mut pen);
+                    p.draw(p.id == focus, sel, args.pipe, ribbon, &mut frame, &mut pen);
                     drew = true;
                 }
             }
@@ -5656,8 +5741,13 @@ keys:
                     },
                     hosts: (!isolated.is_empty())
                         .then(|| (isolated.iter().filter(|&&up| up).count(), isolated.len())),
-                    decisions: decisions.len(),
-                    ask: newest_ask(&decisions, &looked_at, &panes),
+                    agents: agents_by_pane(&report.agents, &panes),
+                    decisions: report
+                        .asks
+                        .iter()
+                        .filter(|a| a.kind == agents::AskKind::Decision)
+                        .count(),
+                    ask: newest_ask(&report.asks, &looked_at, &panes),
                 };
                 let line = strip::line(&readings);
                 if relayout || line != strip_line {
@@ -5714,7 +5804,7 @@ keys:
             // Without the strip, a decision not yet looked at shows on the
             // bottom row instead (the search and paste bars come first).
             if strip_rows == 0 && find_bar.is_none() && paste_ask.is_none() {
-                if let Some(ask) = newest_ask(&decisions, &looked_at, &panes) {
+                if let Some(ask) = newest_ask(&report.asks, &looked_at, &panes) {
                     let text = format!(" AGENT › Ctrl+Shift+J · {ask}");
                     draw_bar(
                         &text,

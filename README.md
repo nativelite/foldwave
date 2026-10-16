@@ -6,8 +6,9 @@ output, steered by one human.
 **Status: M5, the beta, under way.** The M4 alpha is met: every performance
 target in the design is measured in `fwterm`, foldwave's terminal (scorecard in
 [`docs/design.md`](docs/design.md) §10.1). Built for the beta so far: the Mirai
-look, a settings sheet, a first run, a one-file installer, and the first slice
-of the agent layer (atrium agents waiting on a decision show in the window).
+look, a settings sheet, a first run, a one-file installer, and the agent layer's
+first slices (atrium's agents and what they need show in the window) and the
+activity ribbon.
 Building happens with
 [atrium](https://github.com/nativelite/atrium) fleets.
 
@@ -49,7 +50,7 @@ The competitive landscape for the whole suite is in
 | Alt+Shift+Plus / Minus / D | split the focused pane right / down / along its longer side |
 | Alt+Arrow, click | move focus between panes |
 | Ctrl+Shift+Z | zoom the focused pane, and back |
-| Ctrl+Shift+J | show the pane of an atrium agent waiting on a decision |
+| Ctrl+Shift+J | show the pane of an atrium agent that needs you: waiting on a decision, finished, or failed |
 | Ctrl+Shift+W | close the focused pane |
 | Ctrl+Shift+F | search every pane's log, and earlier sessions' |
 | Ctrl+Up / Ctrl+Down | jump between commands' prompts |
@@ -58,6 +59,14 @@ The competitive landscape for the whole suite is in
 
 While a program asks for the mouse (atrium with Ctrl+A m, vim, htop), clicks
 and the wheel go to it; hold Shift to select or scroll in foldwave instead.
+
+The instrument strip under the title bar shows the agents atrium runs in the
+panes, one glyph each by pane (working, waiting on a decision, finished,
+failed), so an agent behind a zoomed pane is still present. The activity
+ribbon at each pane's right edge maps the lines the pane holds onto its rows:
+where commands started, in red where one failed, and where the view is.
+`instruments = off` and `ribbon = off` in the settings file (or the settings
+sheet) hide them.
 
 `fwterm --help` lists every option and key.
 

@@ -110,6 +110,13 @@ impl Form {
                     true,
                 ),
                 f(
+                    "Appearance",
+                    "Activity ribbon",
+                    "ribbon",
+                    Value::Switch(s.ribbon.unwrap_or(true)),
+                    true,
+                ),
+                f(
                     "Paste",
                     "Ask before several lines",
                     "paste_warning",
@@ -352,6 +359,7 @@ mod tests {
                 ("font", Some("Cascadia Mono".into())),
                 ("px", Some("72".into())),
                 ("instruments", Some("off".into())),
+                ("ribbon", Some("on".into())),
                 ("paste_warning", Some("on".into())),
                 ("log_dir", None),
                 ("log_cap_gib", Some("10".into())),
@@ -570,7 +578,7 @@ mod render_tests {
             "the theme applies at once"
         );
         // Down to the paste switch: its section shows instead.
-        for _ in 0..4 {
+        for _ in 0..5 {
             f.key(Key::Down);
         }
         let g = render(&f, 90, 20);
@@ -584,7 +592,7 @@ mod render_tests {
             "deep\\".repeat(20)
         )));
         let mut f = Form::new(&s, "mirai");
-        for _ in 0..5 {
+        for _ in 0..6 {
             f.key(Key::Down);
         }
         let g = render(&f, 90, 20);

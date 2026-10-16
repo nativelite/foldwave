@@ -1,8 +1,13 @@
 //! The instrument strip (design §11 row 17): one row under the title bar
 //! reading out what fwterm is doing, `PANES 04 · FOCUS 1 · CPU 0.1 % · LOG
-//! E: 364.1 GB FREE · INDEX CPU · HOSTS 16/16`, and while agents in the panes
-//! wait on a decision (atrium's bus, `agents.rs`), how many and the newest one
-//! not yet looked at. `instruments = off` in the settings file hides it.
+//! E: 364.1 GB FREE · INDEX CPU · HOSTS 16/16`; the agents atrium runs in the
+//! panes, one glyph each by pane (`AGENTS 1 ●●◆  3 ✓✗`: working, waiting on a
+//! decision, finished, failed), so an agent behind a zoomed pane is still
+//! present; and while any wait on a decision, how many and the newest thing
+//! not yet looked at (`agents.rs`). `instruments = off` in the settings file
+//! hides it.
+
+use crate::agents::Status;
 
 /// What the strip reads out.
 #[derive(Debug, Clone, PartialEq)]
@@ -19,10 +24,25 @@ pub struct Readings {
     pub index: &'static str,
     /// Pane hosts running of those started; `None` without any.
     pub hosts: Option<(usize, usize)>,
+    /// The agents in each pane that runs an atrium: the pane's number, from
+    /// 1, and each agent's status in atrium's order. Panes without agents
+    /// are left out.
+    pub agents: Vec<(usize, Vec<Status>)>,
     /// Decisions agents in the panes are waiting on.
     pub decisions: usize,
-    /// The newest of them not yet looked at, as one line.
+    /// The newest thing not yet looked at (a decision, an agent finished or
+    /// failed), as one line.
     pub ask: Option<String>,
+}
+
+/// An agent's presence: one glyph.
+pub fn glyph(s: Status) -> (char, Kind) {
+    match s {
+        Status::Running => ('\u{25CF}', Kind::Value), // ●
+        Status::Waiting => ('\u{25C6}', Kind::Bad),   // ◆
+        Status::Finished => ('\u{2713}', Kind::Good), // ✓
+        Status::Failed => ('\u{2717}', Kind::Bad),    // ✗
+    }
 }
 
 /// How a piece of the strip is drawn.
@@ -61,8 +81,24 @@ pub fn segments(r: &Readings) -> Vec<(String, Kind)> {
         let kind = if up == all { Kind::Good } else { Kind::Bad };
         item("HOSTS", format!("{up}/{all}"), kind);
     }
+    if !r.agents.is_empty() {
+        out.push(("  ·  ".into(), Kind::Label));
+        out.push(("AGENTS ".into(), Kind::Label));
+        for (i, (pane, agents)) in r.agents.iter().enumerate() {
+            if i > 0 {
+                out.push(("  ".into(), Kind::Label));
+            }
+            out.push((format!("{pane} "), Kind::Label));
+            for &s in agents {
+                let (ch, kind) = glyph(s);
+                out.push((ch.to_string(), kind));
+            }
+        }
+    }
     if r.decisions > 0 {
-        item("DECISIONS", r.decisions.to_string(), Kind::Bad);
+        out.push(("  ·  ".into(), Kind::Label));
+        out.push(("DECISIONS ".into(), Kind::Label));
+        out.push((r.decisions.to_string(), Kind::Bad));
     }
     // The key before the message, so a long message is what gets cut.
     if let Some(ask) = &r.ask {
@@ -99,6 +135,7 @@ mod tests {
             log: Some(("E:".into(), 364 * (1 << 30))),
             index: "CPU",
             hosts: Some((16, 16)),
+            agents: Vec::new(),
             decisions: 0,
             ask: None,
         };
@@ -128,10 +165,46 @@ mod tests {
             log: None,
             index: "OFF",
             hosts: None,
+            agents: Vec::new(),
             decisions: 0,
             ask: None,
         };
         assert_eq!(text(&r), " PANES 01  ·  FOCUS 1  ·  CPU —  ·  INDEX OFF");
+    }
+
+    #[test]
+    fn agents_show_one_glyph_each_by_pane() {
+        let r = Readings {
+            panes: 4,
+            focus: 1,
+            cpu: None,
+            log: None,
+            index: "OFF",
+            hosts: None,
+            agents: vec![
+                (1, vec![Status::Running, Status::Running, Status::Waiting]),
+                (3, vec![Status::Finished, Status::Failed]),
+            ],
+            decisions: 1,
+            ask: None,
+        };
+        assert_eq!(
+            text(&r),
+            " PANES 04  ·  FOCUS 1  ·  CPU —  ·  INDEX OFF  ·  AGENTS 1 \u{25CF}\u{25CF}\u{25C6}  3 \u{2713}\u{2717}  ·  DECISIONS 1"
+        );
+        let kinds: Vec<Kind> = segments(&r)
+            .iter()
+            .filter(|(s, _)| {
+                s.chars()
+                    .all(|c| "\u{25CF}\u{25C6}\u{2713}\u{2717}".contains(c))
+            })
+            .map(|(_, k)| *k)
+            .collect();
+        assert_eq!(
+            kinds,
+            [Kind::Value, Kind::Value, Kind::Bad, Kind::Good, Kind::Bad],
+            "working plain, waiting and failed red, finished green"
+        );
     }
 
     #[test]
@@ -143,6 +216,7 @@ mod tests {
             log: None,
             index: "OFF",
             hosts: None,
+            agents: Vec::new(),
             decisions: 2,
             ask: Some("dev_1: deploy: merge?".into()),
         };

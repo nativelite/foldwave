@@ -75,6 +75,14 @@ impl Blocks {
         }
     }
 
+    /// Every command, oldest first: the line it started on (its command
+    /// line, else its prompt) and its exit code if the shell sent one.
+    pub fn commands(&self) -> impl Iterator<Item = (u64, Option<i32>)> + '_ {
+        self.list
+            .iter()
+            .map(|b| (b.command.unwrap_or(b.prompt), b.exit))
+    }
+
     /// Forget blocks whose prompt is before `first`, the oldest line the
     /// pane still holds.
     pub fn forget_before(&mut self, first: u64) {

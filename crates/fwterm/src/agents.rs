@@ -1,14 +1,19 @@
-//! Agent events in foldwave (design §8.7, first slice): an agent run by atrium
-//! in one of fwterm's panes that needs a decision shows in the instrument
-//! strip, wherever that pane is, until it is answered.
+//! Agent events in foldwave (design §8.7): the agents atrium runs in fwterm's
+//! panes, each with a status, and what needs the human: an agent waiting on
+//! a decision, one that finished, one that failed. They show in the
+//! instrument strip wherever their pane is, hidden or not.
 //!
 //! atrium already keeps each running session's bus beside its session
 //! snapshot, `<state>\<project>\<pid>-<started ms>.bus.json`, rewritten at
 //! most every 5 s, and the snapshot itself every 15 s as a heartbeat. So
 //! nothing in atrium changes and no channel is opened: a thread here finds the
 //! sessions with a fresh heartbeat, finds which pane each atrium runs under
-//! from the process tree, and reads the open decisions with atrium's own bus
-//! code (`abus`). A decision leaves when atrium marks it answered.
+//! from the process tree, reads the agents' roles from the snapshot
+//! (`panes[].role`) and the open decisions and each agent's latest
+//! `status=` with atrium's own bus code (`abus`). A decision leaves when
+//! atrium marks it answered; `status=done` and `status=failed` are what
+//! atrium's fleet rules have agents post, so they are read as finished and
+//! failed.
 
 use crate::layout::PaneId;
 use resmon::RawProc;
@@ -41,11 +46,12 @@ pub fn sessions_root(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> 
     set("LOCALAPPDATA").map(|d| PathBuf::from(d).join("atrium").join("sessions"))
 }
 
-/// A running atrium: its process and the bus file beside its snapshot.
+/// A running atrium: its process, its snapshot and the bus file beside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
     pub pid: u32,
     pub started_ms: u64,
+    pub snapshot: PathBuf,
     pub bus: PathBuf,
 }
 
@@ -91,6 +97,7 @@ pub fn live_sessions(root: &Path, now: SystemTime) -> Vec<Session> {
             let s = Session {
                 pid,
                 started_ms,
+                snapshot: f.path(),
                 bus,
             };
             match by_pid.get(&pid) {
@@ -150,23 +157,100 @@ pub fn headline(topic: &str, fields: &BTreeMap<String, String>) -> String {
     line.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// A decision an agent is waiting on, as fwterm shows it.
+/// What an ask is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AskKind {
+    /// An agent waits on a decision (open until atrium marks it answered).
+    Decision,
+    /// An agent said it finished (`status=done`).
+    Finished,
+    /// An agent said it failed (`status=failed`, `blocked`, `error`).
+    Failed,
+}
+
+/// Something that needs the human, as fwterm shows it: a decision an agent
+/// is waiting on, or an agent that finished or failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Decision {
+pub struct Ask {
     pub pane: PaneId,
     /// Unique across sessions: the atrium's pid and start, and the event's
     /// sequence number on its bus.
     pub key: (u32, u64, u64),
+    pub kind: AskKind,
     /// Who raised it (the agent's role or id), if the bus says.
     pub from: Option<String>,
     pub text: String,
     pub ts_ms: u64,
 }
 
-/// The open decisions in a bus file, oldest first: `(seq, from, headline,
-/// ts_ms)`. A missing or unreadable file has none.
-pub fn open_decisions(bus: &Path) -> Vec<(u64, Option<String>, String, u64)> {
-    abus::bus::Bus::with_file(bus.to_path_buf())
+impl Ask {
+    /// One line: who, what became of them, and the event's text.
+    pub fn label(&self) -> String {
+        let who = self.from.as_deref().unwrap_or("an agent");
+        match self.kind {
+            AskKind::Decision => format!("{who}: {}", self.text),
+            AskKind::Finished => format!("{who} finished: {}", self.text),
+            AskKind::Failed => format!("{who} failed: {}", self.text),
+        }
+    }
+}
+
+/// Where an agent stands, from the last it said on the bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Status {
+    /// Nothing said, or a status word that is not an end: working.
+    Running,
+    /// Waiting on a decision.
+    Waiting,
+    Finished,
+    Failed,
+}
+
+/// The status a `status=` word means. atrium's fleet rules have agents post
+/// `status=done`; its board uses `DONE`; `blocked` is what a stuck agent
+/// posts. Anything else is taken as still working.
+pub fn status_of(word: &str) -> Status {
+    match word.trim().to_ascii_lowercase().as_str() {
+        "done" | "finished" | "complete" | "completed" | "ok" | "success" | "succeeded" => {
+            Status::Finished
+        }
+        "failed" | "fail" | "failure" | "error" | "blocked" | "crashed" | "aborted" => {
+            Status::Failed
+        }
+        _ => Status::Running,
+    }
+}
+
+/// An agent in one of the panes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Agent {
+    pub pane: PaneId,
+    pub role: String,
+    pub status: Status,
+}
+
+/// What the watcher reports: everything that needs the human, oldest first,
+/// and every agent, by pane then in the order atrium lists them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Report {
+    pub asks: Vec<Ask>,
+    pub agents: Vec<Agent>,
+}
+
+/// One bus file, read: `(seq, from, headline, ts_ms)` of each open decision,
+/// oldest first, and the latest `status=` event of each agent that posted
+/// one, in the order the agents first did: `(role, seq, status word,
+/// headline without the status, ts_ms)`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BusRead {
+    pub decisions: Vec<(u64, Option<String>, String, u64)>,
+    pub statuses: Vec<(String, u64, String, String, u64)>,
+}
+
+/// Read a bus file. A missing or unreadable file has nothing in it.
+pub fn read_bus(bus: &Path) -> BusRead {
+    let b = abus::bus::Bus::with_file(bus.to_path_buf());
+    let decisions = b
         .pending_decisions()
         .into_iter()
         .map(|e| {
@@ -177,44 +261,157 @@ pub fn open_decisions(bus: &Path) -> Vec<(u64, Option<String>, String, u64)> {
                 e.ts_ms,
             )
         })
+        .collect();
+    let mut statuses: Vec<(String, u64, String, String, u64)> = Vec::new();
+    for e in b.tail(usize::MAX) {
+        let (Some(from), Some(status)) = (&e.from, e.fields.get("status")) else {
+            continue;
+        };
+        let rest: BTreeMap<String, String> = e
+            .fields
+            .iter()
+            .filter(|(k, _)| k.as_str() != "status")
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let entry = (
+            from.clone(),
+            e.seq,
+            status.clone(),
+            headline(&e.topic, &rest),
+            e.ts_ms,
+        );
+        match statuses.iter_mut().find(|s| &s.0 == from) {
+            Some(slot) => *slot = entry,
+            None => statuses.push(entry),
+        }
+    }
+    BusRead {
+        decisions,
+        statuses,
+    }
+}
+
+/// The agents' roles in a session snapshot (`panes[].role`), in atrium's
+/// pane order; panes without a role are left out. Nothing from a file that
+/// is missing or not a snapshot.
+pub fn roles(snapshot: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(snapshot) else {
+        return Vec::new();
+    };
+    let Ok(v) = json::parse(&text) else {
+        return Vec::new();
+    };
+    v.get("panes")
+        .and_then(|p| p.as_array())
+        .map(|panes| {
+            panes
+                .iter()
+                .filter_map(|p| p.get("role").and_then(|r| r.as_str()))
+                .filter(|r| !r.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The agents of one session, under `pane`: those atrium lists, in its
+/// order, then any that only the bus names. An open decision from an agent
+/// makes it waiting, whatever it said last; else its last status word says.
+pub fn agents_of(pane: PaneId, roles: &[String], read: &BusRead) -> Vec<Agent> {
+    let mut names: Vec<&str> = roles.iter().map(String::as_str).collect();
+    for (role, ..) in &read.statuses {
+        if !names.contains(&role.as_str()) {
+            names.push(role);
+        }
+    }
+    names
+        .into_iter()
+        .map(|role| {
+            let waiting = read
+                .decisions
+                .iter()
+                .any(|(_, from, _, _)| from.as_deref() == Some(role));
+            let status = if waiting {
+                Status::Waiting
+            } else {
+                read.statuses
+                    .iter()
+                    .find(|s| s.0 == role)
+                    .map_or(Status::Running, |s| status_of(&s.2))
+            };
+            Agent {
+                pane,
+                role: role.to_string(),
+                status,
+            }
+        })
         .collect()
 }
 
-/// The decision Ctrl+Shift+J shows: the newest not yet looked at; else,
-/// all looked at, the first waiting in another pane than `focus`; else the
-/// first.
-pub fn next_to_show<'a>(
-    decisions: &'a [Decision],
-    looked_at: &std::collections::HashSet<(u32, u64, u64)>,
-    focus: PaneId,
-) -> Option<&'a Decision> {
-    decisions
+/// What needs the human in one session, under `pane`: its open decisions,
+/// and each agent whose last word was an end (finished or failed).
+pub fn asks_of(pane: PaneId, session: (u32, u64), read: &BusRead) -> Vec<Ask> {
+    let mut out: Vec<Ask> = read
+        .decisions
         .iter()
-        .rev()
-        .find(|d| !looked_at.contains(&d.key))
-        .or_else(|| decisions.iter().find(|d| d.pane != focus))
-        .or(decisions.first())
+        .map(|(seq, from, text, ts_ms)| Ask {
+            pane,
+            key: (session.0, session.1, *seq),
+            kind: AskKind::Decision,
+            from: from.clone(),
+            text: text.clone(),
+            ts_ms: *ts_ms,
+        })
+        .collect();
+    for (role, seq, word, text, ts_ms) in &read.statuses {
+        let kind = match status_of(word) {
+            Status::Finished => AskKind::Finished,
+            Status::Failed => AskKind::Failed,
+            _ => continue,
+        };
+        out.push(Ask {
+            pane,
+            key: (session.0, session.1, *seq),
+            kind,
+            from: Some(role.clone()),
+            text: text.clone(),
+            ts_ms: *ts_ms,
+        });
+    }
+    out
 }
 
-/// Watch for decisions, every [`EVERY`], on a thread of its own. `roots` is
+/// The ask Ctrl+Shift+J shows: the newest not yet looked at; else, all
+/// looked at, the first waiting in another pane than `focus`; else the
+/// first.
+pub fn next_to_show<'a>(
+    asks: &'a [Ask],
+    looked_at: &std::collections::HashSet<(u32, u64, u64)>,
+    focus: PaneId,
+) -> Option<&'a Ask> {
+    asks.iter()
+        .rev()
+        .find(|d| !looked_at.contains(&d.key))
+        .or_else(|| asks.iter().find(|d| d.pane != focus))
+        .or(asks.first())
+}
+
+/// Watch the agents, every [`EVERY`], on a thread of its own. `roots` is
 /// every pane's root process, kept current by the window; each change in
-/// the open decisions is sent, then `wake` is called. The thread ends when
+/// what is reported is sent, then `wake` is called. The thread ends when
 /// the receiver is dropped.
 pub fn watch(
     roots: Arc<Mutex<Vec<(PaneId, u32)>>>,
     wake: impl Fn() + Send + 'static,
-) -> Receiver<Vec<Decision>> {
+) -> Receiver<Report> {
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("fwterm agents".into())
         .spawn(move || {
-            let mut last: Vec<Decision> = Vec::new();
-            // Each bus file's last read, by its modification time.
-            #[allow(clippy::type_complexity)]
-            let mut cache: HashMap<
-                PathBuf,
-                (SystemTime, Vec<(u64, Option<String>, String, u64)>),
-            > = HashMap::new();
+            let mut last = Report::default();
+            // Each bus and snapshot file's last read, by modification time.
+            let mut cache: HashMap<PathBuf, (SystemTime, BusRead)> = HashMap::new();
+            let mut role_cache: HashMap<PathBuf, (SystemTime, Vec<String>)> = HashMap::new();
             // Which pane each session's atrium runs under (`None`: none of
             // this window's). A running process keeps its place, so the
             // process list (~5 ms) is read again only for a new session or
@@ -228,7 +425,7 @@ pub fn watch(
                         let live = live_sessions(&root, SystemTime::now());
                         any_live = !live.is_empty();
                         if live.is_empty() {
-                            Vec::new()
+                            Report::default()
                         } else {
                             let roots = roots.lock().map(|r| r.clone()).unwrap_or_default();
                             if roots != placed_for {
@@ -247,38 +444,47 @@ pub fn watch(
                                 }
                             }
                             placed.retain(|k, _| live.iter().any(|s| (s.pid, s.started_ms) == *k));
-                            let mut found = Vec::new();
+                            let mut found = Report::default();
+                            let modified = |p: &Path| {
+                                std::fs::metadata(p)
+                                    .and_then(|m| m.modified())
+                                    .unwrap_or(SystemTime::UNIX_EPOCH)
+                            };
                             for s in &live {
                                 let Some(&Some(pane)) = placed.get(&(s.pid, s.started_ms)) else {
                                     continue;
                                 };
-                                let modified = std::fs::metadata(&s.bus)
-                                    .and_then(|m| m.modified())
-                                    .unwrap_or(SystemTime::UNIX_EPOCH);
-                                let open = match cache.get(&s.bus) {
-                                    Some((t, open)) if *t == modified => open.clone(),
+                                let at = modified(&s.bus);
+                                let read = match cache.get(&s.bus) {
+                                    Some((t, read)) if *t == at => read.clone(),
                                     _ => {
-                                        let open = open_decisions(&s.bus);
-                                        cache.insert(s.bus.clone(), (modified, open.clone()));
-                                        open
+                                        let read = read_bus(&s.bus);
+                                        cache.insert(s.bus.clone(), (at, read.clone()));
+                                        read
                                     }
                                 };
-                                found.extend(open.into_iter().map(|(seq, from, text, ts_ms)| {
-                                    Decision {
-                                        pane,
-                                        key: (s.pid, s.started_ms, seq),
-                                        from,
-                                        text,
-                                        ts_ms,
+                                let at = modified(&s.snapshot);
+                                let roles = match role_cache.get(&s.snapshot) {
+                                    Some((t, roles)) if *t == at => roles.clone(),
+                                    _ => {
+                                        let roles = roles(&s.snapshot);
+                                        role_cache.insert(s.snapshot.clone(), (at, roles.clone()));
+                                        roles
                                     }
-                                }));
+                                };
+                                found
+                                    .asks
+                                    .extend(asks_of(pane, (s.pid, s.started_ms), &read));
+                                found.agents.extend(agents_of(pane, &roles, &read));
                             }
                             cache.retain(|p, _| live.iter().any(|s| &s.bus == p));
-                            found.sort_by_key(|d| (d.ts_ms, d.key));
+                            role_cache.retain(|p, _| live.iter().any(|s| &s.snapshot == p));
+                            found.asks.sort_by_key(|d| (d.ts_ms, d.key));
+                            found.agents.sort_by_key(|a| a.pane);
                             found
                         }
                     }
-                    None => Vec::new(),
+                    None => Report::default(),
                 };
                 if found != last {
                     if tx.send(found.clone()).is_err() {
@@ -369,6 +575,7 @@ mod tests {
             [Session {
                 pid: 100,
                 started_ms: 5,
+                snapshot: p.join("100-5.json"),
                 bus: p.join("100-5.bus.json")
             }]
         );
@@ -422,9 +629,10 @@ mod tests {
 
     #[test]
     fn ctrl_shift_j_shows_the_newest_unseen_then_cycles_through_the_rest() {
-        let d = |pane, seq, ts_ms| Decision {
+        let d = |pane, seq, ts_ms| Ask {
             pane,
             key: (1, 1, seq),
+            kind: AskKind::Decision,
             from: None,
             text: String::new(),
             ts_ms,
@@ -451,43 +659,155 @@ mod tests {
     }
 
     #[test]
-    fn open_decisions_come_from_atriums_own_bus_code() {
+    fn the_bus_gives_open_decisions_and_each_agents_last_status() {
         let root = scratch("bus");
         let path = root.join("1-2.bus.json");
         let mut bus = abus::bus::Bus::with_file(path.clone());
-        let fields = |msg: &str| vec![("msg".to_string(), msg.to_string())];
+        let fields = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<Vec<_>>()
+        };
         use abus::bus::Kind;
         bus.publish(
             "deploy",
             Kind::DecisionNeeded,
             Some("dev_1"),
-            &fields("merge to main?"),
+            &fields(&[("msg", "merge to main?")]),
             1_000,
         )
         .unwrap();
-        bus.publish("status", Kind::Fyi, Some("dev_2"), &fields("built"), 1_001)
-            .unwrap();
+        bus.publish(
+            "status",
+            Kind::Fyi,
+            Some("dev_2"),
+            &fields(&[("msg", "built")]),
+            1_001,
+        )
+        .unwrap();
         let answered = bus
             .publish(
                 "review",
                 Kind::DecisionNeeded,
                 Some("dev_2"),
-                &fields("ship it?"),
+                &fields(&[("msg", "ship it?")]),
                 1_002,
             )
             .unwrap();
         assert!(bus.resolve(answered.seq));
+        // dev_2 works, then is done; dev_3 is blocked.
+        bus.publish(
+            "work",
+            Kind::Fyi,
+            Some("dev_2"),
+            &fields(&[("item", "A"), ("status", "started")]),
+            1_003,
+        )
+        .unwrap();
+        bus.publish(
+            "work",
+            Kind::Fyi,
+            Some("dev_3"),
+            &fields(&[("item", "B"), ("status", "blocked"), ("msg", "no key")]),
+            1_004,
+        )
+        .unwrap();
+        bus.publish(
+            "work",
+            Kind::Fyi,
+            Some("dev_2"),
+            &fields(&[("item", "A"), ("status", "done"), ("commit", "abc")]),
+            1_005,
+        )
+        .unwrap();
         drop(bus);
-        let open = open_decisions(&path);
+        let read = read_bus(&path);
         assert_eq!(
-            open.len(),
+            read.decisions.len(),
             1,
-            "fyi and answered ones are not open: {open:?}"
+            "fyi and answered ones are not open: {read:?}"
         );
-        assert_eq!(open[0].1.as_deref(), Some("dev_1"));
-        assert_eq!(open[0].2, "deploy: merge to main?");
-        assert!(open_decisions(&root.join("none.bus.json")).is_empty());
+        assert_eq!(read.decisions[0].1.as_deref(), Some("dev_1"));
+        assert_eq!(read.decisions[0].2, "deploy: merge to main?");
+        assert_eq!(
+            read.statuses,
+            [
+                (
+                    "dev_2".to_string(),
+                    6,
+                    "done".to_string(),
+                    "work: commit=abc · item=A".to_string(),
+                    1_005
+                ),
+                (
+                    "dev_3".to_string(),
+                    5,
+                    "blocked".to_string(),
+                    "work: no key · item=B".to_string(),
+                    1_004
+                ),
+            ],
+            "the latest per agent, in the order they first posted"
+        );
+        assert_eq!(read_bus(&root.join("none.bus.json")), BusRead::default());
+
+        // The snapshot names the agents; the bus says where they stand.
+        let snap = root.join("1-2.json");
+        std::fs::write(
+            &snap,
+            r#"{"version":2,"layout":{"ids":[0,1,2],"focus":0},"panes":[
+                {"id":0,"role":"lead"},{"id":1,"role":"dev_1"},{"id":2,"role":"dev_2"},
+                {"id":3,"role":null}],"meta":{"pid":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(roles(&snap), ["lead", "dev_1", "dev_2"]);
+        assert!(roles(&root.join("none.json")).is_empty());
+        let agents = agents_of(7, &roles(&snap), &read);
+        let got: Vec<(&str, Status)> = agents.iter().map(|a| (a.role.as_str(), a.status)).collect();
+        assert_eq!(
+            got,
+            [
+                ("lead", Status::Running),
+                ("dev_1", Status::Waiting),
+                ("dev_2", Status::Finished),
+                ("dev_3", Status::Failed),
+            ],
+            "atrium's order, then one only the bus names"
+        );
+        assert!(agents.iter().all(|a| a.pane == 7));
+        let asks = asks_of(7, (1, 2), &read);
+        let got: Vec<(AskKind, String)> = asks.iter().map(|a| (a.kind, a.label())).collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    AskKind::Decision,
+                    "dev_1: deploy: merge to main?".to_string()
+                ),
+                (
+                    AskKind::Finished,
+                    "dev_2 finished: work: commit=abc · item=A".to_string()
+                ),
+                (
+                    AskKind::Failed,
+                    "dev_3 failed: work: no key · item=B".to_string()
+                ),
+            ]
+        );
+        assert_eq!(asks[1].key, (1, 2, 6), "the status event's own sequence");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn status_words_follow_atriums_fleet_rules_and_board() {
+        assert_eq!(status_of("done"), Status::Finished);
+        assert_eq!(status_of("DONE"), Status::Finished);
+        assert_eq!(status_of(" completed "), Status::Finished);
+        assert_eq!(status_of("blocked"), Status::Failed);
+        assert_eq!(status_of("FAILED"), Status::Failed);
+        assert_eq!(status_of("started"), Status::Running);
+        assert_eq!(status_of("review=pending"), Status::Running);
     }
 }
 
