@@ -47,6 +47,7 @@ The competitive landscape for the whole suite is in
 | Keys | Does |
 | --- | --- |
 | Ctrl+Comma | settings |
+| F1 | help: the keys |
 | Alt+Shift+Plus / Minus / D | split the focused pane right / down / along its longer side |
 | Alt+Arrow, click | move focus between panes |
 | Ctrl+Shift+Z | zoom the focused pane, and back |
@@ -66,7 +67,8 @@ failed), so an agent behind a zoomed pane is still present. The activity
 ribbon at each pane's right edge maps the lines the pane holds onto its rows:
 where commands started, in red where one failed, and where the view is.
 `instruments = off` and `ribbon = off` in the settings file (or the settings
-sheet) hide them.
+sheet) hide them. The strip's SETTINGS and HELP buttons, at its right end,
+open the settings sheet and this help.
 
 `fwterm --help` lists every option and key.
 

@@ -121,6 +121,77 @@ pub fn line(r: &Readings) -> Vec<(char, Kind)> {
         .collect()
 }
 
+/// The two buttons at the strip's right end, for whoever does not know the
+/// keys: the settings sheet (Ctrl+,) and the help (F1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Button {
+    Settings,
+    Help,
+}
+
+const SETTINGS: &str = "\u{2699} SETTINGS"; // ⚙ SETTINGS
+const HELP: &str = "? HELP";
+
+/// The buttons as drawn, left to right: two spaces between them and one
+/// after, at the strip's right edge.
+pub fn buttons() -> Vec<(String, Kind)> {
+    vec![
+        (SETTINGS.into(), Kind::Accent),
+        ("  ".into(), Kind::Label),
+        (HELP.into(), Kind::Accent),
+        (" ".into(), Kind::Label),
+    ]
+}
+
+/// How many columns the buttons take, their gap and trailing space included.
+pub fn buttons_width() -> usize {
+    buttons().iter().map(|(s, _)| s.chars().count()).sum()
+}
+
+/// The button a click at column `col` of a `cols`-wide strip hits, if any.
+pub fn button_at(cols: usize, col: usize) -> Option<Button> {
+    let start = cols.checked_sub(buttons_width())?;
+    let settings = SETTINGS.chars().count();
+    let help = HELP.chars().count();
+    let at = col.checked_sub(start)?;
+    if at < settings {
+        Some(Button::Settings)
+    } else if at >= settings + 2 && at < settings + 2 + help {
+        Some(Button::Help)
+    } else {
+        None
+    }
+}
+
+/// The strip's row as drawn `cols` wide: the readings cut so they end at
+/// least two columns before the buttons (a long ask never runs into them),
+/// then the buttons against the right edge. A strip too narrow for the
+/// buttons shows the readings alone.
+pub fn with_buttons(line: &[(char, Kind)], cols: usize) -> Vec<(char, Kind)> {
+    let blank = (' ', Kind::Label);
+    let Some(start) = cols.checked_sub(buttons_width()) else {
+        return (0..cols)
+            .map(|c| line.get(c).copied().unwrap_or(blank))
+            .collect();
+    };
+    let cut = start.saturating_sub(2);
+    let tail: Vec<(char, Kind)> = buttons()
+        .into_iter()
+        .flat_map(|(s, k)| s.chars().map(move |c| (c, k)).collect::<Vec<_>>())
+        .collect();
+    (0..cols)
+        .map(|c| {
+            if c < cut {
+                line.get(c).copied().unwrap_or(blank)
+            } else if c >= start {
+                tail[c - start]
+            } else {
+                blank
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,5 +316,72 @@ mod tests {
             text(&seen).ends_with("DECISIONS 2"),
             "the count stays until answered"
         );
+    }
+
+    #[test]
+    fn a_click_on_a_button_names_it_and_the_gap_and_the_readings_miss() {
+        // 40 columns: the buttons take the last 19, from column 21.
+        assert_eq!(buttons_width(), 19);
+        let start = 40 - 19;
+        assert_eq!(button_at(40, start), Some(Button::Settings));
+        assert_eq!(button_at(40, start + 9), Some(Button::Settings));
+        assert_eq!(button_at(40, start + 10), None, "the gap");
+        assert_eq!(button_at(40, start + 11), None, "the gap");
+        assert_eq!(button_at(40, start + 12), Some(Button::Help));
+        assert_eq!(button_at(40, start + 17), Some(Button::Help));
+        assert_eq!(button_at(40, start + 18), None, "the trailing space");
+        assert_eq!(button_at(40, 0), None, "the readings");
+        assert_eq!(button_at(40, start - 1), None, "just left of them");
+        assert_eq!(button_at(10, 5), None, "too narrow for the buttons");
+    }
+
+    #[test]
+    fn the_buttons_sit_at_the_right_edge_and_a_long_ask_stops_short_of_them() {
+        let r = Readings {
+            panes: 2,
+            focus: 1,
+            cpu: None,
+            log: None,
+            index: "OFF",
+            hosts: None,
+            agents: Vec::new(),
+            decisions: 1,
+            ask: Some("dev_1: deploy: merge this very long branch name now?".into()),
+        };
+        let row = with_buttons(&line(&r), 60);
+        let s: String = row.iter().map(|(c, _)| *c).collect();
+        assert_eq!(s.chars().count(), 60);
+        assert!(s.ends_with("  \u{2699} SETTINGS  ? HELP "), "{s:?}");
+        assert!(s.starts_with(" PANES 02  ·  FOCUS 1"), "{s:?}");
+        // The readings end two blank columns before the buttons.
+        let start = 60 - buttons_width();
+        assert_eq!(&s[..].chars().nth(start - 1), &Some(' '));
+        assert_eq!(&s[..].chars().nth(start - 2), &Some(' '));
+        assert_ne!(row[start - 3].0, ' ', "the ask fills up to the cut");
+        assert_eq!(row[start].1, Kind::Accent);
+        assert_eq!(row[start + 12].1, Kind::Accent);
+        // Short readings leave the middle blank.
+        let short = Readings {
+            ask: None,
+            decisions: 0,
+            ..r
+        };
+        let s: String = with_buttons(&line(&short), 80)
+            .iter()
+            .map(|(c, _)| *c)
+            .collect();
+        assert_eq!(
+            s,
+            format!(
+                "{:<61}\u{2699} SETTINGS  ? HELP ",
+                " PANES 02  ·  FOCUS 1  ·  CPU —  ·  INDEX OFF"
+            )
+        );
+        // Too narrow for them: the readings alone.
+        let s: String = with_buttons(&line(&short), 10)
+            .iter()
+            .map(|(c, _)| *c)
+            .collect();
+        assert_eq!(s, " PANES 02 ");
     }
 }

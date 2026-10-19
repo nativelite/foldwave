@@ -56,6 +56,8 @@ mod fold;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod governor;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod help;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod hostlines;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod icon;
@@ -103,6 +105,7 @@ mod app {
     use crate::blocks;
     use crate::emu::Emu;
     use crate::fold;
+    use crate::help;
     use crate::hostlines;
     use crate::icon;
     use crate::wire;
@@ -249,35 +252,13 @@ options:
                 frames, frames per second, gaps between frames
 
 keys:
-  Alt+Shift+Plus    split the focused pane, the new one to the right
-  Alt+Shift+Minus   split it, the new one below
-  Alt+Shift+D       split it along its longer side
-  Alt+Arrow, click  focus the pane in that direction / under the pointer
-  Ctrl+Comma        settings: theme, font, size, the paste question, the
-                    instrument strip, logs, shell (saved to fwterm.conf)
-  Ctrl+Shift+W      close the focused pane (the last one closes the window)
-  Ctrl+Shift+Z      zoom the focused pane to the whole window, or back
-  Ctrl+Shift+J      show the pane of an agent waiting on a decision (atrium's
-                    bus; the instrument strip counts them), then the next
-  Ctrl+Up/Down      jump to the previous / next command's prompt
-  Ctrl+Shift+O      select a command's output (then Ctrl+C copies it)
-  Ctrl+Shift+[ / ]  fold that command's output to one line / unfold
-  Ctrl+Shift+F      search every pane's log, and earlier sessions' in the same
-                    log folder: type, Enter searches, Enter /
-                    Shift+Enter step through hits (newest first), Esc closes;
-                    /pattern/ is a regular expression (. [a-z] \\d \\w \\s
-                    * + ? {m,n} | ( ) ^ $), case ignored like text
-  drag, double-click   select text in a pane / select a word
-                    (a program that asked for the mouse gets clicks, drags
-                    and the wheel instead; Shift keeps them foldwave's)
-  Ctrl+Shift+C      copy the selection (Ctrl+C too while there is one;
-                    otherwise Ctrl+C goes to the program)
-  Ctrl+V, Ctrl+Shift+V   paste; several lines into a program that did not
-                    ask for bracketed paste (a shell runs each) ask first:
-                    Enter pastes, Esc cancels (paste_warning = off in the
-                    settings file pastes at once)
-  Shift+PgUp/PgDn, wheel   scroll the focused pane back / forward
 ";
+
+    /// The usage text: the options, then the keys from `help::KEYS`, the
+    /// list the help sheet (F1) shows.
+    fn usage() -> String {
+        format!("{USAGE}{}", help::usage_keys())
+    }
 
     #[derive(Clone)]
     struct Args {
@@ -382,7 +363,7 @@ keys:
         };
         while i < argv.len() {
             match argv[i].as_str() {
-                "-h" | "--help" => return Err(USAGE.into()),
+                "-h" | "--help" => return Err(usage()),
                 "--backend" => {
                     a.backend = value(&mut i, "--backend")?;
                     if a.backend != "vulkan" && a.backend != "cpu" {
@@ -575,7 +556,7 @@ keys:
                     }
                     break;
                 }
-                other => return Err(format!("unknown argument {other:?}\n\n{USAGE}")),
+                other => return Err(format!("unknown argument {other:?}\n\n{}", usage())),
             }
         }
         Ok(a)
@@ -2075,12 +2056,13 @@ keys:
         p
     }
 
-    /// Draw the instrument strip across grid row 0.
+    /// Draw the instrument strip across grid row 0: the readings, cut short
+    /// of the SETTINGS and HELP buttons at the right edge.
     fn draw_strip(line: &[(char, strip::Kind)], cols: usize, frame: &mut Frame, pen: &mut Pen) {
         let t = pen.theme;
         let bg = t.surface;
-        for col in 0..cols {
-            let (ch, kind) = line.get(col).copied().unwrap_or((' ', strip::Kind::Label));
+        let row = strip::with_buttons(line, cols);
+        for (col, &(ch, kind)) in row.iter().enumerate() {
             let fg = match kind {
                 strip::Kind::Label => t.dim,
                 strip::Kind::Value => t.palette.fg,
@@ -4654,6 +4636,9 @@ keys:
         let mut paste_warning = settings().1.paste_warning.unwrap_or(true);
         // The settings sheet, while open (Ctrl+,).
         let mut sheet: Option<settings_ui::Form> = None;
+        // The help sheet (F1, or ? HELP in the strip); never open with the
+        // settings sheet.
+        let mut help_sheet: Option<help::Sheet> = None;
         // Decisions agents in the panes wait on (atrium's bus, design §8.7),
         // the ones already looked at with Ctrl+Shift+J, and each pane's root
         // process for the watcher to place atrium's under.
@@ -4888,6 +4873,64 @@ keys:
                                 frame.damage_all();
                                 sheet = None;
                             }
+                        }
+                        layout_dirty = true;
+                    }
+                    continue;
+                }
+                // The help sheet takes every key and click while open: Esc,
+                // Enter, F1 and a click close it; the arrows, the page keys
+                // and the wheel scroll it.
+                if let Some(h) = help_sheet.as_mut() {
+                    use settings_ui::Key as K;
+                    let key = match *e {
+                        Event::Char(_) if drop_char => {
+                            drop_char = false;
+                            continue;
+                        }
+                        Event::Char('\r') => K::Enter,
+                        Event::Char('\u{1b}') => K::Esc,
+                        Event::Char(_) => continue,
+                        Event::Key {
+                            vk: 0x26,
+                            down: true,
+                        } => K::Up,
+                        Event::Key {
+                            vk: 0x28,
+                            down: true,
+                        } => K::Down,
+                        Event::Key {
+                            vk: 0x21,
+                            down: true,
+                        } => K::PageUp,
+                        Event::Key {
+                            vk: 0x22,
+                            down: true,
+                        } => K::PageDown,
+                        // F1 again, or a click anywhere: closed.
+                        Event::Key {
+                            vk: 0x70,
+                            down: true,
+                        }
+                        | Event::Click(..)
+                        | Event::DoubleClick(..) => K::Esc,
+                        Event::Wheel(delta) => {
+                            let lines = (delta.unsigned_abs() as usize * 3).div_euclid(120).max(1);
+                            for _ in 0..lines {
+                                h.key(if delta > 0 { K::Up } else { K::Down });
+                            }
+                            layout_dirty = true;
+                            continue;
+                        }
+                        Event::Key { .. }
+                        | Event::SysKey { .. }
+                        | Event::Drag(..)
+                        | Event::Release(..) => continue,
+                        _ => K::Char('\u{0}'),
+                    };
+                    if key != K::Char('\u{0}') {
+                        if h.key(key) {
+                            help_sheet = None;
                         }
                         layout_dirty = true;
                     }
@@ -5144,7 +5187,15 @@ keys:
                         // Ctrl+, : the settings sheet.
                         // (Ctrl+, types no character, so none is dropped.)
                         if vk == 0xBC && ctrl && !shift {
+                            help_sheet = None;
                             sheet = Some(settings_ui::Form::new(&settings().1, &theme_name));
+                            layout_dirty = true;
+                            continue;
+                        }
+                        // F1: the help sheet, the keys. (It types no
+                        // character either.)
+                        if vk == 0x70 && !ctrl && !shift && !fwrender::win::alt_down() {
+                            help_sheet = Some(help::Sheet::new());
                             layout_dirty = true;
                             continue;
                         }
@@ -5382,6 +5433,25 @@ keys:
                             y as usize / m.cell_h as usize,
                             x as usize / m.cell_w as usize,
                         );
+                        // The strip's buttons; the rest of the strip takes
+                        // the click and does nothing with it.
+                        if strip_rows > 0 && row == 0 {
+                            match strip::button_at(grid_cols, col) {
+                                Some(strip::Button::Settings) => {
+                                    help_sheet = None;
+                                    sheet =
+                                        Some(settings_ui::Form::new(&settings().1, &theme_name));
+                                    layout_dirty = true;
+                                }
+                                Some(strip::Button::Help) => {
+                                    sheet = None;
+                                    help_sheet = Some(help::Sheet::new());
+                                    layout_dirty = true;
+                                }
+                                None => {}
+                            }
+                            continue;
+                        }
                         clear(&mut selection, &panes);
                         press = None;
                         if let Some(id) = pane_at(&placement.panes, row, col) {
@@ -5856,6 +5926,18 @@ keys:
                 let cells = settings_ui::render(form, w, h);
                 let (top, left) = (
                     grid_rows.saturating_sub(h) / 2,
+                    grid_cols.saturating_sub(w) / 2,
+                );
+                draw_sheet(&cells, top, left, &mut frame, &mut pen);
+                drew = true;
+            }
+            // The help sheet, the same way.
+            if let Some(h) = &help_sheet {
+                let w = grid_cols.saturating_sub(4).min(96);
+                let h_rows = grid_rows.saturating_sub(2).min(22);
+                let cells = h.render(w, h_rows);
+                let (top, left) = (
+                    grid_rows.saturating_sub(h_rows) / 2,
                     grid_cols.saturating_sub(w) / 2,
                 );
                 draw_sheet(&cells, top, left, &mut frame, &mut pen);

@@ -41,6 +41,9 @@ pub enum Action {
 pub enum Key {
     Up,
     Down,
+    /// The help sheet's page keys; the settings sheet ignores them.
+    PageUp,
+    PageDown,
     Left,
     Right,
     Enter,
