@@ -2278,6 +2278,14 @@ keys:
             altscreen::visible(self.total, &self.alt)
         }
 
+        /// How far back a view of `rows` rows can go: its top row is the
+        /// first line of the log, as memory's clamp puts the oldest held
+        /// line at the top. Any further and the view's bottom would climb
+        /// through the log, leaving blank rows below the last line shown.
+        fn deepest(&self, rows: usize) -> u64 {
+            self.visible().saturating_sub(rows as u64)
+        }
+
         /// The log line a view `back` lines above live ends before.
         fn line_back(&self, back: u64) -> u64 {
             altscreen::line_back(self.total, &self.alt, back)
@@ -2868,7 +2876,7 @@ keys:
                     self.deep = self.pane_dir.as_deref().and_then(|f| Deep::open(f).ok());
                 }
                 if let Some(d) = self.deep.as_mut() {
-                    self.back = self.back.min(d.visible() as usize);
+                    self.back = self.back.min(d.deepest(rows) as usize);
                     // The view's bottom is `back` lines above live, in log
                     // lines (a wrapped line counts once here, once per row in
                     // memory, so the hand-over is approximate), not counting
@@ -6197,6 +6205,44 @@ keys:
             let mut d = Deep::open(&pane).unwrap();
             assert_eq!(d.total, 11);
             assert_eq!(at(&mut d, 5).1, "L14");
+            let _ = std::fs::remove_dir_all(&pane);
+        }
+
+        #[test]
+        fn scrolling_back_past_the_log_stops_with_its_first_line_on_top() {
+            let pane = std::env::temp_dir().join(format!("fwterm-deepest-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&pane);
+            std::fs::create_dir_all(&pane).unwrap();
+            let cfg = panelog::Config::default();
+            {
+                let mut w =
+                    panelog::Writer::create(&pane.join(logstore::gen_name(1, 0)), cfg).unwrap();
+                w.append(&lines(0..10), 0).unwrap();
+            }
+            let mut d = Deep::open(&pane).unwrap();
+            let (rows, cols) = (4, 10);
+            // The wheel asked for far more than the log holds: the view
+            // stops where the first line is the top row and the screen is
+            // still full, as memory's clamp stops at the oldest held line.
+            let back = (1_000u64).min(d.deepest(rows));
+            let end = d.line_back(back);
+            assert_eq!(end, rows as u64, "the view ends after the first screen");
+            d.rebuild(end.max(1), rows, cols, false).unwrap();
+            assert_eq!(
+                (0..rows).map(|r| row(&d.term, r)).collect::<Vec<_>>(),
+                ["L0", "L1", "L2", "L3"]
+            );
+            // Capped at the whole log instead, the view ends after line 0:
+            // one line and blank rows under it, the history gone.
+            let end = d.line_back(d.visible());
+            d.rebuild(end.max(1), rows, cols, false).unwrap();
+            assert_eq!(
+                (0..rows).map(|r| row(&d.term, r)).collect::<Vec<_>>(),
+                ["L0", "", "", ""],
+                "what the old cap showed"
+            );
+            // A log shorter than a screen has nowhere to scroll to.
+            assert_eq!(d.deepest(100), 0);
             let _ = std::fs::remove_dir_all(&pane);
         }
 
