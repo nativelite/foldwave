@@ -2,7 +2,9 @@
 //! the panes. It edits what `fwterm.conf` holds and saves it there, other
 //! lines kept. Keys: Up/Down (or Tab) move, Left/Right change a choice, a
 //! switch or a number, Enter edits text and numbers or presses a button,
-//! Ctrl+S saves, Esc closes.
+//! Ctrl+S saves, Esc closes. Mouse: a click on a row selects it, on a value
+//! does what Enter does there (the `‹` of a choice steps back), on a section
+//! shows it, on a button presses it; the wheel moves.
 
 use crate::logstore::Settings;
 
@@ -240,6 +242,68 @@ impl Form {
         Action::None
     }
 
+    /// Act on a click at cell `(row, col)` of the sheet drawn `w x h` (the
+    /// same `w, h` as [`render`]; the cell relative to the sheet's top-left).
+    /// A click while typing first takes the text, as Enter would. A click on
+    /// the frame, the hints or empty space does nothing.
+    pub fn click(&mut self, row: usize, col: usize, w: usize, h: usize) -> Action {
+        if self.editing.is_some() {
+            self.key(Key::Enter);
+        }
+        let l = Layout::of(w, h);
+        if row == l.button_row {
+            if (l.save_col..l.save_col + SAVE.len()).contains(&col) {
+                return Action::Save(self.values());
+            }
+            if (l.cancel_col..l.cancel_col + CANCEL.len()).contains(&col) {
+                return Action::Close;
+            }
+            return Action::None;
+        }
+        // A section, left of the rule: its first field gets the focus.
+        if col < NAV {
+            if let Some(s) = SECTIONS
+                .iter()
+                .enumerate()
+                .find(|(i, _)| Layout::section_row(*i) == row)
+                .map(|(_, s)| *s)
+            {
+                if let Some(i) = self.fields.iter().position(|f| f.section == s) {
+                    self.at = i;
+                }
+            }
+            return Action::None;
+        }
+        // A field of the section shown: selected, and its value acted on.
+        if !(l.left - 1..l.w - 2).contains(&col) {
+            return Action::None;
+        }
+        let on = self.section();
+        let hit = self
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.section == on)
+            .enumerate()
+            .find(|(n, _)| Layout::field_row(*n) == row)
+            .map(|(_, (i, _))| i);
+        if let Some(i) = hit {
+            self.at = i;
+            let value_col = l.left + VALUE;
+            if col == value_col && matches!(self.fields[i].value, Value::Choice(..)) {
+                self.key(Key::Left);
+            } else if col >= value_col {
+                self.key(Key::Enter);
+            }
+        }
+        Action::None
+    }
+
+    /// The wheel: a notch moves the focus as Up or Down would.
+    pub fn scroll(&mut self, up: bool) {
+        self.key(if up { Key::Up } else { Key::Down });
+    }
+
     /// Every field as the settings file writes it.
     pub fn values(&self) -> Vec<(&'static str, Option<String>)> {
         self.fields
@@ -461,16 +525,67 @@ pub fn panel(w: usize, h: usize, title: &str) -> Vec<Vec<Cell>> {
     g
 }
 
+/// The sheet is never drawn smaller than this: `(w, h)` as [`render`] takes
+/// them, as it draws them.
+pub fn fitted(w: usize, h: usize) -> (usize, usize) {
+    (w.max(40), h.max(12))
+}
+
+/// The column of the rule between the sections and the fields.
+const NAV: usize = 20;
+/// A value starts this many columns after its label.
+const VALUE: usize = 26;
+const SAVE: &str = "[ SAVE ]";
+const CANCEL: &str = "[ CANCEL ]";
+
+/// Where the sheet drawn `w x h` puts things: one place for [`render`] and
+/// [`Form::click`], so a change in the drawing cannot leave a click behind.
+struct Layout {
+    w: usize,
+    h: usize,
+    /// Where a field's label starts; its value at `left + VALUE`.
+    left: usize,
+    /// The buttons' row, and each button's first column.
+    button_row: usize,
+    save_col: usize,
+    cancel_col: usize,
+}
+
+impl Layout {
+    fn of(w: usize, h: usize) -> Layout {
+        let (w, h) = fitted(w, h);
+        let cancel_col = w - 3 - CANCEL.len();
+        Layout {
+            w,
+            h,
+            left: NAV + 3,
+            button_row: h - 3,
+            save_col: cancel_col - 2 - SAVE.len(),
+            cancel_col,
+        }
+    }
+
+    /// The row section `i` is named on.
+    fn section_row(i: usize) -> usize {
+        2 + i * 2
+    }
+
+    /// The row the `n`th field of the section shown is on.
+    fn field_row(n: usize) -> usize {
+        2 + n * 2
+    }
+}
+
 /// The sheet drawn `w x h` cells: a frame with accent corners, the sections
 /// down the left, the focused section's fields on the right, the buttons
 /// and a line of keys at the bottom.
 pub fn render(form: &Form, w: usize, h: usize) -> Vec<Vec<Cell>> {
-    let (w, h) = (w.max(40), h.max(12));
+    let l = Layout::of(w, h);
+    let (w, h) = (l.w, l.h);
     let mut g = panel(w, h, " [ SETTINGS ] ");
     // The sections, and the line between them and the fields.
-    let nav = 20;
     for r in 2..h - 4 {
-        put(&mut g, r, nav, "│", Paint::Rule, false);
+        put(&mut g, r, NAV, "│", Paint::Rule, false);
     }
     let on = form.section();
     for (i, s) in SECTIONS.iter().enumerate() {
@@ -479,17 +594,25 @@ pub fn render(form: &Form, w: usize, h: usize) -> Vec<Vec<Cell>> {
         } else {
             ("  ", Paint::Nav)
         };
-        put(&mut g, 2 + i * 2, 3, &format!("{mark}{s}"), paint, false);
+        put(
+            &mut g,
+            Layout::section_row(i),
+            3,
+            &format!("{mark}{s}"),
+            paint,
+            false,
+        );
     }
     // The focused section's fields.
-    let left = nav + 3;
-    let mut r = 2;
-    for (i, f) in form
+    let left = l.left;
+    for (n, (i, f)) in form
         .fields
         .iter()
         .enumerate()
         .filter(|(_, f)| f.section == on)
+        .enumerate()
     {
+        let r = Layout::field_row(n);
         let sel = i == form.at;
         if sel {
             for c in left - 1..w - 2 {
@@ -499,7 +622,7 @@ pub fn render(form: &Form, w: usize, h: usize) -> Vec<Vec<Cell>> {
         put(&mut g, r, left, f.label, Paint::Label, sel);
         // The value, cut to what fits before its note.
         let note = if f.live { "" } else { "next start" };
-        let room = (w - 3 - note.len()).saturating_sub(left + 26 + 1);
+        let room = (w - 3 - note.len()).saturating_sub(left + VALUE + 1);
         let shown = form.shown(i);
         let shown: String = if shown.chars().count() > room {
             shown
@@ -510,30 +633,26 @@ pub fn render(form: &Form, w: usize, h: usize) -> Vec<Vec<Cell>> {
         } else {
             shown
         };
-        put(&mut g, r, left + 26, &shown, Paint::Value, sel);
+        put(&mut g, r, left + VALUE, &shown, Paint::Value, sel);
         if !note.is_empty() {
             put(&mut g, r, w - 3 - note.len(), note, Paint::Note, sel);
         }
-        r += 2;
     }
     // The buttons.
-    let (save, cancel) = ("[ SAVE ]", "[ CANCEL ]");
-    let br = h - 3;
-    let cx = w - 3 - cancel.len();
-    let sx = cx - 2 - save.len();
+    let br = l.button_row;
     put(
         &mut g,
         br,
-        sx,
-        save,
+        l.save_col,
+        SAVE,
         Paint::Button,
         form.at == form.fields.len(),
     );
     put(
         &mut g,
         br,
-        cx,
-        cancel,
+        l.cancel_col,
+        CANCEL,
         Paint::Button,
         form.at == form.fields.len() + 1,
     );
@@ -601,5 +720,95 @@ mod render_tests {
         let g = render(&f, 90, 20);
         let row = text(&g, 2);
         assert!(row.contains("… next start"), "{row}");
+    }
+
+    /// Where `s` is on the rendered sheet: `(row, col)` of its first cell.
+    fn find(g: &[Vec<Cell>], s: &str) -> (usize, usize) {
+        let want: Vec<char> = s.chars().collect();
+        for (r, row) in g.iter().enumerate() {
+            let chars: Vec<char> = row.iter().map(|c| c.0).collect();
+            if let Some(c) = chars.windows(want.len()).position(|w| w == want) {
+                return (r, c);
+            }
+        }
+        panic!("{s:?} is not on the sheet");
+    }
+
+    #[test]
+    fn clicks_on_the_drawn_sheet_select_flip_step_edit_and_press() {
+        let (w, h) = (90, 20);
+        let mut f = Form::new(&Settings::default(), "mirai");
+        let g = render(&f, w, h);
+        // A label selects its row; the value of a switch flips it.
+        let (r, c) = find(&g, "Instrument strip");
+        assert_eq!(f.click(r, c, w, h), Action::None);
+        assert_eq!(f.at, 3);
+        assert_eq!(f.shown(3), "[■] on");
+        let (r, c) = find(&g, "[■] on");
+        f.click(r, c + 1, w, h);
+        assert_eq!(f.shown(3), "[ ] off", "a click on the switch flips it");
+        // A choice steps forward from its name and back from its ‹.
+        let (r, c) = find(&g, "‹ mirai ›");
+        f.click(r, c + 4, w, h);
+        assert_eq!((f.at, f.shown(0).as_str()), (0, "‹ classic ›"));
+        f.click(r, c, w, h);
+        assert_eq!(f.shown(0), "‹ mirai ›", "the ‹ steps back");
+        // A text value opens for typing; a click elsewhere takes the text.
+        let (r, c) = find(&g, "JetBrains Mono (built in)");
+        f.click(r, c, w, h);
+        assert_eq!((f.at, f.editing.as_deref()), (1, Some("")));
+        f.key(Key::Char('C'));
+        let (r, c) = find(&g, "Size (px)");
+        f.click(r, c, w, h);
+        assert_eq!((f.at, f.editing.as_deref()), (2, None));
+        assert_eq!(f.shown(1), "C");
+        // A section on the left shows it, its first field focused.
+        let (r, c) = find(&g, "  Paste");
+        f.click(r, c + 2, w, h);
+        assert_eq!((f.at, f.section()), (5, "Paste"));
+        assert!(text(&render(&f, w, h), 4).contains("▸ Paste"));
+        // The buttons.
+        let (r, c) = find(&g, "[ CANCEL ]");
+        assert_eq!(f.click(r, c + 3, w, h), Action::Close);
+        let (r, c) = find(&g, "[ SAVE ]");
+        let Action::Save(v) = f.click(r, c + 7, w, h) else {
+            panic!("the SAVE button saves");
+        };
+        assert_eq!(v[0], ("theme", Some("mirai".into())));
+        assert_eq!(v[1], ("font", Some("C".into())));
+        assert_eq!(v[3], ("instruments", Some("off".into())));
+    }
+
+    #[test]
+    fn clicks_on_the_frame_the_hints_and_empty_space_do_nothing() {
+        let (w, h) = (90, 20);
+        let mut f = Form::new(&Settings::default(), "mirai");
+        f.key(Key::Down);
+        let before = f.clone();
+        let g = render(&f, w, h);
+        let (hr, hc) = find(&g, "↑↓ move");
+        let (sr, sc) = find(&g, "Saved to fwterm.conf");
+        for (r, c) in [
+            (0, 0),
+            (0, 5),
+            (1, 30),
+            (3, 40),
+            (h - 1, 10),
+            (hr, hc),
+            (sr, sc),
+            (2, 21),
+            (2, 88),
+            (12, 50),
+        ] {
+            assert_eq!(f.click(r, c, w, h), Action::None, "({r}, {c})");
+            assert_eq!(f, before, "({r}, {c}) changed the sheet");
+        }
+        // The wheel moves the focus a row a notch, and wraps as Up does.
+        f.scroll(false);
+        assert_eq!(f.at, 2);
+        f.scroll(true);
+        f.scroll(true);
+        f.scroll(true);
+        assert_eq!(f.at, f.fields.len() + 1);
     }
 }

@@ -46,7 +46,7 @@ The competitive landscape for the whole suite is in
 
 | Keys | Does |
 | --- | --- |
-| Ctrl+Comma | settings |
+| Ctrl+Comma | settings; the sheet takes the mouse too: click a field, a switch or a choice, SAVE or CANCEL |
 | F1 | help: the keys |
 | Alt+Shift+Plus / Minus / D | split the focused pane right / down / along its longer side |
 | Alt+Arrow, click | move focus between panes |

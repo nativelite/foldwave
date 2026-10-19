@@ -81,7 +81,7 @@ pub const KEYS: &[(&str, &str)] = &[
 ];
 
 /// The line under the table: the strip's buttons do the same.
-pub const NOTE: &str = "the strip's \u{2699} SETTINGS and ? HELP open these too";
+pub const NOTE: &str = "the strip's SETTINGS and HELP buttons open these too";
 
 /// `text` broken into lines of at most `width` characters at spaces; a word
 /// longer than that stands alone on its line.

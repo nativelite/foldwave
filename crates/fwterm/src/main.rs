@@ -2089,6 +2089,21 @@ keys:
         }
     }
 
+    /// Where a sheet (settings, help) goes on a `grid_rows x grid_cols`
+    /// grid: `(top, left, w, h)`, centred, two columns in from each side and
+    /// a row from the top and bottom, at most 96 x 22. Drawing and clicks
+    /// both come here, so they agree.
+    fn sheet_rect(grid_rows: usize, grid_cols: usize) -> (usize, usize, usize, usize) {
+        let w = grid_cols.saturating_sub(4).min(96);
+        let h = grid_rows.saturating_sub(2).min(22);
+        (
+            grid_rows.saturating_sub(h) / 2,
+            grid_cols.saturating_sub(w) / 2,
+            w,
+            h,
+        )
+    }
+
     /// Draw the settings sheet's cells with their top-left at `(top, left)`.
     fn draw_sheet(
         cells: &[Vec<settings_ui::Cell>],
@@ -4772,110 +4787,126 @@ keys:
                 let Some(fi) = panes.iter().position(|p| p.id == focus) else {
                     break;
                 };
-                // The settings sheet takes every key and click while open.
+                // The settings sheet takes every key, click and wheel notch
+                // while open: a click inside it goes to the form, one
+                // outside closes it, and the wheel moves the focus.
                 if let Some(form) = sheet.as_mut() {
                     use settings_ui::Key as K;
-                    let key = match *e {
+                    let action = match *e {
                         Event::Char(_) if drop_char => {
                             drop_char = false;
                             continue;
                         }
-                        Event::Char('\r') => K::Enter,
-                        Event::Char('\u{1b}') => K::Esc,
-                        Event::Char('\u{8}') => K::Backspace,
-                        // Ctrl+S.
-                        Event::Char('\u{13}') => K::Save,
-                        Event::Char(c) => K::Char(c),
-                        Event::Key {
-                            vk: 0x26,
-                            down: true,
-                        } => K::Up,
-                        Event::Key {
-                            vk: 0x28,
-                            down: true,
-                        } => K::Down,
-                        Event::Key {
-                            vk: 0x25,
-                            down: true,
-                        } => K::Left,
-                        Event::Key {
-                            vk: 0x27,
-                            down: true,
-                        } => K::Right,
-                        Event::Key { .. }
-                        | Event::SysKey { .. }
-                        | Event::Click(..)
-                        | Event::DoubleClick(..)
-                        | Event::Drag(..)
-                        | Event::Release(..)
-                        | Event::Wheel(_) => continue,
-                        _ => K::Char('\u{0}'),
-                    };
-                    if key != K::Char('\u{0}') {
-                        match form.key(key) {
-                            settings_ui::Action::None => {}
-                            settings_ui::Action::Close => sheet = None,
-                            settings_ui::Action::Save(values) => {
-                                // Into the settings file, other lines kept;
-                                // then what applies at once, applied.
-                                let (app, _) = settings();
-                                let saved = app.as_deref().map(|a| {
-                                    let path = logstore::settings_path(a);
-                                    let old = std::fs::read_to_string(&path).unwrap_or_default();
-                                    std::fs::create_dir_all(a)
-                                        .and_then(|_| {
-                                            std::fs::write(
-                                                &path,
-                                                settings_ui::merged(&old, &values),
-                                            )
-                                        })
-                                        .map(|_| path)
-                                });
-                                match saved {
-                                    Some(Err(e)) => {
-                                        say!("fwterm: could not save the settings: {e}")
-                                    }
-                                    None => {
-                                        say!("fwterm: no LOCALAPPDATA: the settings were not saved")
-                                    }
-                                    Some(Ok(_)) => {}
-                                }
-                                let conf = settings().1;
-                                if let Some(t) = conf.theme.as_deref().and_then(Theme::named) {
-                                    theme = t;
-                                    theme_name = conf.theme.clone().unwrap_or_default();
-                                    theme.apply(&conf.colors);
-                                    palette = theme.palette.clone();
-                                    match theme.title_bar {
-                                        Some(bar) => {
-                                            surface.window().set_frame_colors(
-                                                bar,
-                                                theme.palette.fg,
-                                                theme.rule,
-                                            );
-                                        }
-                                        None => {
-                                            surface.window().reset_frame_colors();
-                                        }
-                                    }
-                                }
-                                paste_warning = conf.paste_warning.unwrap_or(true);
-                                let rows = usize::from(conf.instruments.unwrap_or(true));
-                                let rib = conf.ribbon.unwrap_or(true);
-                                if rows != strip_rows || rib != ribbon {
-                                    strip_rows = rows;
-                                    ribbon = rib;
-                                    placement = place_panes(
-                                        &layout, zoom, grid_rows, grid_cols, strip_rows, ribbon,
-                                    );
-                                    place_all(&mut panes, &placement);
-                                }
-                                frame.damage_all();
-                                sheet = None;
+                        Event::Click(x, y) | Event::DoubleClick(x, y) if x >= 0 && y >= 0 => {
+                            let (row, col) = (
+                                y as usize / m.cell_h as usize,
+                                x as usize / m.cell_w as usize,
+                            );
+                            let (top, left, w, h) = sheet_rect(grid_rows, grid_cols);
+                            let (sw, sh) = settings_ui::fitted(w, h);
+                            if (top..top + sh).contains(&row) && (left..left + sw).contains(&col) {
+                                form.click(row - top, col - left, w, h)
+                            } else {
+                                settings_ui::Action::Close
                             }
                         }
-                        layout_dirty = true;
+                        // A row a notch, as the sheet only moves a focus.
+                        Event::Wheel(delta) => {
+                            let notches = (delta.unsigned_abs() as usize).div_euclid(120).max(1);
+                            for _ in 0..notches {
+                                form.scroll(delta > 0);
+                            }
+                            settings_ui::Action::None
+                        }
+                        _ => {
+                            let key = match *e {
+                                Event::Char('\r') => K::Enter,
+                                Event::Char('\u{1b}') => K::Esc,
+                                Event::Char('\u{8}') => K::Backspace,
+                                // Ctrl+S.
+                                Event::Char('\u{13}') => K::Save,
+                                Event::Char(c) => K::Char(c),
+                                Event::Key {
+                                    vk: 0x26,
+                                    down: true,
+                                } => K::Up,
+                                Event::Key {
+                                    vk: 0x28,
+                                    down: true,
+                                } => K::Down,
+                                Event::Key {
+                                    vk: 0x25,
+                                    down: true,
+                                } => K::Left,
+                                Event::Key {
+                                    vk: 0x27,
+                                    down: true,
+                                } => K::Right,
+                                _ => continue,
+                            };
+                            form.key(key)
+                        }
+                    };
+                    match action {
+                        settings_ui::Action::None => {}
+                        settings_ui::Action::Close => sheet = None,
+                        settings_ui::Action::Save(values) => {
+                            // Into the settings file, other lines kept;
+                            // then what applies at once, applied.
+                            let (app, _) = settings();
+                            let saved = app.as_deref().map(|a| {
+                                let path = logstore::settings_path(a);
+                                let old = std::fs::read_to_string(&path).unwrap_or_default();
+                                std::fs::create_dir_all(a)
+                                    .and_then(|_| {
+                                        std::fs::write(&path, settings_ui::merged(&old, &values))
+                                    })
+                                    .map(|_| path)
+                            });
+                            match saved {
+                                Some(Err(e)) => {
+                                    say!("fwterm: could not save the settings: {e}")
+                                }
+                                None => {
+                                    say!("fwterm: no LOCALAPPDATA: the settings were not saved")
+                                }
+                                Some(Ok(_)) => {}
+                            }
+                            let conf = settings().1;
+                            if let Some(t) = conf.theme.as_deref().and_then(Theme::named) {
+                                theme = t;
+                                theme_name = conf.theme.clone().unwrap_or_default();
+                                theme.apply(&conf.colors);
+                                palette = theme.palette.clone();
+                                match theme.title_bar {
+                                    Some(bar) => {
+                                        surface.window().set_frame_colors(
+                                            bar,
+                                            theme.palette.fg,
+                                            theme.rule,
+                                        );
+                                    }
+                                    None => {
+                                        surface.window().reset_frame_colors();
+                                    }
+                                }
+                            }
+                            paste_warning = conf.paste_warning.unwrap_or(true);
+                            let rows = usize::from(conf.instruments.unwrap_or(true));
+                            let rib = conf.ribbon.unwrap_or(true);
+                            if rows != strip_rows || rib != ribbon {
+                                strip_rows = rows;
+                                ribbon = rib;
+                                placement = place_panes(
+                                    &layout, zoom, grid_rows, grid_cols, strip_rows, ribbon,
+                                );
+                                place_all(&mut panes, &placement);
+                            }
+                            frame.damage_all();
+                            sheet = None;
+                        }
                     }
+                    layout_dirty = true;
                     continue;
                 }
                 // The help sheet takes every key and click while open: Esc,
@@ -5921,25 +5952,15 @@ keys:
             }
             // The settings sheet, over everything, centred.
             if let Some(form) = &sheet {
-                let w = grid_cols.saturating_sub(4).min(96);
-                let h = grid_rows.saturating_sub(2).min(22);
+                let (top, left, w, h) = sheet_rect(grid_rows, grid_cols);
                 let cells = settings_ui::render(form, w, h);
-                let (top, left) = (
-                    grid_rows.saturating_sub(h) / 2,
-                    grid_cols.saturating_sub(w) / 2,
-                );
                 draw_sheet(&cells, top, left, &mut frame, &mut pen);
                 drew = true;
             }
             // The help sheet, the same way.
             if let Some(h) = &help_sheet {
-                let w = grid_cols.saturating_sub(4).min(96);
-                let h_rows = grid_rows.saturating_sub(2).min(22);
+                let (top, left, w, h_rows) = sheet_rect(grid_rows, grid_cols);
                 let cells = h.render(w, h_rows);
-                let (top, left) = (
-                    grid_rows.saturating_sub(h_rows) / 2,
-                    grid_cols.saturating_sub(w) / 2,
-                );
                 draw_sheet(&cells, top, left, &mut frame, &mut pen);
                 drew = true;
             }

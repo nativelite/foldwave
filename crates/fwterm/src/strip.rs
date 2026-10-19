@@ -129,8 +129,10 @@ pub enum Button {
     Help,
 }
 
-const SETTINGS: &str = "\u{2699} SETTINGS"; // ⚙ SETTINGS
-const HELP: &str = "? HELP";
+// Plain words: a gear (U+2699) came through the font fallback wider than a
+// cell and was cut off.
+const SETTINGS: &str = "SETTINGS";
+const HELP: &str = "HELP";
 
 /// The buttons as drawn, left to right: two spaces between them and one
 /// after, at the strip's right edge.
@@ -320,16 +322,16 @@ mod tests {
 
     #[test]
     fn a_click_on_a_button_names_it_and_the_gap_and_the_readings_miss() {
-        // 40 columns: the buttons take the last 19, from column 21.
-        assert_eq!(buttons_width(), 19);
-        let start = 40 - 19;
+        // 40 columns: the buttons take the last 15, from column 25.
+        assert_eq!(buttons_width(), 15);
+        let start = 40 - 15;
         assert_eq!(button_at(40, start), Some(Button::Settings));
-        assert_eq!(button_at(40, start + 9), Some(Button::Settings));
-        assert_eq!(button_at(40, start + 10), None, "the gap");
-        assert_eq!(button_at(40, start + 11), None, "the gap");
-        assert_eq!(button_at(40, start + 12), Some(Button::Help));
-        assert_eq!(button_at(40, start + 17), Some(Button::Help));
-        assert_eq!(button_at(40, start + 18), None, "the trailing space");
+        assert_eq!(button_at(40, start + 7), Some(Button::Settings));
+        assert_eq!(button_at(40, start + 8), None, "the gap");
+        assert_eq!(button_at(40, start + 9), None, "the gap");
+        assert_eq!(button_at(40, start + 10), Some(Button::Help));
+        assert_eq!(button_at(40, start + 13), Some(Button::Help));
+        assert_eq!(button_at(40, start + 14), None, "the trailing space");
         assert_eq!(button_at(40, 0), None, "the readings");
         assert_eq!(button_at(40, start - 1), None, "just left of them");
         assert_eq!(button_at(10, 5), None, "too narrow for the buttons");
@@ -351,7 +353,7 @@ mod tests {
         let row = with_buttons(&line(&r), 60);
         let s: String = row.iter().map(|(c, _)| *c).collect();
         assert_eq!(s.chars().count(), 60);
-        assert!(s.ends_with("  \u{2699} SETTINGS  ? HELP "), "{s:?}");
+        assert!(s.ends_with("  SETTINGS  HELP "), "{s:?}");
         assert!(s.starts_with(" PANES 02  ·  FOCUS 1"), "{s:?}");
         // The readings end two blank columns before the buttons.
         let start = 60 - buttons_width();
@@ -359,7 +361,7 @@ mod tests {
         assert_eq!(&s[..].chars().nth(start - 2), &Some(' '));
         assert_ne!(row[start - 3].0, ' ', "the ask fills up to the cut");
         assert_eq!(row[start].1, Kind::Accent);
-        assert_eq!(row[start + 12].1, Kind::Accent);
+        assert_eq!(row[start + 10].1, Kind::Accent);
         // Short readings leave the middle blank.
         let short = Readings {
             ask: None,
@@ -373,7 +375,7 @@ mod tests {
         assert_eq!(
             s,
             format!(
-                "{:<61}\u{2699} SETTINGS  ? HELP ",
+                "{:<65}SETTINGS  HELP ",
                 " PANES 02  ·  FOCUS 1  ·  CPU —  ·  INDEX OFF"
             )
         );
