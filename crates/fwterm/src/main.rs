@@ -124,7 +124,7 @@ mod app {
     use crate::settings_ui;
     use crate::strip;
     use crate::theme::Theme;
-    use fwrender::win::{display_refresh_hz, CpuPresenter, Event, Waker, Window};
+    use fwrender::win::{display_refresh_hz, CpuPresenter, Cursor, Event, Waker, Window};
     use fwrender::{
         Atlas, CellInstance, CpuRenderer, FontRasterizer, Frame, GlyphKey, GlyphPart, Highlight,
         Metrics, Palette, Rasterizer, Sharpening,
@@ -2057,18 +2057,27 @@ keys:
     }
 
     /// Draw the instrument strip across grid row 0: the readings, cut short
-    /// of the SETTINGS and HELP buttons at the right edge.
-    fn draw_strip(line: &[(char, strip::Kind)], cols: usize, frame: &mut Frame, pen: &mut Pen) {
+    /// of the SETTINGS and HELP buttons at the right edge. The buttons sit
+    /// on the selection colour, a step up from the strip, so they read as
+    /// buttons; `hover`, the one under the pointer, is lit in the accent.
+    fn draw_strip(
+        line: &[(char, strip::Kind)],
+        cols: usize,
+        hover: Option<strip::Button>,
+        frame: &mut Frame,
+        pen: &mut Pen,
+    ) {
         let t = pen.theme;
-        let bg = t.surface;
-        let row = strip::with_buttons(line, cols);
+        let row = strip::with_buttons(line, cols, hover);
         for (col, &(ch, kind)) in row.iter().enumerate() {
-            let fg = match kind {
-                strip::Kind::Label => t.dim,
-                strip::Kind::Value => t.palette.fg,
-                strip::Kind::Accent => t.accent,
-                strip::Kind::Good => t.palette.indexed[2],
-                strip::Kind::Bad => t.error,
+            let (fg, bg) = match kind {
+                strip::Kind::Label => (t.dim, t.surface),
+                strip::Kind::Value => (t.palette.fg, t.surface),
+                strip::Kind::Accent => (t.accent, t.surface),
+                strip::Kind::Good => (t.palette.indexed[2], t.surface),
+                strip::Kind::Bad => (t.error, t.surface),
+                strip::Kind::Button => (t.accent, t.palette.selection),
+                strip::Kind::Hover => (t.palette.bg, t.accent),
             };
             let key = GlyphKey {
                 ch,
@@ -4670,6 +4679,10 @@ keys:
         // drive's free space (read every 5 s).
         let mut strip_line: Vec<(char, strip::Kind)> = Vec::new();
         let mut strip_next = Instant::now();
+        // The strip button under the pointer, and the one the strip was
+        // last drawn with.
+        let mut hover: Option<strip::Button> = None;
+        let mut drawn_hover: Option<strip::Button> = None;
         #[allow(clippy::type_complexity)]
         let mut log_free: Option<(Instant, Option<(String, u64)>)> = None;
         // Every pane starts at its real size; a zoom then hides the rest.
@@ -4774,10 +4787,15 @@ keys:
             };
             events.clear();
             surface.window().wait(timeout, &mut events);
-            if events
-                .iter()
-                .any(|e| !matches!(e, Event::Woken | Event::Paint))
-            {
+            // The pointer merely moving over the window is not input the
+            // frame rate should rise for (it lights the strip's buttons and
+            // nothing else); a key, a click, a drag or the wheel is.
+            if events.iter().any(|e| {
+                !matches!(
+                    e,
+                    Event::Woken | Event::Paint | Event::Move(..) | Event::Leave
+                )
+            }) {
                 last_input = Instant::now();
             }
             input.clear();
@@ -4787,6 +4805,32 @@ keys:
                 let Some(fi) = panes.iter().position(|p| p.id == focus) else {
                     break;
                 };
+                // The pointer over a strip button lights it and becomes a
+                // hand, sheet open or not, so this comes before the sheets
+                // take the rest. Nothing else wants a plain move.
+                if let Event::Move(..) | Event::Leave = *e {
+                    let now = match *e {
+                        Event::Move(x, y) if x >= 0 && y >= 0 && strip_rows > 0 => {
+                            let (row, col) = (
+                                y as usize / m.cell_h as usize,
+                                x as usize / m.cell_w as usize,
+                            );
+                            (row == 0)
+                                .then(|| strip::button_at(grid_cols, col))
+                                .flatten()
+                        }
+                        _ => None,
+                    };
+                    if now != hover {
+                        hover = now;
+                        surface.window().set_cursor(if now.is_some() {
+                            Cursor::Hand
+                        } else {
+                            Cursor::Arrow
+                        });
+                    }
+                    continue;
+                }
                 // The settings sheet takes every key, click and wheel notch
                 // while open: a click inside it goes to the form, one
                 // outside closes it, and the wheel moves the focus.
@@ -5862,11 +5906,18 @@ keys:
                     ask: newest_ask(&report.asks, &looked_at, &panes),
                 };
                 let line = strip::line(&readings);
-                if relayout || line != strip_line {
-                    draw_strip(&line, grid_cols, &mut frame, &mut pen);
+                if relayout || line != strip_line || hover != drawn_hover {
+                    draw_strip(&line, grid_cols, hover, &mut frame, &mut pen);
                     strip_line = line;
+                    drawn_hover = hover;
                     drew = true;
                 }
+            } else if strip_rows > 0 && hover != drawn_hover {
+                // The pointer moved on or off a button between readings:
+                // the strip as last read, lit anew.
+                draw_strip(&strip_line, grid_cols, hover, &mut frame, &mut pen);
+                drawn_hover = hover;
+                drew = true;
             }
             // The search bar, over the window's bottom row.
             if let Some(f) = &find_bar {

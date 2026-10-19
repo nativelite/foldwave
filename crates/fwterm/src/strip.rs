@@ -53,6 +53,11 @@ pub enum Kind {
     Accent,
     Good,
     Bad,
+    /// A button at rest: raised a little from the strip, so it reads as
+    /// one.
+    Button,
+    /// The button under the pointer: lit.
+    Hover,
 }
 
 /// The strip's pieces, left to right.
@@ -135,12 +140,24 @@ const SETTINGS: &str = "SETTINGS";
 const HELP: &str = "HELP";
 
 /// The buttons as drawn, left to right: two spaces between them and one
-/// after, at the strip's right edge.
+/// after, at the strip's right edge, both at rest.
 pub fn buttons() -> Vec<(String, Kind)> {
+    buttons_lit(None)
+}
+
+/// The buttons as drawn with `hover`, the one under the pointer, lit.
+fn buttons_lit(hover: Option<Button>) -> Vec<(String, Kind)> {
+    let kind = |b: Button| {
+        if hover == Some(b) {
+            Kind::Hover
+        } else {
+            Kind::Button
+        }
+    };
     vec![
-        (SETTINGS.into(), Kind::Accent),
+        (SETTINGS.into(), kind(Button::Settings)),
         ("  ".into(), Kind::Label),
-        (HELP.into(), Kind::Accent),
+        (HELP.into(), kind(Button::Help)),
         (" ".into(), Kind::Label),
     ]
 }
@@ -167,9 +184,14 @@ pub fn button_at(cols: usize, col: usize) -> Option<Button> {
 
 /// The strip's row as drawn `cols` wide: the readings cut so they end at
 /// least two columns before the buttons (a long ask never runs into them),
-/// then the buttons against the right edge. A strip too narrow for the
-/// buttons shows the readings alone.
-pub fn with_buttons(line: &[(char, Kind)], cols: usize) -> Vec<(char, Kind)> {
+/// then the buttons against the right edge, `hover` (the one under the
+/// pointer) lit. A strip too narrow for the buttons shows the readings
+/// alone.
+pub fn with_buttons(
+    line: &[(char, Kind)],
+    cols: usize,
+    hover: Option<Button>,
+) -> Vec<(char, Kind)> {
     let blank = (' ', Kind::Label);
     let Some(start) = cols.checked_sub(buttons_width()) else {
         return (0..cols)
@@ -177,7 +199,7 @@ pub fn with_buttons(line: &[(char, Kind)], cols: usize) -> Vec<(char, Kind)> {
             .collect();
     };
     let cut = start.saturating_sub(2);
-    let tail: Vec<(char, Kind)> = buttons()
+    let tail: Vec<(char, Kind)> = buttons_lit(hover)
         .into_iter()
         .flat_map(|(s, k)| s.chars().map(move |c| (c, k)).collect::<Vec<_>>())
         .collect();
@@ -350,7 +372,7 @@ mod tests {
             decisions: 1,
             ask: Some("dev_1: deploy: merge this very long branch name now?".into()),
         };
-        let row = with_buttons(&line(&r), 60);
+        let row = with_buttons(&line(&r), 60, None);
         let s: String = row.iter().map(|(c, _)| *c).collect();
         assert_eq!(s.chars().count(), 60);
         assert!(s.ends_with("  SETTINGS  HELP "), "{s:?}");
@@ -360,15 +382,15 @@ mod tests {
         assert_eq!(&s[..].chars().nth(start - 1), &Some(' '));
         assert_eq!(&s[..].chars().nth(start - 2), &Some(' '));
         assert_ne!(row[start - 3].0, ' ', "the ask fills up to the cut");
-        assert_eq!(row[start].1, Kind::Accent);
-        assert_eq!(row[start + 10].1, Kind::Accent);
+        assert_eq!(row[start].1, Kind::Button);
+        assert_eq!(row[start + 10].1, Kind::Button);
         // Short readings leave the middle blank.
         let short = Readings {
             ask: None,
             decisions: 0,
             ..r
         };
-        let s: String = with_buttons(&line(&short), 80)
+        let s: String = with_buttons(&line(&short), 80, None)
             .iter()
             .map(|(c, _)| *c)
             .collect();
@@ -380,10 +402,56 @@ mod tests {
             )
         );
         // Too narrow for them: the readings alone.
-        let s: String = with_buttons(&line(&short), 10)
+        let s: String = with_buttons(&line(&short), 10, None)
             .iter()
             .map(|(c, _)| *c)
             .collect();
         assert_eq!(s, " PANES 02 ");
+    }
+
+    #[test]
+    fn the_pointer_lights_only_the_button_under_it() {
+        let r = Readings {
+            panes: 1,
+            focus: 1,
+            cpu: None,
+            log: None,
+            index: "OFF",
+            hosts: None,
+            agents: Vec::new(),
+            decisions: 0,
+            ask: None,
+        };
+        let start = 40 - buttons_width();
+        let kinds = |hover: Option<Button>| -> Vec<Kind> {
+            with_buttons(&line(&r), 40, hover)[start..]
+                .iter()
+                .map(|(_, k)| *k)
+                .collect()
+        };
+        let mut rest = vec![Kind::Button; 8];
+        rest.extend([Kind::Label; 2]);
+        rest.extend([Kind::Button; 4]);
+        rest.push(Kind::Label);
+        assert_eq!(kinds(None), rest, "both at rest");
+        let mut settings = rest.clone();
+        settings[..8].fill(Kind::Hover);
+        assert_eq!(kinds(Some(Button::Settings)), settings);
+        let mut help = rest.clone();
+        help[10..14].fill(Kind::Hover);
+        assert_eq!(kinds(Some(Button::Help)), help);
+        // Every cell the pointer lights is one a click on it would hit.
+        for (i, k) in kinds(Some(Button::Help)).iter().enumerate() {
+            assert_eq!(
+                *k == Kind::Hover,
+                button_at(40, start + i) == Some(Button::Help),
+                "column {}",
+                start + i
+            );
+        }
+        assert!(
+            buttons().iter().all(|(_, k)| *k != Kind::Hover),
+            "nothing lit without a pointer"
+        );
     }
 }

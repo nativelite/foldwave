@@ -140,6 +140,26 @@ pub struct IconInfo {
     pub color: Hgdiobj,
 }
 
+/// `TRACKMOUSEEVENT` (winuser.h): asks for `WM_MOUSELEAVE` when the pointer
+/// leaves `hwnd_track`'s client area.
+#[repr(C)]
+pub struct TrackMouseEvent {
+    pub cb_size: u32,
+    pub flags: u32,
+    pub hwnd_track: Hwnd,
+    pub hover_time: u32,
+}
+
+/// `TRACKMOUSEEVENT.dwFlags`: report the pointer leaving.
+pub const TME_LEAVE: u32 = 0x0002;
+pub const WM_MOUSELEAVE: u32 = 0x02A3;
+pub const WM_SETCURSOR: u32 = 0x0020;
+/// `WM_SETCURSOR`'s low word of lparam when the pointer is in the client
+/// area (the hit-test code).
+pub const HTCLIENT: isize = 1;
+/// `IDC_HAND` is `MAKEINTRESOURCE(32649)`.
+pub const IDC_HAND: usize = 32649;
+
 pub const WM_SETICON: u32 = 0x0080;
 pub const ICON_SMALL: usize = 0;
 pub const ICON_BIG: usize = 1;
@@ -290,6 +310,9 @@ extern "system" {
     pub fn SetWindowLongPtrW(hwnd: Hwnd, index: i32, value: isize) -> isize;
     pub fn GetWindowLongPtrW(hwnd: Hwnd, index: i32) -> isize;
     pub fn LoadCursorW(instance: Hinstance, name: *const u16) -> Handle;
+    /// Sets the calling thread's cursor; returns the previous one.
+    pub fn SetCursor(cursor: Handle) -> Handle;
+    pub fn TrackMouseEvent(track: *mut TrackMouseEvent) -> Bool;
     pub fn GetMessageW(msg: *mut Msg, hwnd: Hwnd, min: u32, max: u32) -> Bool;
     pub fn PostQuitMessage(code: i32);
     pub fn TranslateMessage(msg: *const Msg) -> Bool;
@@ -477,4 +500,5 @@ const _: () = {
     assert!(size_of::<TextMetricW>() == 60);
     assert!(size_of::<BitmapInfoHeader>() == 40);
     assert!(size_of::<BitmapInfo>() == 44);
+    assert!(size_of::<TrackMouseEvent>() == 24);
 };

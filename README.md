@@ -68,7 +68,7 @@ ribbon at each pane's right edge maps the lines the pane holds onto its rows:
 where commands started, in red where one failed, and where the view is.
 `instruments = off` and `ribbon = off` in the settings file (or the settings
 sheet) hide them. The strip's SETTINGS and HELP buttons, at its right end,
-open the settings sheet and this help.
+light up under the pointer and open the settings sheet and this help.
 
 `fwterm --help` lists every option and key.
 

@@ -6,7 +6,7 @@ use crate::cpu::CpuRenderer;
 use std::ffi::c_void;
 use std::io;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Once, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -52,6 +52,13 @@ pub enum Event {
     Drag(i32, i32),
     /// The left button came up at `(x, y)` (`WM_LBUTTONUP`).
     Release(i32, i32),
+    /// The pointer moved to `(x, y)` with no button down (`WM_MOUSEMOVE`).
+    /// Coalesced: a `Move` queued behind another `Move` replaces it, so a
+    /// fast pointer leaves one event, its latest place, and never floods
+    /// the queue.
+    Move(i32, i32),
+    /// The pointer left the client area (`WM_MOUSELEAVE`).
+    Leave,
     /// The user asked to close the window (`WM_CLOSE`). The window stays
     /// open; drop the [`Window`] to close it.
     CloseRequested,
@@ -73,6 +80,14 @@ struct Shared {
     /// An auto-reset event, set whenever an event is queued: what `wait`
     /// sleeps on.
     ready: Handle,
+    /// The `HCURSOR` shown over the client area, chosen by
+    /// [`Window::set_cursor`] on the caller's thread and read by the window
+    /// thread on `WM_SETCURSOR`.
+    cursor: AtomicUsize,
+    /// Whether the pointer is in the client area: set on `WM_MOUSEMOVE`,
+    /// when `TrackMouseEvent` is armed to report its leaving, and cleared
+    /// on `WM_MOUSELEAVE`.
+    inside: AtomicBool,
 }
 
 // SAFETY: `ready` is a kernel event handle, usable from any thread; the rest
@@ -82,13 +97,33 @@ unsafe impl Send for Shared {}
 unsafe impl Sync for Shared {}
 
 impl Shared {
-    /// Queue `e` and wake a waiting [`Window::wait`]. Never blocks for long
-    /// and never panics: it runs inside the window procedure.
-    fn push(&self, e: Event) {
-        match self.events.lock() {
-            Ok(mut q) => q.push(e),
-            Err(p) => p.into_inner().push(e),
+    /// Shared state with a fresh ready event and `cursor` to start with.
+    fn new(cursor: Handle) -> io::Result<Shared> {
+        // SAFETY: no attributes or name; auto-reset, not signalled.
+        let ready = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+        if ready.is_null() {
+            return Err(last_error("CreateEventW"));
         }
+        Ok(Shared {
+            events: Mutex::new(Vec::new()),
+            size: Mutex::new((0, 0)),
+            surrogate: Mutex::new(None),
+            ready,
+            cursor: AtomicUsize::new(cursor as usize),
+            inside: AtomicBool::new(false),
+        })
+    }
+
+    /// Queue `e` and wake a waiting [`Window::wait`]. Never blocks for long
+    /// and never panics: it runs inside the window procedure. A
+    /// [`Event::Move`] behind a pending one replaces it.
+    fn push(&self, e: Event) {
+        let mut q = self.events.lock().unwrap_or_else(|p| p.into_inner());
+        match (q.last_mut(), e) {
+            (Some(last @ Event::Move(..)), Event::Move(..)) => *last = e,
+            _ => q.push(e),
+        }
+        drop(q);
         // SAFETY: `ready` lives as long as `self` (closed in `drop`).
         unsafe { SetEvent(self.ready) };
     }
@@ -148,6 +183,19 @@ pub struct Window {
     timer: Handle,
     /// Icons set with [`Window::set_icon`], destroyed with the window.
     icons: Vec<Handle>,
+    /// The system's arrow and hand cursors, loaded once; the system owns
+    /// them, so nothing is destroyed.
+    arrow: Handle,
+    hand: Handle,
+}
+
+/// The pointer's shape over the client area ([`Window::set_cursor`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cursor {
+    /// The usual arrow.
+    Arrow,
+    /// A pointing hand: something under the pointer can be clicked.
+    Hand,
 }
 
 impl std::fmt::Debug for Window {
@@ -393,17 +441,15 @@ impl Window {
     pub fn new(title: &str, width: u32, height: u32) -> io::Result<Window> {
         // SAFETY: a null name returns the executable's module handle.
         let hinstance = unsafe { GetModuleHandleW(std::ptr::null()) };
-        // SAFETY: no attributes or name; auto-reset, not signalled.
-        let ready = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
-        if ready.is_null() {
-            return Err(last_error("CreateEventW"));
-        }
-        let shared = Arc::new(Shared {
-            events: Mutex::new(Vec::new()),
-            size: Mutex::new((0, 0)),
-            surrogate: Mutex::new(None),
-            ready,
-        });
+        // SAFETY: predefined system cursors (null instance); shared, never
+        // destroyed, and usable from any thread.
+        let (arrow, hand) = unsafe {
+            (
+                LoadCursorW(std::ptr::null_mut(), IDC_ARROW as *const u16),
+                LoadCursorW(std::ptr::null_mut(), IDC_HAND as *const u16),
+            )
+        };
+        let shared = Arc::new(Shared::new(arrow)?);
         let (made, created) = mpsc::channel();
         let for_thread = Arc::clone(&shared);
         let title = title.to_string();
@@ -439,7 +485,38 @@ impl Window {
                 )
             },
             icons: Vec::new(),
+            arrow,
+            hand,
         })
+    }
+
+    /// Show `cursor` while the pointer is over the client area. Cheap, from
+    /// the caller's thread: the choice is stored for the window thread,
+    /// which Windows asks (`WM_SETCURSOR`) at each pointer move.
+    ///
+    /// The pointer should change at once, not at its next move, so when it
+    /// is inside the client area the window is posted the same
+    /// `WM_SETCURSOR` Windows would send for a move there (`wparam` the
+    /// window, `lparam` the client hit-test code and `WM_MOUSEMOVE`), and
+    /// the handler sets the cursor. Outside, the next move in will ask.
+    pub fn set_cursor(&self, cursor: Cursor) {
+        let handle = match cursor {
+            Cursor::Arrow => self.arrow,
+            Cursor::Hand => self.hand,
+        };
+        self.shared.cursor.store(handle as usize, Ordering::Release);
+        if self.shared.inside.load(Ordering::Acquire) {
+            // SAFETY: `hwnd` is live; posting fails harmlessly on a full
+            // queue, and the next pointer move asks again.
+            unsafe {
+                PostMessageW(
+                    self.hwnd,
+                    WM_SETCURSOR,
+                    self.hwnd as usize,
+                    HTCLIENT | ((WM_MOUSEMOVE as isize) << 16),
+                )
+            };
+        }
     }
 
     /// Resize the window so its client area is `width x height` physical
@@ -825,8 +902,28 @@ unsafe extern "system" fn wnd_proc(hwnd: Hwnd, msg: u32, wparam: usize, lparam: 
                         Event::DoubleClick(x, y)
                     });
                 }
-                WM_MOUSEMOVE if wparam & MK_LBUTTON != 0 => push(Event::Drag(x, y)),
-                WM_MOUSEMOVE => {}
+                WM_MOUSEMOVE => {
+                    // The first move in arms one WM_MOUSELEAVE for when the
+                    // pointer goes out; Windows disarms it as it fires.
+                    if !shared.inside.swap(true, Ordering::AcqRel) {
+                        let mut track = TrackMouseEvent {
+                            cb_size: std::mem::size_of::<TrackMouseEvent>() as u32,
+                            flags: TME_LEAVE,
+                            hwnd_track: hwnd,
+                            hover_time: 0,
+                        };
+                        // SAFETY: `track` is a complete TRACKMOUSEEVENT for
+                        // our live window, on its own thread.
+                        if unsafe { TrackMouseEvent(&mut track) } == 0 {
+                            shared.inside.store(false, Ordering::Release);
+                        }
+                    }
+                    push(if wparam & MK_LBUTTON != 0 {
+                        Event::Drag(x, y)
+                    } else {
+                        Event::Move(x, y)
+                    });
+                }
                 _ => {
                     // SAFETY: no preconditions; a no-op without capture.
                     unsafe { ReleaseCapture() };
@@ -834,6 +931,19 @@ unsafe extern "system" fn wnd_proc(hwnd: Hwnd, msg: u32, wparam: usize, lparam: 
                 }
             }
             0
+        }
+        WM_MOUSELEAVE => {
+            shared.inside.store(false, Ordering::Release);
+            push(Event::Leave);
+            0
+        }
+        // Over the client area the cursor set with `Window::set_cursor`
+        // wins; the frame and edges keep the system's.
+        WM_SETCURSOR if lparam & 0xFFFF == HTCLIENT => {
+            // SAFETY: a cursor the system owns, on the thread that owns the
+            // window the pointer is over.
+            unsafe { SetCursor(shared.cursor.load(Ordering::Acquire) as Handle) };
+            1
         }
         WM_CLOSE => {
             push(Event::CloseRequested);
@@ -1063,5 +1173,34 @@ impl Drop for Clipboard {
     fn drop(&mut self) {
         // SAFETY: this guard exists only while the clipboard is open.
         unsafe { CloseClipboard() };
+    }
+}
+
+// The queue alone, with no window: nothing is shown and no input is sent.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fast_pointer_leaves_one_move_in_the_queue_but_never_loses_a_click() {
+        let shared = Shared::new(std::ptr::null_mut()).expect("an event");
+        shared.push(Event::Move(1, 1));
+        shared.push(Event::Move(2, 2));
+        shared.push(Event::Move(3, 3));
+        shared.push(Event::Click(4, 4));
+        shared.push(Event::Move(5, 5));
+        shared.push(Event::Leave);
+        shared.push(Event::Move(6, 6));
+        let q = shared.events.lock().unwrap();
+        assert_eq!(
+            *q,
+            [
+                Event::Move(3, 3),
+                Event::Click(4, 4),
+                Event::Move(5, 5),
+                Event::Leave,
+                Event::Move(6, 6),
+            ]
+        );
     }
 }
