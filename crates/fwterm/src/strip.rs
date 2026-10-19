@@ -81,6 +81,21 @@ pub fn segments(r: &Readings) -> Vec<(String, Kind)> {
         let kind = if up == all { Kind::Good } else { Kind::Bad };
         item("HOSTS", format!("{up}/{all}"), kind);
     }
+    if r.decisions > 0 {
+        out.push(("  ·  ".into(), Kind::Label));
+        out.push(("DECISIONS ".into(), Kind::Label));
+        out.push((r.decisions.to_string(), Kind::Bad));
+    }
+    // What needs the human before the roster: the strip is cut from the
+    // right, so with many agents the key and the message still show, and a
+    // long message cuts into the roster, not the other way round. The key
+    // before the message for the same reason.
+    if let Some(ask) = &r.ask {
+        out.push(("  ·  ".into(), Kind::Label));
+        out.push(("CTRL+SHIFT+J".into(), Kind::Accent));
+        out.push(("  ›  ".into(), Kind::Accent));
+        out.push((ask.clone(), Kind::Value));
+    }
     if !r.agents.is_empty() {
         out.push(("  ·  ".into(), Kind::Label));
         out.push(("AGENTS ".into(), Kind::Label));
@@ -94,18 +109,6 @@ pub fn segments(r: &Readings) -> Vec<(String, Kind)> {
                 out.push((ch.to_string(), kind));
             }
         }
-    }
-    if r.decisions > 0 {
-        out.push(("  ·  ".into(), Kind::Label));
-        out.push(("DECISIONS ".into(), Kind::Label));
-        out.push((r.decisions.to_string(), Kind::Bad));
-    }
-    // The key before the message, so a long message is what gets cut.
-    if let Some(ask) = &r.ask {
-        out.push(("  ·  ".into(), Kind::Label));
-        out.push(("CTRL+SHIFT+J".into(), Kind::Accent));
-        out.push(("  ›  ".into(), Kind::Accent));
-        out.push((ask.clone(), Kind::Value));
     }
     out
 }
@@ -190,7 +193,18 @@ mod tests {
         };
         assert_eq!(
             text(&r),
-            " PANES 04  ·  FOCUS 1  ·  CPU —  ·  INDEX OFF  ·  AGENTS 1 \u{25CF}\u{25CF}\u{25C6}  3 \u{2713}\u{2717}  ·  DECISIONS 1"
+            " PANES 04  ·  FOCUS 1  ·  CPU —  ·  INDEX OFF  ·  DECISIONS 1  ·  AGENTS 1 \u{25CF}\u{25CF}\u{25C6}  3 \u{2713}\u{2717}"
+        );
+        // With something to show, the key and the message come before the
+        // roster: the strip is cut from the right, so the roster is what a
+        // long message cuts into.
+        let asked = Readings {
+            ask: Some("dev_1: deploy: merge?".into()),
+            ..r.clone()
+        };
+        assert_eq!(
+            text(&asked),
+            " PANES 04  ·  FOCUS 1  ·  CPU —  ·  INDEX OFF  ·  DECISIONS 1  ·  CTRL+SHIFT+J  ›  dev_1: deploy: merge?  ·  AGENTS 1 \u{25CF}\u{25CF}\u{25C6}  3 \u{2713}\u{2717}"
         );
         let kinds: Vec<Kind> = segments(&r)
             .iter()

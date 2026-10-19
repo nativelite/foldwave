@@ -2062,8 +2062,10 @@ keys:
         let mut p = layout.place_zoomed(zoom, rows.saturating_sub(strip).max(1), cols);
         for (_, r) in &mut p.panes {
             r.top += strip;
-            // The activity ribbon takes the pane's rightmost column.
-            if ribbon && r.cols > 1 {
+            // The activity ribbon takes the pane's rightmost column. A pane
+            // of two columns or fewer keeps them: `draw` paints the ribbon
+            // only beside two or more.
+            if ribbon && r.cols > 2 {
                 r.cols -= 1;
             }
         }
@@ -3112,8 +3114,9 @@ keys:
             // (`place_panes` keeps it): what memory holds mapped onto the
             // rows, commands marked, failed ones in red, the view's lines on
             // the surface colour. Blank while a full-screen program draws.
-            // A pane of one column kept it (nothing was reserved), so the
-            // ribbon needs two.
+            // `place_panes` reserves the column only from a pane of three,
+            // so a pane of two columns or fewer kept them all and has no
+            // ribbon.
             if ribbon && rows > 0 && r.cols >= 2 {
                 let col = r.left + r.cols;
                 let oldest = scrolled - held as u64;
