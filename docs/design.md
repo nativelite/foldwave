@@ -2064,9 +2064,10 @@ take the ship down.
     process without logs: 919-944 MiB/s against 896-906. Parity: the host
     path costs nothing end to end and the in-process path is ~3 % faster.
     Both builds ran ~35 % under the 1,111-1,136 MiB/s of 2026-09-27 the
-    same way on the same machine, so that gap is the day (Balanced power
-    plan, Task Manager open, logs on E:, a 990 PRO), not the code: the
-    absolute figures here are relative to each other only.
+    same way on the same machine, so that gap is the day (power mode Best
+    performance, so not that; Task Manager open; logs on E:, a 990 PRO),
+    not the code: the absolute figures here are relative to each other
+    only.
   - **The GPU fails alone (2026-09-29).** Until then a failed Vulkan draw
     ended fwterm's loop, and the window and every pane host with it.
     - Renderer: a draw or resize that fails on Vulkan (a lost device or
