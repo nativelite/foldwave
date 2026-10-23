@@ -2036,8 +2036,8 @@ take the ship down.
     held lines all the same) is not sent. Measured with
     `cargo test --release -p nativelite-fwterm wire::bench -- --ignored --nocapture`
     on a 47x177 pane, medians over 1,000-2,000 updates, **on a Linux VM
-    (not the reference machine; to be re-measured there, with
-    `fwbench --emit` through `--isolate` for the end-to-end figure)**:
+    (not the reference machine; re-run there 2026-10-18: diff 17-37 µs,
+    compose 46-56 µs medians, p99 noisy)**:
 
     | per update, µs | before | after |
     | --- | --- | --- |
@@ -2056,6 +2056,17 @@ take the ship down.
     3 of every 4 updates at 60 Hz are applied and never drawn), which
     trades up to a frame of output latency and needs the reference machine
     to decide.
+    **End to end on the reference machine (2026-10-23):** 16 panes, 1 GiB
+    of `fwbench --emit` each, pipe lane, 2400x1300, `--max-fps 165`, this
+    build against the 2026-09-29 build (`942a59a`), 3 rounds alternating.
+    Isolated panes with logs: 709-727 MiB/s at 129-137 fps, gap p99 15-19
+    ms, against 729-739 MiB/s at 135-137 fps, p99 12-14 ms before; in
+    process without logs: 919-944 MiB/s against 896-906. Parity: the host
+    path costs nothing end to end and the in-process path is ~3 % faster.
+    Both builds ran ~35 % under the 1,111-1,136 MiB/s of 2026-09-27 the
+    same way on the same machine, so that gap is the day (Balanced power
+    plan, Task Manager open, logs on E:, a 990 PRO), not the code: the
+    absolute figures here are relative to each other only.
   - **The GPU fails alone (2026-09-29).** Until then a failed Vulkan draw
     ended fwterm's loop, and the window and every pane host with it.
     - Renderer: a draw or resize that fails on Vulkan (a lost device or
