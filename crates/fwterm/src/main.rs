@@ -2832,6 +2832,11 @@ keys:
             let held = term.history_len();
             let (rows, cols) = (term.screen().rows(), term.screen().cols());
             let logged = self.find_dir.is_some() || self.pane_dir.is_some();
+            // How far above live the view's bottom is, for the ribbon: `back`,
+            // except while a search hit shows, where the log is rebuilt
+            // around the hit's line and `back` is not kept; `None` while the
+            // view is another pane's log, which the ribbon does not map.
+            let mut view_back = Some(self.back as u64);
             // A search hit in a pane without a log: shown from memory, below.
             let find_here = self.find_view.clone().filter(|_| !logged);
             if let Some((line, needle)) = self.find_view.clone().filter(|_| logged) {
@@ -2844,6 +2849,7 @@ keys:
                 }
                 if let Some(d) = self.deep.as_mut() {
                     let end = (line + 1 + rows as u64 / 2).min(d.total);
+                    view_back = self.find_dir.is_none().then(|| d.back_of(end));
                     let _ = d.rebuild(end.max(1), rows, cols, pipe);
                     let s = d.term.screen();
                     // Where the hit should be: `end - 1 - line` lines above
@@ -3135,7 +3141,8 @@ keys:
                 let col = r.left + r.cols;
                 let oldest = scrolled - held as u64;
                 let end = scrolled + rows as u64;
-                let view_top = scrolled.saturating_sub(self.back as u64);
+                // No view to mark: a top past the end marks nothing.
+                let view_top = view_back.map_or(u64::MAX, |b| scrolled.saturating_sub(b));
                 let cells = {
                     let blocks = shared.blocks.lock().unwrap();
                     ribbon::cells(rows, oldest, end, view_top, blocks.commands())

@@ -1568,9 +1568,12 @@ touch, which the mirror knows exactly and a local `Term` only as a whole.
     from the pane's blocks, so it costs one pass over them per frame of
     that pane and nothing when the pane is not drawn; blank while a
     full-screen program draws. `ribbon = off` (settings file or sheet)
-    hides it. Open: a click on the ribbon jumping the view to those lines;
-    the ribbon while the view is rebuilt from the log (beyond memory, where
-    it marks nothing); output rate as brightness.
+    hides it. The view's band follows the view that is drawn: a search hit
+    (2026-10-23) is placed by the hit's line, as the log view is by its
+    depth, both approximate where lines wrap (§8.4), and a view beyond what
+    memory holds, or of another pane's log, has no band. Open: a click on
+    the ribbon jumping the view to those lines (today it hits no pane);
+    output rate as brightness.
 - **Status:** agent session state from transcripts (`agsess`), shown per pane.
 - **Resource accounting per pane:** CPU, memory, disk and GPU share, and the
   job/cgroup limits and compile pool from atrium.

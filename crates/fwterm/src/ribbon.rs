@@ -109,7 +109,10 @@ mod tests {
         assert!(cells(0, 0, 10, 0, std::iter::empty()).is_empty());
         assert_eq!(flags(&cells(3, 10, 10, 10, std::iter::empty())), "...");
         assert_eq!(flags(&cells(3, 10, 5, 0, std::iter::empty())), "...");
-        // A view past the end shows nothing in view.
+        // A view past the end shows nothing in view: `draw` passes
+        // `u64::MAX` when the view is not of this pane's memory (another
+        // pane's log), even when memory starts at line 0.
         assert_eq!(flags(&cells(3, 0, 30, 100, [(0, None)].into_iter())), "p..");
+        assert_eq!(flags(&cells(3, 0, 2, u64::MAX, std::iter::empty())), "...");
     }
 }
