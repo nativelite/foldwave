@@ -160,6 +160,13 @@ those parts on std (`std::arch` or word-at-a-time tricks).
 
 ## Cross-cutting findings
 
+### Agent teams want a tmux verb set
+- Claude Code runs its agent teams ("teammateMode") in split panes through a backend; the backends are tmux and iTerm2. A Windows Terminal backend is requested and still open (issue opened 2026-02-09; open on 2026-11-08) — https://github.com/anthropics/claude-code/issues/24384
+- The issue's own table of what Windows Terminal's `wt.exe` lacks: pane ids, `list-panes`, `send-keys` (its workaround is file-based inboxes). A terminal that wants to host teams needs the tmux verb set itself — same URL.
+- Verified on the reference machine (2026-11-08, strings in the installed `claude.exe` under `%APPDATA%\npm\node_modules\@anthropic-ai\claude-code\bin`): `teammateMode`, `TMUX_PANE`, `ITERM_SESSION_ID`, and the tmux verbs `new-session`, `split-window` (a 70 % split; the log line `[TmuxBackend] Created teammate`), `send-keys`, `list-panes`, `kill-pane`, `display-message`, `capture-pane -p`.
+- Unverified here: the exact flag forms (`split-window -h -l 70% -P -F '#{pane_id}'`, `tmux -V` at least 2.0, `$TMUX` checked with `$TMUX_PANE`) come from the atrium session's survey of 2026-11-08.
+- How foldwave would use it: design §8.7c, slice 4.
+
 ### No surveyed terminal pages scrollback to disk while running
 - **Windows Terminal:** writes the buffer to disk on exit and restores it (PR #16598).
 - **Ghostty:** compresses pages in RAM; unlimited scrollback is "planned".

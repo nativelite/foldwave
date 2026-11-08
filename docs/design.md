@@ -1579,6 +1579,8 @@ touch, which the mirror knows exactly and a local `Term` only as a whole.
   job/cgroup limits and compile pool from atrium.
 - **Views:** fold blocks, diff-aware rendering, jump between an agent's commands,
   cross-pane query results (§8.5).
+- **The control plane, Claude Code's teams and other terminals:** §8.7c
+  (proposal, 2026-11-08): how fwterm fits atrium's next release.
 - **Background agents (founder idea, 2026-09-24; proposal, not designed).** In
   a multi-agent flow, panes you are not working with can be hidden, not just
   zoomed past. A hidden agent is shown as a small animated presence, and only
@@ -1783,6 +1785,161 @@ sampled every 5 s; machine busy from `GetSystemTimes`; 16 logical CPUs.
   "other" row was spoiled by the idle process (pid 0), which the recorder then
   excluded, so A's Defender and short-lived rows are not separated; the rows
   shown for A are unaffected.
+
+### 8.7c The control plane: atrium's next release, Claude Code's teams, other terminals
+
+*Proposal, 2026-11-08. Nothing here is a founder decision; the open ones are
+listed at the end.* The founder's direction (2026-11-08): atrium's next release
+builds out its control plane and its reach into other terminals, and foldwave
+integrates with that release exactly, rather than around it.
+
+**What atrium 0.41.0 ships** (read 2026-11-08 at atrium `50717aa`; the atrium
+session working on the release confirmed the list; paths are in the atrium repo).
+
+- One control channel per atrium process, bound only under `--allow-ctl`: on
+  Windows the named pipe `\\.\pipe\atrium-ctl-<pid>` (`src/ipc/sys_windows.rs:289`),
+  same-user only; one JSON line request and one JSON line reply per connection,
+  drained from atrium's run loop with no thread (`src/ipc.rs:1-21`). Reads need no
+  token; a write needs the caller's `ATRIUM_TOKEN` (`src/ctl.rs:21-31`).
+- Every pane atrium spawns gets `ATRIUM_CTL` (the endpoint), `ATRIUM_PANE` (its id)
+  and `ATRIUM_TOKEN` (a per-pane capability), added to the environment it inherits
+  (`src/pane_spawn.rs:177-197`).
+- Verbs (`src/ctl/request.rs:49-95`; table in `docs/control-plane.md:44-69`):
+  spawn, list, send, status, kill, respawn, audit; board set / get / list / del /
+  claim / release; bus pub / sub / unsub / feed / resolve / topics; and the mod
+  protocol hello, report, whoami, inbox, answer, ask, asked, who. Text reaches an
+  agent as a bracketed paste typed once the pane is idle, or, with atrium's
+  Claude Code mod installed, through the engine's own prompt queue (the mod polls
+  `ctl inbox` every 1.5 s, `mod/hooks/ctl.ts:54`).
+- The bus and board (`nativelite-abus` 0.2.1) live in the broker process: a ring
+  of 512 events of two kinds (`fyi`, `decision_needed`), flushed every 5 s to the
+  sidecar fwterm reads today (§8.7). Nothing talks between two atriums, two
+  terminals or two machines; a nested atrium is capped by its parent's session
+  registry (`src/main.rs:189-245`) and that is all.
+- Status comes from files, never from the screen: `agsess` tails each agent's own
+  session log, and a mod's `report` is instant. atrium emits OSC 8, OSC 52 and the
+  alternate screen, and no title, OSC 7, OSC 9 or BEL (`src/filter.rs`,
+  `src/screen.rs:38-40`).
+
+**What its next release adds** (atrium's plans, surveyed 2026-11-08).
+
+- Title and "needs you" (`PLAN.md`; founder decisions of 2026-09-18 recorded
+  there): an `OSC 2` title `atrium · <name> · <state>`, change-gated; on a
+  transition to needs-you, one BEL and/or an `OSC 9` toast (default both, 30 s
+  cooldown per pane), plus Windows Terminal's taskbar state `OSC 9;4;2;0` /
+  `9;4;0;0`; children's own OSC 0/1/2 titles stripped. Not built yet
+  (`src/attention.rs` does not exist).
+- A `tmux`-compatible shim forwarding to ctl, so Claude Code's own agent teams
+  get atrium's chrome ([prior-art](prior-art.md#agent-teams-want-a-tmux-verb-set));
+  hook-injected status for unmodded panes; a held `inbox --wait` instead of the
+  poll; the model's own messaging (`SendMessage`, `ListAgents`) routed through ctl
+  (`PLAN-mod.md` R6); approvals routed to wherever the human is (R10); any Claude
+  Code on the machine joining a broker as a remote pane (R18).
+- Further out (`.atrium-dev/ROADMAP.md:64-73`, "Own-terminal, Phase 2 +
+  cross-terminal coordination"): a headless daemon that owns the ptys, the Job
+  Object, the pane buffers and the bus and board, with a reattachable front end,
+  staged as one shared same-user broker, then addressing, then presence and
+  discovery, then cross-machine. atrium's own notes name foldwave as where real
+  isolation would come from (`HANDOFF.md:97`).
+
+**Where fwterm stands.** §8.7's watcher reads the sidecars every 2 s and finds
+atrium's pane by walking the process tree. A pane gets no identity from fwterm
+(the only variable set on a child is the log banner,
+[`main.rs:3767`](../crates/fwterm/src/main.rs)), and fwterm understands OSC
+133/633 marks and nothing else: no title, no OSC 9, nothing on BEL (`find.rs:95`
+and `ansi::marks` see 0x07 only as an OSC terminator). So today atrium cannot
+tell it is inside fwterm, cannot ask for attention except through a file fwterm
+happens to poll, and Claude Code's agent teams have no backend in fwterm at all,
+as they have none in Windows Terminal.
+
+**The fit, in four slices (proposal).** Each is small, verifiable alone, and
+none needs a change in atrium 0.41; the first three fit atrium's next release as
+planned.
+
+1. *Pane identity.* Every pane fwterm spawns gets `TERM_PROGRAM=foldwave`,
+   `TERM_PROGRAM_VERSION`, `FOLDWAVE_PANE` (the pane's id, stable for the
+   window's life, `main.rs:5476`) and `FOLDWAVE_WINDOW` (the window's pid).
+   atrium adds its variables to the inherited environment, so an agent two
+   levels down still sees them. No runtime cost.
+2. *Attention.* fwterm renders what atrium's title plan emits, and more of it
+   than Windows Terminal does: `OSC 0/2` becomes the pane's title (in the strip
+   beside the AGENTS glyphs, and the window title follows the focused pane);
+   `OSC 9;4` sets a progress badge on the pane and the taskbar button's state
+   (`ITaskbarList3`); BEL flashes the pane's focus brackets once and raises an
+   ask the way a decision does, so Ctrl+Shift+J reaches it; an `OSC 9` toast
+   shows in fwterm's own bar (the FIND / PASTE bar style) for a few seconds, and
+   as a Windows notification only if the founder wants one (that needs an
+   AppUserModelID, so it belongs with packaging). This serves any program, not
+   only atrium: a long build's `printf '\a'` becomes an ask. All of it is
+   change-gated and per pane, so idle cost stays where it is.
+3. *fwterm as a ctl client.* When a pane's process tree holds an atrium started
+   with `--allow-ctl`, the watcher reads `\\.\pipe\atrium-ctl-<pid>` instead of
+   the sidecar: `list` for the roster (role, depth, status), `bus feed --since`
+   for events and decisions, `board list` when the strip wants captions. Reads
+   need no token, so atrium does not change, and the sidecar stays as the
+   fallback for an atrium without `--allow-ctl`. Gains: status is atrium's own
+   (agsess, or a mod's report) instead of fwterm's reading of a `status=` word;
+   captions, context share and cost become available to the strip; latency drops
+   from the 5 s flush plus the 2 s poll to the poll alone. Same 2 s cadence, one
+   connection per request, so the idle cost measured in §8.7 should not move;
+   to be re-measured.
+4. *Claude Code's teams in fwterm panes.* A `tmux` shim over a host channel:
+   fwterm binds `\\.\pipe\foldwave-<pid>` (atrium's framing and same-user rule;
+   a per-pane `FOLDWAVE_TOKEN`), and a small `tmux.exe` in a directory fwterm
+   prepends to each pane's PATH answers the verbs Claude Code uses
+   ([prior-art](prior-art.md#agent-teams-want-a-tmux-verb-set)): `-V`,
+   `new-session`, `split-window` (a 70 % split, printing the new pane's id),
+   `send-keys`, `list-panes`, `kill-pane`, `display-message -p`,
+   `capture-pane -p`. fwterm sets `TMUX` and `TMUX_PANE` in its panes so the
+   detection passes. `capture-pane` is a read of the pane's lines from memory or
+   its log, which fwterm already serves to its own views (§8.4); `split-window`
+   is `place_panes` with a command, a cwd and an environment; `send-keys` writes
+   to the pane's pty. Result: a Claude Code lead in any fwterm pane spawns its
+   teammates as fwterm panes, each logged, searchable and present in the strip,
+   with no atrium running. When atrium is the broker, atrium's shim must win
+   inside its panes (it prepends its own directory and owns the trust ladder),
+   and atrium's `spawn` could ask fwterm's channel for a real pane instead of
+   tiling one on its own screen; that is the first thing the two programs agree
+   on, below.
+
+**With atrium's daemon (later; atrium decides its shape first).** When `atriumd`
+exists, fwterm is the reattachable front end atrium's roadmap wants: it attaches
+over the broker's pipe, every daemon pane becomes an fwterm pane (drawn on the
+GPU, logged, searched), and the strip reads the one shared bus for every fwterm
+window on the machine, so an ask raised in another window is one Ctrl+Shift+J
+away. That is what "cross-terminal" means for the human at the keyboard. fwterm
+already streams panes from a process it shares no memory with (the pane host
+wire, [`wire.rs`](../crates/fwterm/src/wire.rs): row diffs over a pipe, §8.8a);
+the daemon's pane stream and fwterm's host wire should be one format, or
+trivially mapped, decided together before either side builds. Approvals routed
+to the focused pane (atrium's R10) land in fwterm as a bar with y / n / always
+keys, answered back over the channel.
+
+**What foldwave asks of atrium's release** (sent to the atrium session
+2026-11-08; its answers go here).
+
+1. Keep the pipe name `\\.\pipe\atrium-ctl-<pid>` and the token-free reads
+   (`list`, `status`, `bus feed`, `board list`) stable, and document them as the
+   surface a host terminal reads.
+2. Emit the title and needs-you sequences when `TERM_PROGRAM=foldwave` exactly
+   as for Windows Terminal; fwterm renders all four, the toast included.
+3. Pass the host's `FOLDWAVE_*`, `TERM_PROGRAM*` and `TMUX*` variables through
+   to its panes unchanged, and prepend its own `tmux` shim directory so atrium's
+   shim is the one its agents find.
+4. In the daemon design, make "the host supplies the pane" a first-class
+   option: `spawn` asks `FOLDWAVE_CTL` when it is set, and the pane stream
+   format is agreed with foldwave.
+
+**Open for the founder.**
+
+- Slice 4 overlaps what atrium plans (a `tmux` shim). Build both (fwterm's for
+  Claude-native teams with no atrium running, atrium's for brokered fleets), or
+  only atrium's?
+- Share atrium's `ipc.rs` as an org crate (one concern: a local JSON-line
+  request/reply channel), or write fwterm's own? Both are org code; the question
+  is who maintains it.
+- Toasts: fwterm's own bar only, or Windows notifications too (packaging work)?
+- Order: slices 1 to 3 before the beta check in a window, or after it?
 
 ### 8.8 The resource governor
 **CPU pressure is the first input, not one of many.** On an agentic machine the
@@ -2333,6 +2490,7 @@ One concern each; names are placeholders.
 | M3 status (2026-09-22) | **Spike delivered on Windows with Vulkan, not D3D11** (§8.6 puts Vulkan first; this row said D3D11). `fwrender`: frame with row damage, glyph atlas, CPU reference renderer, a Vulkan backend that matches it pixel for pixel, and a Win32 window. `fwbench render` at 164 fps: output to present p99 ≤ 7.2 ms on Vulkan against 10.7–18.3 ms on CPU; Vulkan's frame cost is flat at ~0.2 ms up to 2560x1400; idle draws 0 frames. Our own glyph rasterizer (`glyphs-rs`) replaces GDI: the same cells, and with the default sharpening (vertical fit, stem align, stem snap; switchable off) about as crisp as GDI's hinting at the same cost per glyph. Measured against Windows Terminal, Alacritty and WezTerm from the outside (`fwprobe`): key-to-screen latency tied with the fastest within the instrument's one-frame resolution; throughput set by the console host, where fwterm reaches 83 MiB/s on OpenConsole 1.24 against Windows Terminal's 115. Open: the throughput gap on the same host, and the installed-OpenConsole launcher (§11 row 6). Decision 4 is confirmed as Vulkan, and the `vterm` scroll-region cost found here is fixed | [`crates/fwrender`](../crates/fwrender), §8.6 |
 | **M4 App alpha** | window, panes, blocks, cross-pane search, governor | all §4 targets measured on the reference machine |
 | **M5 Beta** (founder, 2026-09-29) | a settings screen; packaging and first run (an installer, fwterm usable out of the box); the agent layer (agents' own events, from atrium's bus, as blocks beside shell commands, §8.7); foldwave's own look (branding, leaning toward a neo-Tokyo feel) | each piece checked in a window, §4 targets still met; then the engine packages held for the beta may be released (founder approves each) |
+| M5 status (2026-11-08) | **v0.1.0 cut as a GitHub pre-release on 2026-10-29** from `76cab43` on the private repo (installer built from that commit; gate green before the build). In: the settings sheet, packaging and first run, the Mirai look, and the agent layer's first slices (decisions, presences, finished and failed agents, the activity ribbon, §8.7). Still owed: the beta check in a window on the reference machine (the installed copy's first run, the settings sheet's mouse, the strip's buttons, Ctrl+Shift+J, the ribbon under a real atrium fleet). Next for the agent layer: the fit with atrium's next release, §8.7c (proposal; founder decisions listed there) | [v0.1.0](https://github.com/nativelite/foldwave/releases/tag/v0.1.0) |
 | M4 status (2026-09-24) | **Alpha proof met (2026-09-29): every §4 target measured in fwterm on the reference machine; scorecard in §10.1.** Before that, under way: Route A bundled: `tools/fetch_conpty.py` fetches Microsoft's ConPTY package (pinned, SHA-256 checked) beside `fwterm.exe`, with `THIRD-PARTY-NOTICES.md`; each pane falls back to the system conhost if the bundled host cannot start (pty-rs 1fa80be). **Scrollback (hot tail):** `ansi::Screen::with_history` keeps lines scrolled off the top as a ring of the screen's own rows (no copy), `vterm` `Term::with_history`, `fwrender::Frame::update_view`; fwterm scrolls with the wheel and Shift+PgUp/PgDn, anchored on the text while output flows, typing returns to live (default 10,000 lines). Cost measured: pipe lane 605.5 MiB/s without history, 418.1 with 10,000 lines — cold rows in a ~35 MB ring; compact lines (§8.3) are the fix. **Deep history (2026-09-23):** `fwterm --log DIR` writes the pane's output to its own panelog on a logger thread (bounded 4 MiB queue: the reader waits for the disk rather than growing memory; flushed when idle and on close), with a `vterm` checkpoint per MiB taken under the pane lock so it lands at the right offset. Scrolling past the in-memory history opens the log and rebuilds the screen at that line (nearest checkpoint + replay; p99 6.9 ms measured in M1). Checked in a window: 3,000 lines with 100 in memory, wheel back ~1,000 and ~2,930 lines showed lines 1974–1994 and 54–74 from the log. Pipe lane with logging 359.0 MiB/s (358.7, 359.0, 361.4), paced by panelog's single-thread writer; 418 without. Opt-in at first; on by default since 2026-09-24, within a budget (below). The hand-over between memory and log is approximate when lines wrap (a wrapped line is one log line, several screen rows). **Several panes (2026-09-23):** a window holds a tree of split panes over one cell grid, one-cell `│`/`─` dividers with joined corners, the lines around the focused pane in blue, all drawn into a single `fwrender::Frame` (`Frame::set_grid`, `update_view_at`, `put`), so neither backend changed. Windows Terminal's default keys: Alt+Shift+Plus/Minus/D split, Alt+Arrow or a click moves focus, Ctrl+Shift+W closes; a pane whose program exits closes, and the last one closes the window with its exit code; `--panes N` opens a near-square grid. Console-lane exit is now detected from the process (polled every 50 ms), since the console host keeps the output pipe open after its client exits; a closed pane's pseudoconsole is released (checked: its OpenConsole goes away). Measured over Remote Desktop on a noisy machine, so relative numbers only. One pane, pipe lane, 1 GiB via `fwprobe throughput`, alternating old/new builds: median 375.8 MiB/s before, 376.9 after, no regression. 16 panes, 1 GiB of `fwbench --emit` each, 2400x1300, `--max-fps 165`: one window against 16 separate windows of the same pane size, history off: 13.7 s output span at 132 fps against 15.6 s wall at 128–149 fps; history 10,000: 27.5–30.3 s at 90–109 fps against 32.6 s at 107–136 fps. Getting there took one fix: the UI thread took the 16 pane locks one after another, each waiting out that reader's chunk, and fell to 43–56 fps with history on; it now raises every due pane's `want` first so the waits overlap. Both layouts stall up to ~1.3 s now and then with 10,000-line history; that is the cold-memory cost compact lines address. **Selection and copy (2026-09-23):** drag selects within a pane (double-click: a word, by Windows Terminal's delimiters); the selection is pinned to output lines, not window rows, so it stays on its text while output scrolls in or the view scrolls back, and copies from history after its lines leave the screen (checked: the same two lines copied before and after ~40 new lines scrolled in). Ctrl+Shift+C copies, Ctrl+C copies while something is selected and otherwise still reaches the program (checked: it interrupts `ping`); Ctrl+V / Ctrl+Shift+V paste, line breaks sent as Enter. Cells are highlighted through `fwrender::Highlight` and the palette's selection colour; the clipboard is Win32 `CF_UNICODETEXT` on `fwrender::win::Window`. Since then: a wrapped line copies as the one line it was (2026-09-27 (ansi c0d2889 keeps a wrap mark per row and history line; vterm 33ecc3e sets it on autowrap; pane hosts send the marks with updates and history lines); bracketed paste and a hidden cursor are honoured since 2026-09-27 (vterm 1316682 tracks `?2004`, exposes `?25`; pane hosts send both with each update): a paste is wrapped in `ESC[200~`/`ESC[201~` when the program asked, with any such markers in the text dropped, and the cursor is not drawn while hidden. Dragging a selection past a pane's top or bottom scrolls it (2026-09-27): every 50 ms while held, moving or not, one line per row beyond the edge up to half the pane (`select::edge_scroll`), no further back than memory holds, the selection extended to the edge row; not in the view rebuilt from the log. Selection in the view rebuilt from the log (2026-09-27): drag, double-click and copy work on that screen's rows; the selection belongs to the rebuilt screen it was made on and stops showing once the view moves, since that view's rows line up with log lines only approximately. **No stray console (2026-09-23):** fwterm was a console-subsystem program, so started from Explorer or `Start-Process` it also got a console window of its own. It is now a GUI-subsystem program: one window (checked: its only visible top-level window is its own; its children are just the pane's OpenConsole and shell). Messages go to stderr when that is redirected, else to the terminal it was started from, attached only for the write (`fwrender::win::write_parent_console`) so that terminal's Ctrl+C never reaches fwterm (checked: `--bogus` shows its usage in the launching console). A shell no longer waits for fwterm; tools that launch and wait on it (`fwprobe`) are unaffected. **Fonts by name (2026-09-23):** `fwterm --font NAME` picks an installed family. `glyphs::describe` reads only each file's table directory and its `name`, `OS/2` and `post` tables; `fwrender::FontCatalog` scans the system and per-user font folders (305 faces in 12–20 ms, 5 runs, warm) and picks regular, bold, italic and bold italic by weight and slant. Without `--font`, the default loads from its known files with no scan. An unknown name lists the monospaced families found. Checked off-screen (CPU renderer to an image): Consolas and Courier New with all four styles, Lucida Console (regular only, as shipped), Cascadia Mono and Ubuntu Mono (per-user folder). A single-file variable family like Cascadia Mono draws bold from its own file at `wght` 700 (2026-09-27; glyphs a07c118 applies `gvar`; `FontFile::variations`); fwterm's default font is JetBrains Mono 2.304, compiled into it (founder, 2026-09-28: chosen for a simple, legible feel over Cascadia, Geist, Commit and Source Code Pro, compared off-screen; built in rather than fetched, so every build has it): its variable upright and italic files in `crates/fwrender/fonts/` (SIL OFL 1.1; `fwterm --licenses`), bold and bold italic their `wght` 700 instances; the system catalog lists it first, and any installed family still works with `--font`, and one without an italic face draws italic as its upright face slanted (2026-09-29, §11 row 12); CFF (`.otf` PostScript) outlines are refused with a clear message. **Compact lines (2026-09-24, §8.3):** `ansi::Screen` history now stores each line as it leaves as UTF-8 text plus runs of style in 64 KiB chunks (a one-style line: 12 bytes over its text), not as a row of 20-byte cells in a ring. The screen tracks, per row, whether everything written is one-byte characters in one style and mirrors those bytes, so the usual row is stored by copying them. Measured on the noisy Remote Desktop machine, old and new builds alternating. 16 panes, 1 GiB of `fwbench --emit` each, 2400x1300, `--max-fps 165`, 10,000-line history, 3 runs each: output span 26.2–27.1 s before, 16.4–16.7 s after (no history measured 13.7 s earlier); 107–108 fps before, 136–138 after; worst frame gap 133–222 ms before, 33–50 ms after; peak working set 239 MiB before, 119 MiB after. One pane: no change. `fwprobe throughput`, pipe lane, 1 GiB: 341–411 MiB/s before, 395–399 after. Emulation alone (177x47 flood, 9 rounds, medians): 10,000 lines cost 32% against no history, 35% with the ring. So the single-pane cost is now per-line work, about 20 ns in an emulator doing about 80 ns a line, not cold memory; recovering it would need cheaper style comparison or storing off the emulating thread. Styles are stored inline per run, 9 bytes each, not interned: runs are few, and a per-pane table would only grow. Scrolled-back views and copy decode a line once (`Screen::history_row`). **Logs by default (2026-09-24, §8.4):** every pane logs unless `--no-log`, to the fastest drive `--choose-log-drive` found or the OS's place, within a 10 GiB budget that also keeps a tenth of the drive free. Logs are chains of generations deleted oldest first; a coloured warning opens each pane when the drive is nearly full; scrolling back crosses generations (tested: rebuilds either side of a roll-over, and after the older one is deleted). The reader now hands bytes to the logger before the emulator sees them (§8.1). `resmon::volume` gives free space and the fixed drives. Details and measurements in §8.4. A pane whose log stops (a failed write, flush or roll-over, e.g. a full or removed drive) says so once in red, keeps new output in memory, and parses live from then on, since a hidden pane can no longer catch up from its log; the governor stops shedding it (2026-09-27). **GPU search index (2026-09-24, §8.7a):** the logs' search signatures are built on the GPU for every pane, off the loggers (−13 to −15 % of fwterm's CPU while logging a flood; identical to panelog's own). **Blocks (2026-09-24, §8.7):** shell-integration marks (OSC 133) cut output into commands; cmd.exe is set up automatically; Ctrl+Up/Down jump between prompts and Ctrl+Shift+O selects a command's output; marks are stored in the log. **Cross-pane search (2026-09-24, §8.5):** Ctrl+Shift+F searches every pane's log (all generations, indexed), newest first, and shows each hit rebuilt from the log with the match highlighted. **Idle (2026-09-25, §4):** measured on today's fwterm (logging, GPU indexer, governor on), idle 30 s after settling: 1 pane 0.35–0.50 % of one core, 16 panes 0.94 % (0.06 % of the machine), GPU no busier than with no fwterm (0.1–0.5 % vs 0.3–0.4 %). 16 panes first measured 3.1 %: loggers woke every 50 ms and console panes polled for exit every 50 ms. An idle logger now wakes once a second, and exit is polled every 200 ms. **Governor, first slice (2026-09-24, §8.8):** `resmon::cpu` (CPU sets, CPU time, thread placement); placing readers and the UI thread on P-cores measured no better (16 panes lost 10–20 % of their frame rate), so it is off by default (`--place fast`); under CPU pressure frames drop to 30 fps except just after input, which saves GPU work but only 2–4 % of fwterm's CPU, whose cost under a flood is parsing; a RAM budget per pane, deferred then (16 panes peaked at 119 MiB of 48.5 GB free), is built since 2026-09-29 (§8.8, memory budget). **Zoom and hidden-pane shedding (2026-09-24, §8.8):** Ctrl+Shift+Z zooms a pane; hidden panes only log (the default, §11 row 10; `--hidden busy` sheds only under pressure), and each catches up exactly from its log when shown (200 MB in about 0.3 s, without stalling the window). With 4 flooding panes and one shown, fwterm's CPU fell about 40 %. §8.2's checkpoint rebuild cannot work for an unparsed pane; the frozen emulator plus log replay replaces it. | [`crates/fwterm`](../crates/fwterm) |
 
 M1–M2 pay off in atrium before any GPU work, which de-risks the expensive part.
