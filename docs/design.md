@@ -1915,20 +1915,35 @@ trivially mapped, decided together before either side builds. Approvals routed
 to the focused pane (atrium's R10) land in fwterm as a bar with y / n / always
 keys, answered back over the channel.
 
-**What foldwave asks of atrium's release** (sent to the atrium session
-2026-11-08; its answers go here).
+**What foldwave asks of atrium's release**, and what the atrium session
+answered the same day (facts checked by it at atrium `8011dd9`; it stressed
+that the commitments are the founder's call, raised to them, and nothing below
+is a promise to build).
 
 1. Keep the pipe name `\\.\pipe\atrium-ctl-<pid>` and the token-free reads
-   (`list`, `status`, `bus feed`, `board list`) stable, and document them as the
-   surface a host terminal reads.
+   stable, and document them as the surface a host terminal reads. *Answer:*
+   the pipe name is current; the token-free verbs are exactly `list`, `status`,
+   `audit`, `board get`, `board list`, `bus feed`, `bus topics`
+   (`src/ctl/request.rs:140-166`, `Cmd::is_read_only`). They carry no stability
+   promise yet; the documented host path today is the sidecar snapshot. So
+   slice 3 keeps the sidecar as its fallback until atrium documents the reads.
 2. Emit the title and needs-you sequences when `TERM_PROGRAM=foldwave` exactly
    as for Windows Terminal; fwterm renders all four, the toast included.
+   *Answer:* not built; `PLAN.md` designs them for Windows Terminal, and keying
+   the full set to `TERM_PROGRAM=foldwave` is a one-line detection case if the
+   founder green-lights the feature, which sits on a build-or-retire list. Slice
+   2 is worth building regardless: BEL, titles and `OSC 9;4` come from other
+   programs too.
 3. Pass the host's `FOLDWAVE_*`, `TERM_PROGRAM*` and `TMUX*` variables through
    to its panes unchanged, and prepend its own `tmux` shim directory so atrium's
-   shim is the one its agents find.
+   shim is the one its agents find. *Answer:* passthrough holds today
+   (`pane_base_env` is additive and nothing clears the environment in
+   `pane_spawn.rs` or `spawn.rs`); the shim and any PATH prepend do not exist
+   yet (the next spike), and which shim wins is a design point for the founder.
 4. In the daemon design, make "the host supplies the pane" a first-class
    option: `spawn` asks `FOLDWAVE_CTL` when it is set, and the pane stream
-   format is agreed with foldwave.
+   format is agreed with foldwave. *Answer:* no current plan in atrium; the
+   proposal stays here for the founder to pick up.
 
 **Open for the founder.**
 
