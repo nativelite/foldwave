@@ -1821,21 +1821,45 @@ session working on the release confirmed the list; paths are in the atrium repo)
   alternate screen, and no title, OSC 7, OSC 9 or BEL (`src/filter.rs`,
   `src/screen.rs:38-40`).
 
-**What its next release adds** (atrium's plans, surveyed 2026-11-08).
+**What atrium 0.42.0 and 0.43.0 shipped, both on 2026-11-08** (tags `v0.42.0`,
+`v0.43.0`; `CHANGELOG.md`; read 2026-11-09).
 
-- Title and "needs you" (`PLAN.md`; founder decisions of 2026-09-18 recorded
-  there): an `OSC 2` title `atrium · <name> · <state>`, change-gated; on a
-  transition to needs-you, one BEL and/or an `OSC 9` toast (default both, 30 s
-  cooldown per pane), plus Windows Terminal's taskbar state `OSC 9;4;2;0` /
-  `9;4;0;0`; children's own OSC 0/1/2 titles stripped. Not built yet
-  (`src/attention.rs` does not exist).
-- A `tmux`-compatible shim forwarding to ctl, so Claude Code's own agent teams
-  get atrium's chrome ([prior-art](prior-art.md#agent-teams-want-a-tmux-verb-set));
-  landed on atrium's main on 2026-11-08 (`src/tmux_shim.rs`, unreleased);
-  hook-injected status for unmodded panes; a held `inbox --wait` instead of the
-  poll; the model's own messaging (`SendMessage`, `ListAgents`) routed through ctl
-  (`PLAN-mod.md` R6); approvals routed to wherever the human is (R10); any Claude
-  Code on the machine joining a broker as a remote pane (R18).
+- Title and "needs you" (0.43.0, `src/attention.rs`, atrium issue #19; the
+  plan of 2026-09-18): the host's title becomes `atrium · <name> · <state>`
+  (`? builder needs you · 2 working`, `● 3 working`, `○ idle`), written only
+  when it changes, the host's own title pushed at startup and popped at exit
+  with the XTWINOPS title stack (`ESC[22;2t` / `ESC[23;2t`); a pane newly
+  waiting on approval (per pane, 30 s cooldown) or a decision newly addressed
+  to the human rings: `BEL`, an `OSC 9` toast (`ESC]9;<text>BEL`; the module
+  header names fwterm as a host that shows it) and the progress state `OSC
+  9;4;2;0` while anything needs you, `9;4;0;0` after. `notify` = `both`
+  (default), `bell`, `toast`, `off`. Emitted for every host, not keyed on
+  `TERM_PROGRAM`. Children's own OSC 0/1/2 titles are stripped.
+- Claude Code's agent teams as atrium panes (0.42.0) through the
+  `tmux`-compatible shim ([prior-art](prior-art.md#agent-teams-want-a-tmux-verb-set)),
+  a `teams` key (`show` or `off`), and in 0.43.0 the shim's protocol half moved
+  to `nativelite-tmuxproto` (§11 row 19). A claude pane that carries `TMUX` is
+  launched with `--teammate-mode auto` (split panes inside tmux, in-process
+  otherwise) when the claude is 2.1.50 or newer and the user passed no
+  `--teammate-mode` of their own; the option is hidden from `claude --help`.
+- Certainty status for a claude pane without the mod (0.43.0, issue #16):
+  the pane is launched with `--settings <atrium's hooks file>` whose hooks run
+  `atrium ctl report status=…` on prompt submit, tool use, permission request,
+  stop and session end, so the yellow border lands within a tick.
+- The token-free ctl reads are a documented, stable surface for a host
+  terminal (0.43.0, issue #20; `docs/control-plane.md`, "Reading the control
+  plane from a host"): replies are additive-only, `ok` is always present and
+  `{"ok":false,"err":"<text>"}` is the only failure shape, pane ids are stable
+  for the session, status words are the agsess vocabulary, the sidecars stay
+  as the fallback, and `list` names the answering atrium's version so a host
+  keys its expectations on it. Wire-golden tests pin the shapes.
+
+**Still planned on atrium's side.** `nativelite-ipc` (issue #14, open; §11
+row 20); the ctl doorbell and a held inbox connection (issue #15); the model's
+own messaging (`SendMessage`, `ListAgents`) routed through ctl (`PLAN-mod.md`
+R6); approvals routed to wherever the human is (R10); any Claude Code on the
+machine joining a broker as a remote pane (R18).
+
 - Further out (`.atrium-dev/ROADMAP.md:64-73`, "Own-terminal, Phase 2 +
   cross-terminal coordination"): a headless daemon that owns the ptys, the Job
   Object, the pane buffers and the bus and board, with a reattachable front end,
@@ -1864,7 +1888,9 @@ planned.
    levels down still sees them. No runtime cost.
 2. *Attention.* fwterm renders what atrium's title plan emits, and more of it
    than Windows Terminal does: `OSC 0/2` becomes the pane's title (in the strip
-   beside the AGENTS glyphs, and the window title follows the focused pane);
+   beside the AGENTS glyphs, and the window title follows the focused pane),
+   with the XTWINOPS title stack (`ESC[22;2t` saves, `ESC[23;2t` restores),
+   which atrium uses to give the title back at exit;
    `OSC 9;4` sets a progress badge on the pane and the taskbar button's state
    (`ITaskbarList3`); BEL flashes the pane's focus brackets once and raises an
    ask the way a decision does, so Ctrl+Shift+J reaches it; an `OSC 9` toast
@@ -1925,40 +1951,42 @@ is a promise to build).
    stable, and document them as the surface a host terminal reads. *Answer:*
    the pipe name is current; the token-free verbs are exactly `list`, `status`,
    `audit`, `board get`, `board list`, `bus feed`, `bus topics`
-   (`src/ctl/request.rs:140-166`, `Cmd::is_read_only`). They carry no stability
-   promise yet; the documented host path today is the sidecar snapshot. So
-   slice 3 keeps the sidecar as its fallback until atrium documents the reads.
+   (`src/ctl/request.rs:140-166`, `Cmd::is_read_only`). At the time they
+   carried no stability promise. **Done in 0.43.0** (issue #20): the promise
+   above, with the sidecar as the documented fallback. Slice 3 builds on it.
 2. Emit the title and needs-you sequences when `TERM_PROGRAM=foldwave` exactly
    as for Windows Terminal; fwterm renders all four, the toast included.
-   *Answer:* not built; `PLAN.md` designs them for Windows Terminal, and keying
-   the full set to `TERM_PROGRAM=foldwave` is a one-line detection case if the
-   founder green-lights the feature, which sits on a build-or-retire list. Slice
-   2 is worth building regardless: BEL, titles and `OSC 9;4` come from other
-   programs too.
+   *Answer:* not built at the time; on a build-or-retire list. **Built in
+   0.43.0** (issue #19), and emitted for every host, so no keying was needed.
+   Slice 2 renders exactly those sequences, the title stack included.
 3. Pass the host's `FOLDWAVE_*`, `TERM_PROGRAM*` and `TMUX*` variables through
    to its panes unchanged, and prepend its own `tmux` shim directory so atrium's
    shim is the one its agents find. *Answer:* passthrough holds today
    (`pane_base_env` is additive and nothing clears the environment in
-   `pane_spawn.rs` or `spawn.rs`); the shim and any PATH prepend do not exist
-   yet (the next spike), and which shim wins is a design point for the founder.
+   `pane_spawn.rs` or `spawn.rs`); the shim and any PATH prepend did not exist
+   yet. **Shipped in 0.42.0**: atrium prepends its shim directory in claude
+   panes of ctl sessions with `teams = show`, so inside atrium its shim wins,
+   as the founder decided (§11 row 19).
 4. In the daemon design, make "the host supplies the pane" a first-class
    option: `spawn` asks `FOLDWAVE_CTL` when it is set, and the pane stream
    format is agreed with foldwave. *Answer:* no current plan in atrium; the
    proposal stays here for the founder to pick up.
 
-**State of atrium's side, 2026-11-08 evening** (from the atrium session, at
-atrium main `f180ef5`; issue numbers are on `nativelite/atrium`).
+**State of atrium's side** (first from the atrium session at main `f180ef5`
+on the evening of 2026-11-08, then re-read from the repo on 2026-11-09 at
+`289349e`, the 0.43.0 release; issue numbers are on `nativelite/atrium`).
 
-- atrium 0.42.0 has not shipped: it is main as of `962398f`, gated on the
-  founder's live probe (a real Claude Code lead in `atrium --allow-ctl claude`
-  spawning a split-pane teammate). Its `PLAN.md` is now the 0.43.0 plan, in the
-  order #13, then #14, then #15.
-- #13: the shared tmux verb crate (§11 row 19). Done the same evening, ahead
-  of 0.42.0: `nativelite-tmuxproto` 0.1.0, which atrium depends on by path
-  since `15bc1f7`; its API is in row 19. The parsing, the `#{…}` expansion, the
+- 0.42.0 and 0.43.0 both shipped on 2026-11-08 (what each holds is above).
+- #13, the shared tmux verb crate (§11 row 19): done. `nativelite-tmuxproto`
+  0.1.0 is on crates.io (`cargo search` finds it); atrium depends on it by
+  version and path, the org convention. The parsing, the `#{…}` expansion, the
   POSIX-sh word split (so no shell is needed, Windows included) and the
   `Broker` trait a backend implements all live there.
-- #14: `nativelite-ipc` (§11 row 20), milestone 0.43.0, not started. The API
+- #16 (certainty status through settings hooks), #19 (attention) and #20 (the
+  stable host-read surface): closed, in 0.43.0. #17 (teams follow-ups: the
+  fake-claude e2e, the first split's size) and #21 (housekeeping): open.
+- #14: `nativelite-ipc` (§11 row 20), open and not started; its gate, "after
+  0.42.0", has passed. The API
   fwterm builds against is what `src/ipc.rs` exposes today, expected to carry
   over in shape: server `Listener::bind(addr)`, `poll() -> Option<String>`
   (non-blocking, one complete request line), `respond(&str)` (never blocks),
@@ -1966,12 +1994,9 @@ atrium main `f180ef5`; issue numbers are on `nativelite/atrium`).
   String`, one JSON line each way, one request per connection. #15 adds a
   held-connection mode beside it (the ctl doorbell and a held inbox); nothing
   builds on that until it exists.
-- #19: the attention sequences, build-or-retire, still unbuilt. #20: the
-  stability promise for the token-free reads, 0.43.0, not yet written. The pipe
-  name and the token-free verb list are unchanged since the morning.
-- New: a `teams` key (`show` or `off`, config and per fleet, `962398f`); the
-  shim's directory is prepended only for claude panes in ctl sessions with
-  `teams = show`.
+- The pipe name and the token-free verb list are unchanged since the morning.
+  The `teams` key (`show` or `off`, config and per fleet): the shim's directory
+  is prepended only for claude panes in ctl sessions with `teams = show`.
 
 **Values fwterm's shim matches** (so a Claude Code lead moves between hosts
 without surprises; from atrium's shim, read against `claude.exe` 2.1.289):
@@ -1987,11 +2012,15 @@ Claude Code drops to 256 colours. PATH: atrium prepends
 `%LOCALAPPDATA%\atrium\shim`, holding a `tmux.exe` that is a hard link or copy
 of its own binary, refreshed when the binary changes; fwterm would do the same
 under its own folder. The teammate's argv arrives as one sh-quoted string after
-`--`, and its role is its `--agent-name`. `capture-pane` is refused by the
-shared crate itself (exit 1), not only by atrium, so fwterm's shim refuses it
-too unless the founder wants the crate to grow a host-opt-in for it; serving
-it from the pane's memory or log is what fwterm could do (slice 4), and the
-question is listed as open below.
+`--`, and its role is its `--agent-name`. A claude launched into a pane that
+carries `TMUX` gets `--teammate-mode auto` appended when it is 2.1.50 or newer
+and the user passed no `--teammate-mode` (atrium 0.43.0 does this; fwterm's
+shim does the same, or Claude Code's teams stay in-process). `capture-pane` is
+refused by the shared crate itself (exit 1), and its reason settles the
+question raised earlier here: a host should never hand one pane the text of
+another, since a teammate could read its lead's screen. fwterm follows the
+crate; its own views keep reading the pane's log for the human, which is a
+different thing.
 
 **Decided (founder, 2026-11-08; §11 rows 19 and 20).** Both shims are built
 and share one small crate for the tmux verb parsing, atrium's shim inside
@@ -2005,11 +2034,8 @@ regardless), and the slice order above stands, slices 1 and 2 starting now.
 
 **Still open for the founder.**
 
-- When `nativelite-ipc` publishes (atrium raised the crates.io step), and when
-  `nativelite-tmuxproto` does (fwterm depends on it by path until then).
-- Whether `nativelite-tmuxproto` should let a host opt in to `capture-pane`,
-  so fwterm's shim can serve a pane's text from its log; today the crate
-  refuses it for every host.
+- When `nativelite-ipc` is built and published (atrium issue #14; its "after
+  0.42.0" gate has passed). Slices 3 and 4 wait on it; slices 1 and 2 do not.
 
 ### 8.8 The resource governor
 **CPU pressure is the first input, not one of many.** On an agentic machine the
@@ -2614,8 +2640,8 @@ Founder answers of 2026-09-15.
 | 16 | Beta scope | **Founder decision (2026-09-29): M5 is a settings screen, packaging and first run, the agent layer, and foldwave's own look** (neo-Tokyo leaning) | The local AI server comes last, if at all (§8.7a). The look is a proposal until the founder picks one. **Settings sheet built 2026-09-29** (`settings_ui.rs`, the Mirai-05 board): Ctrl+, opens it over the panes, drawn in the grid; Appearance (theme, font, size, instrument strip), Paste (the multi-line question), Logs (folder, cap). Keys: arrows, Tab, Enter to edit or press, Ctrl+S, Esc. Mouse (2026-10-18, the founder wanted to click around the sheet): a click selects a row, flips a switch, steps a choice (its `‹` back), opens text for typing or presses a button, one outside the sheet closes it, and the wheel moves the focus; `Form::click` reads the same layout `render` draws. Saving rewrites only its keys in fwterm.conf, every other line kept; theme, strip and paste question apply at once, the rest say `next start`. `font =` and `px =` are new settings keys (`--font`/`--px` still win). Checked in a window with a scratch settings file: classic applied live, the strip hidden live, the file's own lines kept. **First run built 2026-09-29** (`first_run.rs`, the Mirai-06 board): while there is no `fwterm.conf` (or with `--first-run`; not with `--pipe` or `--stats`), the window asks three things before any pane starts, drawn in the grid like the sheet. *Shell*: the shells found (PowerShell 7, Windows PowerShell, Command Prompt, Git Bash, WSL), saved as the new `shell =` key (a program after `fwterm --` still wins; cmd.exe without either); one found on PATH is saved by name, since a Store install's folder carries its version. *Logs*: every fixed drive measured for durable writes on a thread, one at a time, with a meter; the fastest with room for the cap is chosen unless one is picked, and Enter on Continue keeps whichever is fastest when the step is left; a drive that cannot be written says why. *Look*: the theme, previewed live with its sixteen colours and title bar, and the instrument strip. Finish saves the five keys (other lines kept); Skip saves nothing, so it asks again. Closing the window stops the measurement after its current 1 MiB write and removes its scratch folder (a killed process leaves it). The sheet gained a Shell field. Checked in windows with an empty scratch settings folder: the three steps, the meter mid-measurement, a drive that cannot be written (G:), classic previewed, the strip off, pwsh started from `shell = pwsh.exe -NoLogo` with logs on E:, no first run on the next start, and no scratch folder after closing mid-measurement. **Packaging built 2026-09-30:** the download is one file, `foldwave-setup-<version>.exe` (`python dev.py package`, `tools/package.py`), which is fwterm itself carrying Microsoft's ConPTY files (fetched pinned and SHA-256 checked, built in through `FOLDWAVE_CONPTY_DIR`). Started under that name (or with `--install`) it installs for the one user, no administrator: fwterm.exe, conpty.dll and OpenConsole.exe into `%LOCALAPPDATA%\Programs\foldwave`, a Start-menu shortcut (Shell Link written by `install.rs`: an item list the shell resolves, with the name, working folder and icon), and an Apps & features entry through `reg.exe import` whose Uninstall runs `fwterm.exe --uninstall`; adds the install folder to the user's own PATH, so `fwterm` works in any terminal opened afterwards (read and written back through `reg export`/`reg import` in UTF-16, so no other entry or the value's type changes; then `WM_SETTINGCHANGE` is broadcast, `fwrender::win::announce_environment_change`); then it starts the installed fwterm, whose first run follows. Added 2026-09-30 after the founder's `fwterm` was not found in a terminal; checked on the real user PATH: install appended the folder once, a second install nothing, uninstall left it identical in text and type. A file in use (a foldwave window open) is renamed aside, which Windows allows, and swept on the next install. Uninstall removes the entry, the PATH entry, the shortcut and the folder's own files (its own exe just after it exits) and keeps settings and logs. A failure shows in a small Mirai window; `--quiet` shows none and starts nothing. `fwterm.exe` now has its own resources, written by `build.rs` with the standard library (`winres.rs`) and taken by the MSVC linker as a `.res` file: the Reticle at 16-96 and 256 px from the same code as the window icon, and version information (foldwave, nativelite, the crate version) for Explorer and Task Manager. 3.3 MiB in all. Checked without a window: the icon read back through Windows at 16, 48 and 256 px, the version strings; an install into scratch folders (files identical to the build and the pinned package; the shortcut's target, folder, icon and description read back by `WScript.Shell`; every Apps & features value), a reinstall with the old exe held open (set aside, new one written), and an uninstall run as the installed copy (folder, shortcut and entry gone). Not checked in a window: the post-install start and the message window. **The founder's atrium session (2026-09-30), four findings, all fixed.** (1) *Mouse for programs* (atrium's Ctrl+A m clicks, scrolling inside it): fwterm never reported the mouse. `vterm` now tracks `?1000`/`?1002`/`?1003` and `?1006` (`Term::mouse_tracking`, `mouse_sgr`; not in checkpoints), pane hosts send them in the update flags, and `mouse.rs` encodes presses, drags, releases and the wheel (SGR, or the original encoding up to column 223) for the pane under the pointer; Shift keeps the mouse fwterm's (select, scroll back), as does a view scrolled into history. On the alternate screen with no tracking the wheel sends Up/Down, three a notch, as Windows Terminal does. On Windows atrium does not read these sequences itself: rawterm turns on console mouse input, the console host asks the terminal for SGR reports (the `?1000`..`?1006` in the log) and turns fwterm's reports into mouse events for atrium. Checked with a probe program in a pane that printed its input into the pane log (off-screen, keys and clicks posted, focus unchanged): `ESC[<0;6;3M`, `ESC[<32;14;3M`, `ESC[<0;14;3m`, `ESC[<64;..M`, `ESC[<65;..M`, and three `ESC[A` per notch on the alternate screen. Not checked: atrium's own reaction to a real click (needs the founder's mouse). (2) *Scrolling back after a full-screen program* showed its screens (founder: skip them, keep them reachable): the reader marks each alternate-screen switch in the log (`E`/`X`, `altscreen.rs`, a split sequence found across chunks; the chunk's marks now go to panelog sorted, which rejects them out of order), and the log view counts only lines outside those stretches, both ways (`line_back`, `back_of`, so Ctrl+Up agrees); a search hit inside one still opens that screen. (3) *Leftover characters in atrium* (`botherun`, `Ra` at line starts): not foldwave, whose log replayed through vterm and through Windows' own console host (hidden, 67x284) gave the same screen. Root cause (a diagnosis agent, byte-level): rawterm's Windows raw output mode lacked `DISABLE_NEWLINE_AUTO_RETURN`, so the console atrium writes to turned the bare LF its inner console host moves down a row with into CR LF: indented rows landed in column 0 and cells atrium skipped as unchanged kept old text. Restoring those 40 bare LFs in the captured bytes gave a clean screen. Fixed in rawterm (the flag, with a fallback for a console that refuses it; matches clearing `OPOST` on Unix); atrium and agtop gates green. (4) *A message to another agent that seemed lost* had arrived and run; the lead's wait ended while the new agent's hooks were still slow |
 | 17 | foldwave's look | **Founder decision (2026-09-29): 未来 Mirai, a holographic-HUD look, ships as the default; the colour scheme is customizable** | Picked from six directions sketched on a design canvas (claude.ai artifact BDHeQTZMqywKCdCm75o7nS). Icon: 01 Reticle (a hex frame with ticks and a lilac wave locking onto a cyan dot). Wordmark `[ FOLDWAVE ]` in Michroma, with フォールドウェーブ; all lockups kept. Colours: background #060b12, surface #0d1622, text #dff6ff, dim #7f9bb0, accent #5ef2ff, holo #b9a6ff, selection #173247, bar #0f2233, rules #5ef2ff at 25 %; terminal colours 0-15 #0d1622 #ff5c7a #4dffb4 #ffe066 #5aa9ff #b9a6ff #5ef2ff #cfe6f2 #6b8296 #ff8aa0 #8affd0 #fff09a #8cc4ff #d4c8ff #9ff8ff #ffffff (each but 0 at 4.5:1 or better on the background). The terminal: focus shown by cyan corner brackets, hairline rules, an instrument strip under the title bar, `FIND ›` in the search bar. **Built 2026-09-29 (colours):** `theme.rs`, Mirai the default and `classic` the old greys (`--theme`, or `theme =` in fwterm.conf); any colour changed with `color.<name> = #rrggbb` (bg, fg, selection, dim, accent, rule, bar, bar_text, error, ansi0..ansi15), a key it cannot use named once. The dividers are hairlines in the rule colour, and the focused pane's corners run a few cells in the accent; the bars' names (`FIND ›`, `PASTE ›`) are in the accent. Checked in windows: 4 panes in Mirai and in classic, and an orange accent and brown bar set in a scratch settings file. **Built 2026-09-29 (window):** the Reticle is drawn in code (`icon.rs`, 16 samples a pixel, a simplified form at 24 px and under) at the two sizes the window's DPI needs, 0.8 ms at 100 % and 6.2 ms at 300 %, and set as the window's icon; the title bar takes the theme's `title_bar` colour, text and rule (Windows 11 DWM attributes; classic leaves the system's). The executable's own icon in Explorer: built 2026-09-30, see row 16 (packaging). **Built 2026-09-29 (instrument strip):** the grid's top row, in the title bar's colour: `PANES · FOCUS · CPU · LOG <drive> <free> FREE · INDEX · HOSTS up/all` (`strip.rs`; hosts in green, red when one is down). CPU is fwterm's (window and hosts) share of the machine, from the governor's half-second reading, which wakes the window only when the tenths it shows change; free space is read every 5 s. `instruments = off` in fwterm.conf hides it. At its right end, `SETTINGS` and `HELP`, lit under the pointer, which becomes a hand, open the settings sheet and the keys help (F1), for whoever does not know the keys (a gear glyph was tried first and came through the font fallback wider than a cell). Idle, 16 panes, 4 runs of 30 s: 0.78–0.99 % of one core, against 0.78–0.88 % without it **Smooth resizing (2026-09-30):** the founder found resizing rough: dragging an edge, the window grew undrawn and, from the top edge, the strip slid out of view until the mouse was released. Windows runs its own loop inside the window's message handling while an edge or the title bar is dragged, and fwterm drew from that same thread. `fwrender::win::Window` now runs its window and messages on a thread of its own, which that loop blocks; events reach the caller through a queue and an event handle, and a `Waker` goes straight to the caller, so fwterm keeps drawing at each new size while the edge moves. Shift, Ctrl and Alt are read on the window thread as each key or click arrives. Measured (2,000 characters posted from another thread each run, release, 3 runs; `input_to_wait_latency`): median 23.2–23.9 µs before, 27.6–33.1 µs after; p90 72–77 µs before, 84–98 after; p99 525–545 µs before, 480–543 after, against a 5 ms key-latency target. Checked: a test holds the window thread busy 600 ms, as the drag loop would, and a wake still ends `wait` within 200 ms; fwterm resized from a script to five sizes, growing from the top among them, drew the strip and the pane at each, as the old build did; characters posted to the window reached pwsh; the clipboard works from fwterm's thread (the founder's clipboard saved and restored around the test). The drag itself needs a real mouse and is the founder's to try. Also: the settings key is Ctrl and the comma key, which "Ctrl+," hid (the founder tried Ctrl and plus), so each pane's first line now says `settings: Ctrl+Comma`, as do the help and the first run |
 | 18 | Tabs | **Founder decision (2026-09-30): tabs are a later addition, not part of M5.** A tab that is not shown is not drawn or parsed, as a hidden pane is today (row 10); switching to one loads it lazily, catching up from its log, for the fastest window, with a loading animation while it does | Not built. The keys, where tabs are shown and the animation are proposals until then: Windows Terminal's keys (Ctrl+Shift+T new, Ctrl+Tab and Ctrl+Shift+Tab to switch), tabs listed in the instrument strip |
-| 19 | The `tmux` shims (§8.7c, slice 4) | **Founder decision (2026-11-08): both shims share one small crate for the tmux verb parsing; atrium's shim is used inside atrium's panes, fwterm's everywhere else** | The crate parses the verbs Claude Code's team backend issues (`-V`, `new-session`, `split-window`, `send-keys`, `list-panes`, `kill-pane`, `display-message -p`, `capture-pane -p`, and `set-option`, `select-pane`, `select-layout`, `resize-pane`, `list-windows`, `new-window`, `has-session`, `show-environment -g`, `load-buffer`, with their flags and `#{…}` format strings; the full set is in [prior-art](prior-art.md#agent-teams-want-a-tmux-verb-set)) into a typed request and formats the replies; each shim supplies its own backend (atrium's ctl, fwterm's host channel). Std only, MIT, one concern (§1 of the charter). atrium's shim already landed on its main the same day (`src/tmux_shim.rs`, `25a0ded`, unreleased): the parsing is pure functions and the backend sits behind a `Broker` trait, so the extraction is a move, not a rewrite. **Built 2026-11-08 evening as [`nativelite-tmuxproto`](https://github.com/nativelite/tmuxproto) 0.1.0** (founder-chosen name; private repo, checkout `repos/tmuxproto`, `98644c4`; std only, MIT; verified here: no dependencies, gate green). Not on crates.io until the founder approves a publish, so fwterm depends on it by path as atrium does (`tmuxproto = { package = "nativelite-tmuxproto", version = "0.1", path = "../tmuxproto" }`). API (`src/lib.rs`): `parse(&[String]) -> Verb`, `Target` and `parse_target`, `expand(fmt, Option<&PaneView>, &View)` for `#{…}` strings, `sh_words`, `agent_name(argv)`, `trait Broker { caller, list, spawn(here, role, argv), kill, send }`, `run(Verb, &mut dyn Broker, Host) -> Outcome { stdout, stderr, code }`, `Host { session_name, version_suffix }` (fwterm: `"fwterm"`, so `tmux -V` prints `tmux 3.5a-fwterm`), `NoBroker` and `needs_broker` for the verbs answered before a session exists, `WINDOW_ID = "@0"`. The crate itself refuses `capture-pane` (exit 1), so a host cannot expose pane text by accident; changes to the verb set go through its CHANGELOG. atrium is now only a backend plus the pane environment |
-| 20 | The control channel's transport | **Founder decision (2026-11-08): atrium's `ipc` module (the local JSON-line request/reply pipe or socket) moves to a shared `nativelite-ipc` crate after atrium 0.42.0 ships**; fwterm's host channel and its ctl client use it | Until then fwterm builds nothing on the module; slice 3's reads can start with a client of its own against the documented framing (one line each way per connection) if they are wanted before the move, else they wait. The move is atrium's release work, listed here so foldwave does not duplicate it. Checked 2026-11-08 evening: atrium is still 0.41.0 on main, no ipc crate exists in the org yet |
+| 19 | The `tmux` shims (§8.7c, slice 4) | **Founder decision (2026-11-08): both shims share one small crate for the tmux verb parsing; atrium's shim is used inside atrium's panes, fwterm's everywhere else** | The crate parses the verbs Claude Code's team backend issues (`-V`, `new-session`, `split-window`, `send-keys`, `list-panes`, `kill-pane`, `display-message -p`, `capture-pane -p`, and `set-option`, `select-pane`, `select-layout`, `resize-pane`, `list-windows`, `new-window`, `has-session`, `show-environment -g`, `load-buffer`, with their flags and `#{…}` format strings; the full set is in [prior-art](prior-art.md#agent-teams-want-a-tmux-verb-set)) into a typed request and formats the replies; each shim supplies its own backend (atrium's ctl, fwterm's host channel). Std only, MIT, one concern (§1 of the charter). atrium's shim already landed on its main the same day (`src/tmux_shim.rs`, `25a0ded`, unreleased): the parsing is pure functions and the backend sits behind a `Broker` trait, so the extraction is a move, not a rewrite. **Built 2026-11-08 evening as [`nativelite-tmuxproto`](https://github.com/nativelite/tmuxproto) 0.1.0** (founder-chosen name; private repo, checkout `repos/tmuxproto`, `98644c4`; std only, MIT; verified here: no dependencies, gate green) **and published to crates.io the same night** (found by `cargo search` on 2026-11-09). fwterm depends on it by version and path as atrium does (`tmuxproto = { package = "nativelite-tmuxproto", version = "0.1", path = "../tmuxproto" }`). API (`src/lib.rs`): `parse(&[String]) -> Verb`, `Target` and `parse_target`, `expand(fmt, Option<&PaneView>, &View)` for `#{…}` strings, `sh_words`, `agent_name(argv)`, `trait Broker { caller, list, spawn(here, role, argv), kill, send }`, `run(Verb, &mut dyn Broker, Host) -> Outcome { stdout, stderr, code }`, `Host { session_name, version_suffix }` (fwterm: `"fwterm"`, so `tmux -V` prints `tmux 3.5a-fwterm`), `NoBroker` and `needs_broker` for the verbs answered before a session exists, `WINDOW_ID = "@0"`. The crate itself refuses `capture-pane` (exit 1), so a host cannot expose pane text by accident; changes to the verb set go through its CHANGELOG. atrium is now only a backend plus the pane environment |
+| 20 | The control channel's transport | **Founder decision (2026-11-08): atrium's `ipc` module (the local JSON-line request/reply pipe or socket) moves to a shared `nativelite-ipc` crate after atrium 0.42.0 ships**; fwterm's host channel and its ctl client use it | Until then fwterm builds nothing on the module; slice 3's reads can start with a client of its own against the documented framing (one line each way per connection) if they are wanted before the move, else they wait. The move is atrium's release work (atrium issue #14), listed here so foldwave does not duplicate it. Checked 2026-11-09: atrium 0.42.0 and 0.43.0 have shipped, so the gate has passed; the crate is not started and no ipc repo exists in the org yet |
 | 21 | Toasts | **Founder decision (2026-11-08): Windows notifications too, if they can be done within the rules**; fwterm's own bar toast ships regardless | Two zero-dependency routes to spike, both our own FFI over std: WinRT toasts through COM activation (`RoGetActivationFactory`, `ToastNotificationManager`), which need an AppUserModelID that the installer registers with the Start Menu shortcut (packaging, §10 M5); or the shell's notification-area balloon (`Shell_NotifyIcon`), which Windows 10 and 11 show as a toast and which needs a tray icon but no registration. Pick by the spike; fall back to the bar alone if neither is clean |
 | 22 | Order of the agent-layer slices | **Founder decision (2026-11-08): the order in §8.7c stands**: pane identity, then attention, then fwterm as a ctl client, then fwterm's own shim; the first two start now, since they wait on nothing | Slices 3 and 4 wait on `nativelite-ipc` (row 20) and the shared verb crate (row 19). The beta check in a window (§10 M5 status) is unchanged and runs when the founder is at the machine |
 
