@@ -298,6 +298,9 @@ keys:
         host_log: Option<String>,
         host_gen: u64,
         host_id: usize,
+        /// The window's process id, for `FOLDWAVE_WINDOW` in the pane's
+        /// environment (§8.7c); 0 means this process is the window.
+        host_window: u32,
         /// The window builds this pane host's search signatures (GPU).
         host_window_signs: bool,
         hidden: Hidden,
@@ -344,6 +347,7 @@ keys:
             host_log: None,
             host_gen: 256 << 20,
             host_id: 0,
+            host_window: 0,
             host_window_signs: false,
             hidden: Hidden::Always,
             zoom: false,
@@ -496,6 +500,10 @@ keys:
                 "--host-id" => {
                     let v = value(&mut i, "--host-id")?;
                     a.host_id = v.parse().map_err(|_| format!("bad --host-id {v:?}"))?;
+                }
+                "--host-window" => {
+                    let v = value(&mut i, "--host-window")?;
+                    a.host_window = v.parse().map_err(|_| format!("bad --host-window {v:?}"))?;
                 }
                 "--shell-integration" => {
                     let v = value(&mut i, "--shell-integration")?;
@@ -3691,6 +3699,7 @@ keys:
                 });
             }
             let session = start_session(
+                id,
                 args,
                 rows,
                 cols,
@@ -3745,7 +3754,8 @@ keys:
             .args(["--host-size", &format!("{rows}x{cols}")])
             .args(["--history", &args.history.to_string()])
             .args(["--host-id", &id.to_string()])
-            .args(["--host-gen", &gen.to_string()]);
+            .args(["--host-gen", &gen.to_string()])
+            .args(["--host-window", &std::process::id().to_string()]);
         if args.pipe {
             cmd.arg("--pipe");
         }
@@ -3877,6 +3887,7 @@ keys:
     /// `shared`: the part of a pane that a pane host runs too.
     #[allow(clippy::too_many_arguments)]
     fn start_session(
+        id: PaneId,
         args: &Args,
         rows: usize,
         cols: usize,
@@ -3899,12 +3910,24 @@ keys:
                 place.clone(),
             )
         };
+        // What the program learns about where it runs (§8.7c, slice 1), then
+        // the shell's own prompt marks.
+        let window = if args.host_window != 0 {
+            args.host_window
+        } else {
+            std::process::id()
+        };
+        let mut env = pane_identity(id, window);
+        if args.shell_integration {
+            env.extend(shell_integration(&args.shell[0]));
+        }
         let session = if args.pipe {
             use std::os::windows::process::CommandExt;
             use std::process::{Command, Stdio};
             // CREATE_NO_WINDOW: no console at all, not even a hidden one.
             let mut child = Command::new(&args.shell[0])
                 .args(&shell_args)
+                .envs(env.iter().map(|(k, v)| (k, v)))
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -3928,11 +3951,6 @@ keys:
                 _job: job,
             }))
         } else {
-            let env = if args.shell_integration {
-                shell_integration(&args.shell[0])
-            } else {
-                Vec::new()
-            };
             let pty = pty::Pty::spawn_with_env(
                 &args.shell[0],
                 &shell_args,
@@ -3971,6 +3989,23 @@ keys:
             "PROMPT".into(),
             format!(r"$E]133;D$E\$E]133;A$E\{own}$E]133;B$E\"),
         )]
+    }
+
+    /// What a pane's program learns about where it runs (design §8.7c, slice
+    /// 1): the terminal's name and version, as other terminals set them, the
+    /// pane's id (stable for the window's life) and the window's process id.
+    /// A pane host sets them too, from the `--host-id` and `--host-window` the
+    /// window gave it, so a program sees the same four either way.
+    fn pane_identity(pane: PaneId, window: u32) -> Vec<(String, String)> {
+        vec![
+            ("TERM_PROGRAM".into(), "foldwave".into()),
+            (
+                "TERM_PROGRAM_VERSION".into(),
+                env!("CARGO_PKG_VERSION").into(),
+            ),
+            ("FOLDWAVE_PANE".into(), pane.to_string()),
+            ("FOLDWAVE_WINDOW".into(), window.to_string()),
+        ]
     }
 
     /// How often the governor reads the CPU counters.
@@ -6057,6 +6092,26 @@ keys:
             a.iter().map(|s| s.to_string()).collect()
         }
 
+        #[test]
+        fn pane_identity_names_the_terminal_the_pane_and_the_window() {
+            let env = pane_identity(3, 4242);
+            let get = |k: &str| {
+                env.iter()
+                    .find(|(key, _)| key == k)
+                    .map(|(_, v)| v.as_str())
+            };
+            assert_eq!(get("TERM_PROGRAM"), Some("foldwave"));
+            assert_eq!(get("TERM_PROGRAM_VERSION"), Some(env!("CARGO_PKG_VERSION")));
+            assert_eq!(get("FOLDWAVE_PANE"), Some("3"));
+            assert_eq!(get("FOLDWAVE_WINDOW"), Some("4242"));
+            assert_eq!(env.len(), 4, "nothing else rides along");
+            // Shell integration adds to it rather than replacing it.
+            let mut both = pane_identity(0, 1);
+            both.extend(shell_integration("cmd.exe"));
+            assert_eq!(both.len(), 5);
+            assert_eq!(both[4].0, "PROMPT");
+        }
+
         fn lines(range: std::ops::Range<u32>) -> Vec<u8> {
             range
                 .map(|i| format!("L{i}\r\n"))
@@ -6435,15 +6490,20 @@ keys:
                 "--host-window-signs",
                 "--host-id",
                 "3",
+                "--host-window",
+                "4242",
                 "--",
                 "cmd",
             ]))
             .unwrap();
             assert!(h.pane_host && h.host_window_signs);
             assert_eq!(
-                (h.host_id, h.shell.as_slice()),
-                (3, &["cmd".to_string()][..])
+                (h.host_id, h.host_window, h.shell.as_slice()),
+                (3, 4242, &["cmd".to_string()][..])
             );
+            // Without the flag this process is the window.
+            assert_eq!(parse(&argv(&[])).unwrap().host_window, 0);
+            assert!(parse(&argv(&["--host-window", "x"])).is_err());
             // Hosts sign their own logs unless the window is told to.
             assert!(!parse(&argv(&[])).unwrap().host_signs_gpu);
             assert!(

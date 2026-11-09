@@ -102,6 +102,7 @@ pub fn run(args: &Args) -> io::Result<i32> {
         last_output: AtomicU64::new(0),
     });
     let session = start_session(
+        args.host_id,
         args,
         rows,
         cols,

@@ -1885,7 +1885,13 @@ planned.
    `TERM_PROGRAM_VERSION`, `FOLDWAVE_PANE` (the pane's id, stable for the
    window's life, `main.rs:5476`) and `FOLDWAVE_WINDOW` (the window's pid).
    atrium adds its variables to the inherited environment, so an agent two
-   levels down still sees them. No runtime cost.
+   levels down still sees them. No runtime cost. *Built 2026-11-09*
+   (`pane_identity` in [`main.rs`](../crates/fwterm/src/main.rs), set in both
+   lanes before the shell's own prompt marks; a pane host gets the window's
+   pid as `--host-window` and its pane's id as `--host-id`, so the four read
+   the same through a host). Checked for real: `fwterm --pipe -- cmd /c set >
+   file`, isolated and `--no-isolate`, each wrote the four variables and the
+   window closed with its shell.
 2. *Attention.* fwterm renders what atrium's title plan emits, and more of it
    than Windows Terminal does: `OSC 0/2` becomes the pane's title (in the strip
    beside the AGENTS glyphs, and the window title follows the focused pane),
