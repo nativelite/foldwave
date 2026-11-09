@@ -33,6 +33,8 @@ pub struct Readings {
     /// The newest thing not yet looked at (a decision, an agent finished or
     /// failed), as one line.
     pub ask: Option<String>,
+    /// The focused pane's title, if its program set one (`OSC 0`/`2`).
+    pub title: Option<String>,
 }
 
 /// An agent's presence: one glyph.
@@ -71,7 +73,11 @@ pub fn segments(r: &Readings) -> Vec<(String, Kind)> {
         out.push((value, kind));
     };
     item("PANES", format!("{:02}", r.panes), Kind::Value);
-    item("FOCUS", r.focus.to_string(), Kind::Value);
+    let focus = match &r.title {
+        Some(title) => format!("{}  {title}", r.focus),
+        None => r.focus.to_string(),
+    };
+    item("FOCUS", focus, Kind::Value);
     let cpu = r.cpu.map_or("—".into(), |c| format!("{:.1} %", c * 100.0));
     item("CPU", cpu, Kind::Value);
     if let Some((drive, free)) = &r.log {
@@ -236,6 +242,7 @@ mod tests {
             agents: Vec::new(),
             decisions: 0,
             ask: None,
+            title: None,
         };
         assert_eq!(
             text(&r),
@@ -266,6 +273,7 @@ mod tests {
             agents: Vec::new(),
             decisions: 0,
             ask: None,
+            title: None,
         };
         assert_eq!(text(&r), " PANES 01  ·  FOCUS 1  ·  CPU —  ·  INDEX OFF");
     }
@@ -285,6 +293,7 @@ mod tests {
             ],
             decisions: 1,
             ask: None,
+            title: None,
         };
         assert_eq!(
             text(&r),
@@ -295,6 +304,7 @@ mod tests {
         // long message cuts into.
         let asked = Readings {
             ask: Some("dev_1: deploy: merge?".into()),
+            title: None,
             ..r.clone()
         };
         assert_eq!(
@@ -328,6 +338,7 @@ mod tests {
             agents: Vec::new(),
             decisions: 2,
             ask: Some("dev_1: deploy: merge?".into()),
+            title: None,
         };
         assert_eq!(
             text(&r),
@@ -336,6 +347,15 @@ mod tests {
         );
         assert!(segments(&r).contains(&("2".into(), Kind::Bad)));
         let seen = Readings { ask: None, ..r };
+        let titled = Readings {
+            title: Some("atrium \u{b7} dev".into()),
+            ..seen.clone()
+        };
+        let shown = text(&titled);
+        assert!(
+            shown.contains("FOCUS 1  atrium \u{b7} dev  \u{b7}  CPU"),
+            "the title follows the focus: {shown}"
+        );
         assert!(
             text(&seen).ends_with("DECISIONS 2"),
             "the count stays until answered"
@@ -371,6 +391,7 @@ mod tests {
             agents: Vec::new(),
             decisions: 1,
             ask: Some("dev_1: deploy: merge this very long branch name now?".into()),
+            title: None,
         };
         let row = with_buttons(&line(&r), 60, None);
         let s: String = row.iter().map(|(c, _)| *c).collect();
@@ -387,6 +408,7 @@ mod tests {
         // Short readings leave the middle blank.
         let short = Readings {
             ask: None,
+            title: None,
             decisions: 0,
             ..r
         };
@@ -421,6 +443,7 @@ mod tests {
             agents: Vec::new(),
             decisions: 0,
             ask: None,
+            title: None,
         };
         let start = 40 - buttons_width();
         let kinds = |hover: Option<Button>| -> Vec<Kind> {

@@ -166,6 +166,9 @@ pub enum AskKind {
     Finished,
     /// An agent said it failed (`status=failed`, `blocked`, `error`).
     Failed,
+    /// A pane's program rang the bell while another pane had the focus
+    /// (`attention`, design §8.7c): open until that pane is looked at.
+    Bell,
 }
 
 /// Something that needs the human, as fwterm shows it: a decision an agent
@@ -191,6 +194,7 @@ impl Ask {
             AskKind::Decision => format!("{who}: {}", self.text),
             AskKind::Finished => format!("{who} finished: {}", self.text),
             AskKind::Failed => format!("{who} failed: {}", self.text),
+            AskKind::Bell => self.text.clone(),
         }
     }
 }

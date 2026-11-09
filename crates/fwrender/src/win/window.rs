@@ -187,6 +187,21 @@ pub struct Window {
     /// them, so nothing is destroyed.
     arrow: Handle,
     hand: Handle,
+    /// The shell's `ITaskbarList3`, made on first use by
+    /// [`Window::set_progress`]; null once that failed.
+    taskbar: Option<*mut c_void>,
+    /// A tray icon was added for [`Window::notify`]; removed on drop.
+    tray: bool,
+}
+
+/// Progress on the taskbar button ([`Window::set_progress`]): a percent for
+/// the first three, none for an indeterminate one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskbarProgress {
+    Normal(u8),
+    Error(u8),
+    Paused(u8),
+    Indeterminate,
 }
 
 /// The pointer's shape over the client area ([`Window::set_cursor`]).
@@ -475,6 +490,8 @@ impl Window {
             hinstance,
             shared,
             thread: Some(thread),
+            taskbar: None,
+            tray: false,
             // SAFETY: no attributes, no name; a null result is handled.
             timer: unsafe {
                 CreateWaitableTimerExW(
@@ -555,6 +572,141 @@ impl Window {
             self.icons.push(icon);
         }
         Ok(())
+    }
+
+    /// Set the title bar's text (`WM_SETTEXT`, handled on the window thread).
+    pub fn set_title(&self, title: &str) {
+        let title = wide(title);
+        // SAFETY: `hwnd` is live; the string is NUL-terminated and outlives
+        // the call.
+        unsafe { SetWindowTextW(self.hwnd, title.as_ptr()) };
+    }
+
+    /// Flash the taskbar button three times, as terminals do for a bell,
+    /// unless this is the foreground window (the person is looking at it).
+    /// True if it flashed.
+    pub fn flash_taskbar(&self) -> bool {
+        // SAFETY: plain calls; `info` is a valid FLASHWINFO that outlives the
+        // call.
+        unsafe {
+            if GetForegroundWindow() == self.hwnd {
+                return false;
+            }
+            let info = FlashWInfo {
+                cb_size: std::mem::size_of::<FlashWInfo>() as u32,
+                hwnd: self.hwnd,
+                flags: FLASHW_TRAY,
+                count: 3,
+                timeout: 0,
+            };
+            FlashWindowEx(&info);
+        }
+        true
+    }
+
+    /// Show progress on the window's taskbar button (`ITaskbarList3`), or
+    /// clear it with `None`. False if the taskbar refused (no shell, or COM
+    /// would not start): nothing is shown and nothing is retried.
+    pub fn set_progress(&mut self, progress: Option<TaskbarProgress>) -> bool {
+        let Some(list) = self.taskbar_list() else {
+            return false;
+        };
+        let (state, value) = match progress {
+            None => (TBPF_NOPROGRESS, None),
+            Some(TaskbarProgress::Indeterminate) => (TBPF_INDETERMINATE, None),
+            Some(TaskbarProgress::Normal(p)) => (TBPF_NORMAL, Some(p)),
+            Some(TaskbarProgress::Error(p)) => (TBPF_ERROR, Some(p)),
+            Some(TaskbarProgress::Paused(p)) => (TBPF_PAUSED, Some(p)),
+        };
+        // SAFETY: `list` is a live ITaskbarList3 made by `taskbar_list`, laid
+        // out as the SDK's vtable; `hwnd` is live.
+        unsafe {
+            let vt = &**(list as *mut *const ITaskbarList3Vtbl);
+            if let Some(p) = value {
+                (vt.set_progress_value)(list, self.hwnd, u64::from(p.min(100)), 100);
+            }
+            (vt.set_progress_state)(list, self.hwnd, state) == 0
+        }
+    }
+
+    /// The shell's taskbar list, made on first use; `None` once it failed.
+    fn taskbar_list(&mut self) -> Option<*mut c_void> {
+        if let Some(list) = self.taskbar {
+            return (!list.is_null()).then_some(list);
+        }
+        let mut out: *mut c_void = std::ptr::null_mut();
+        // SAFETY: COM calls with valid out-pointers; the object made is an
+        // ITaskbarList3 (its IID was asked for), so its vtable is the SDK's.
+        let made = unsafe {
+            let hr = CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED);
+            hr >= 0 || hr == RPC_E_CHANGED_MODE
+        } && unsafe {
+            CoCreateInstance(
+                &CLSID_TASKBAR_LIST,
+                std::ptr::null_mut(),
+                CLSCTX_INPROC_SERVER,
+                &IID_ITASKBAR_LIST3,
+                &mut out,
+            ) >= 0
+        } && !out.is_null()
+            && unsafe {
+                let vt = &**(out as *mut *const ITaskbarList3Vtbl);
+                if (vt.hr_init)(out) >= 0 {
+                    true
+                } else {
+                    (vt.release)(out);
+                    false
+                }
+            };
+        self.taskbar = Some(if made { out } else { std::ptr::null_mut() });
+        made.then_some(out)
+    }
+
+    /// A notification from the system's tray: `title` and `text` as a
+    /// balloon, which Windows 10 and 11 show as a toast in the corner and
+    /// keep in the notification centre. The shell needs a tray icon for it,
+    /// so the window's icon (or, without one, the system's information icon)
+    /// is added the first time and removed when the window closes. False if
+    /// the shell refused.
+    pub fn notify(&mut self, title: &str, text: &str) -> bool {
+        // SAFETY: NOTIFYICONDATAW is plain data; all-zero is a valid value.
+        let mut data: NotifyIconDataW = unsafe { std::mem::zeroed() };
+        data.cb_size = std::mem::size_of::<NotifyIconDataW>() as u32;
+        data.hwnd = self.hwnd;
+        data.id = 1;
+        data.flags = NIF_INFO | NIF_TIP;
+        data.info_flags = NIIF_INFO | NIIF_NOSOUND;
+        if let Some(&icon) = self.icons.first() {
+            data.flags |= NIF_ICON;
+            data.icon = icon;
+        }
+        if let Some(&big) = self.icons.get(1) {
+            data.info_flags = NIIF_USER | NIIF_LARGE_ICON | NIIF_NOSOUND;
+            data.balloon_icon = big;
+        }
+        let put = |field: &mut [u16], s: &str| {
+            let w = wide(s);
+            let n = w.len().min(field.len()) - 1;
+            field[..n].copy_from_slice(&w[..n]);
+            field[n] = 0;
+        };
+        put(&mut data.tip, "fwterm");
+        put(&mut data.info_title, title);
+        put(&mut data.info, text);
+        // SAFETY: `data` is a valid, fully sized NOTIFYICONDATAW; `hwnd` is
+        // live.
+        unsafe {
+            if !self.tray {
+                if Shell_NotifyIconW(NIM_ADD, &mut data) == 0 {
+                    return false;
+                }
+                self.tray = true;
+                data.version = NOTIFYICON_VERSION_4;
+                Shell_NotifyIconW(NIM_SETVERSION, &mut data);
+                return true;
+            }
+            Shell_NotifyIconW(NIM_MODIFY, &mut data) != 0
+        }
     }
 
     /// Colour the title bar and frame: `caption` behind the title, `text`
@@ -763,6 +915,18 @@ impl Window {
 
 impl Drop for Window {
     fn drop(&mut self) {
+        if self.tray {
+            // SAFETY: plain data naming our icon; `hwnd` is still live.
+            let mut data: NotifyIconDataW = unsafe { std::mem::zeroed() };
+            data.cb_size = std::mem::size_of::<NotifyIconDataW>() as u32;
+            data.hwnd = self.hwnd;
+            data.id = 1;
+            unsafe { Shell_NotifyIconW(NIM_DELETE, &mut data) };
+        }
+        if let Some(list) = self.taskbar.take().filter(|l| !l.is_null()) {
+            // SAFETY: a live ITaskbarList3 this window made; released once.
+            unsafe { ((**(list as *mut *const ITaskbarList3Vtbl)).release)(list) };
+        }
         // The window thread destroys its window and ends its loop. Posting
         // fails only while its queue is full (10,000 messages), so try for
         // a second; after that the thread is left running rather than

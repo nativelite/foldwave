@@ -53,6 +53,9 @@ pub enum FromHost {
         dir: String,
         block: u64,
     },
+    /// What the program said rather than drew (a title, a bell, a toast,
+    /// progress; `vterm::Notice`): the window shows it (design §8.7c).
+    Notice(vterm::Notice),
 }
 
 /// To the host.
@@ -350,6 +353,7 @@ const T_MARK: u8 = 2;
 const T_EXITED: u8 = 3;
 const T_HISTORY: u8 = 4;
 const T_BLOCK: u8 = 5;
+const T_NOTICE: u8 = 6;
 const T_INPUT: u8 = 11;
 const T_RESIZE: u8 = 12;
 const T_SHED: u8 = 13;
@@ -622,6 +626,25 @@ impl FromHost {
                 b.extend_from_slice(dir.as_bytes());
                 T_BLOCK
             }
+            FromHost::Notice(n) => {
+                match n {
+                    vterm::Notice::Title(t) => {
+                        b.push(0);
+                        b.extend_from_slice(t.as_bytes());
+                    }
+                    vterm::Notice::Bell => b.push(1),
+                    vterm::Notice::Toast(t) => {
+                        b.push(2);
+                        b.extend_from_slice(t.as_bytes());
+                    }
+                    vterm::Notice::Progress { state, percent } => {
+                        b.push(3);
+                        b.push(*state);
+                        b.push(*percent);
+                    }
+                }
+                T_NOTICE
+            }
         };
         write_frame(w, tag, &b)
     }
@@ -702,6 +725,24 @@ impl FromHost {
                     lines,
                     wrapped,
                 }
+            }
+            T_NOTICE => {
+                let kind = b.u8()?;
+                let rest = |b: &mut Body| -> io::Result<String> {
+                    let s = std::str::from_utf8(&body[b.at..]).map_err(|_| bad())?;
+                    b.at = body.len();
+                    Ok(s.to_string())
+                };
+                FromHost::Notice(match kind {
+                    0 => vterm::Notice::Title(rest(&mut b)?),
+                    1 => vterm::Notice::Bell,
+                    2 => vterm::Notice::Toast(rest(&mut b)?),
+                    3 => vterm::Notice::Progress {
+                        state: b.u8()?,
+                        percent: b.u8()?,
+                    },
+                    _ => return Err(bad()),
+                })
             }
             T_BLOCK => {
                 let generation = b.u32()?;
@@ -974,6 +1015,15 @@ mod tests {
                 dir: "gen-1758800000000-00003".to_string(),
                 block: 17,
             },
+            FromHost::Notice(vterm::Notice::Title(
+                "atrium \u{b7} dev \u{b7} needs you".into(),
+            )),
+            FromHost::Notice(vterm::Notice::Bell),
+            FromHost::Notice(vterm::Notice::Toast("".into())),
+            FromHost::Notice(vterm::Notice::Progress {
+                state: 2,
+                percent: 100,
+            }),
         ];
         for m in &msgs {
             let mut b = Vec::new();

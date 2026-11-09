@@ -78,6 +78,10 @@ pub struct Settings {
     /// `ribbon = off` hides the activity ribbon at each pane's right edge
     /// (on by default).
     pub ribbon: Option<bool>,
+    /// `notify = bar|windows|off`: where a program's notification (`OSC 9`)
+    /// shows: fwterm's bar (the default), also a Windows notification, or
+    /// nowhere (design §8.7c, §11 row 21).
+    pub notify: Option<String>,
     /// `font = <family>` and `px = <size>`, unless `--font` / `--px` say.
     pub font: Option<String>,
     pub px: Option<u32>,
@@ -116,6 +120,7 @@ pub fn parse_settings(text: &str) -> Settings {
             "paste_warning" => s.paste_warning = on_off(v),
             "instruments" => s.instruments = on_off(v),
             "ribbon" => s.ribbon = on_off(v),
+            "notify" if ["bar", "windows", "off"].contains(&v) => s.notify = Some(v.to_string()),
             "font" if !v.is_empty() => s.font = Some(v.to_string()),
             "px" => s.px = v.parse::<u32>().ok().filter(|p| (4..=200).contains(p)),
             "shell" if !v.is_empty() => s.shell = Some(v.to_string()),
@@ -548,6 +553,11 @@ mod tests {
         assert_eq!(parse_settings("").instruments, None);
         assert_eq!(parse_settings("ribbon = off\n").ribbon, Some(false));
         assert_eq!(parse_settings("").ribbon, None);
+        assert_eq!(
+            parse_settings("notify = windows\n").notify.as_deref(),
+            Some("windows")
+        );
+        assert_eq!(parse_settings("notify = loud\n").notify, None);
     }
 
     #[test]

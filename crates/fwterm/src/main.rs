@@ -41,6 +41,7 @@
 mod agents;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod altscreen;
+mod attention;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod blocks;
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -111,6 +112,7 @@ mod app {
     use crate::wire;
 
     mod host;
+    use crate::attention;
     use crate::find;
     use crate::first_run;
     use crate::governor::{self, Hidden, Level, Place};
@@ -177,7 +179,13 @@ options:
   (instruments = off in the settings file hides the strip of readings
   under the title bar; ribbon = off hides the activity ribbon at each
   pane's right edge, which maps the lines the pane holds onto its rows:
-  where commands started, in red where one failed, and where the view is)
+  where commands started, in red where one failed, and where the view is;
+  notify = bar (the default) shows a program's notification, OSC 9, in the
+  bar for a few seconds, windows also raises a Windows notification, off
+  shows neither. A bell flashes the pane's brackets and the taskbar
+  button, and asks for Ctrl+Shift+J when its pane is not the focused one;
+  a program's title, OSC 0 or 2, shows in the strip and the title bar;
+  its progress, OSC 9;4, as a badge on the pane and on the taskbar)
   --theme T     colours: mirai (default, foldwave's own) or classic; any
                 colour can be changed in the settings file with
                 color.<name> = #rrggbb (bg, fg, selection, dim, accent,
@@ -2003,6 +2011,21 @@ keys:
     /// The newest decision not yet looked at, as the strip shows it: who
     /// raised it (atrium's name for it) and what it asks, and with several
     /// panes, which of fwterm's it is in.
+    /// The agents' asks and the bells' together, oldest first within each;
+    /// borrowed while no bell is open.
+    fn all_asks<'a>(
+        report: &'a agents::Report,
+        bells: &'a [agents::Ask],
+    ) -> std::borrow::Cow<'a, [agents::Ask]> {
+        if bells.is_empty() {
+            std::borrow::Cow::Borrowed(&report.asks)
+        } else {
+            let mut all = report.asks.clone();
+            all.extend_from_slice(bells);
+            std::borrow::Cow::Owned(all)
+        }
+    }
+
     fn newest_ask(
         asks: &[agents::Ask],
         looked_at: &HashSet<(u32, u64, u64)>,
@@ -2411,6 +2434,10 @@ keys:
         blocks: Mutex<blocks::Blocks>,
         /// In a pane host: marks waiting to go to the window.
         marks_out: Option<Mutex<Vec<(u8, u64, Option<i32>)>>>,
+        /// What the program said rather than drew (`vterm::Notice`), waiting
+        /// for the window: a pane host's, read from its wire; a catch-up's
+        /// title. A local emulator's own are taken when the pane is drawn.
+        notices: Mutex<Vec<vterm::Notice>>,
         /// An isolated pane's host crashed and is to be restarted.
         host_died: AtomicBool,
         /// An isolated pane waiting for history lines from its host: the
@@ -2539,6 +2566,8 @@ keys:
         row_lines: Vec<u64>,
         /// When this pane's host was restarted, for the crash-loop guard.
         restarts: Vec<Instant>,
+        /// What the program said rather than drew, as shown (§8.7c).
+        attention: attention::Attention,
     }
 
     impl Pane {
@@ -2555,6 +2584,57 @@ keys:
                 .unwrap()
                 .resize(rows as u16, cols as u16);
             self.deep = None;
+        }
+
+        /// What was said to the window since the pane was last drawn
+        /// (a pane host's notices arrive on its wire): taken in, so a bell
+        /// in a hidden pane still asks.
+        fn take_notices(&mut self) {
+            let notices = std::mem::take(&mut *self.shared.notices.lock().unwrap());
+            if !notices.is_empty() {
+                let now = Instant::now();
+                for n in notices {
+                    self.attention.apply(n, now);
+                }
+            }
+        }
+
+        /// The progress badge (`OSC 9;4`) over the pane's top right corner,
+        /// after the pane is drawn; nothing without progress.
+        fn draw_badge(&self, frame: &mut Frame, pen: &mut Pen) {
+            let Some(badge) = self.attention.badge() else {
+                return;
+            };
+            let r = self.rect;
+            let n = badge.chars().count();
+            if !self.visible() || r.rows == 0 || r.cols < n + 1 {
+                return;
+            }
+            let bg = match self.attention.progress {
+                Some(attention::Progress::Error(_)) => pen.theme.error,
+                _ => pen.theme.accent,
+            };
+            let left = r.left + r.cols - n;
+            for (i, ch) in badge.chars().enumerate() {
+                let glyph = pen.atlas.slot(
+                    GlyphKey {
+                        ch,
+                        style: 0,
+                        part: GlyphPart::Single,
+                    },
+                    pen.raster,
+                );
+                frame.put(
+                    r.top,
+                    left + i,
+                    CellInstance {
+                        glyph,
+                        fg: pen.palette.bg,
+                        bg,
+                        flags: 0,
+                    },
+                );
+            }
         }
 
         /// Have the logger write out what it holds (bounded wait).
@@ -2823,6 +2903,22 @@ keys:
             let mut term = shared.term.lock().unwrap();
             shared.want.store(false, Ordering::Release);
             term.take_dirty();
+            // What the program said since the last draw: a local emulator's
+            // own, and whatever was left for the window.
+            {
+                let mut notices = std::mem::take(&mut *shared.notices.lock().unwrap());
+                if let Emu::Local(t) = &mut *term {
+                    if t.has_notices() {
+                        notices.extend(t.take_notices());
+                    }
+                }
+                if !notices.is_empty() {
+                    let now = Instant::now();
+                    for n in notices {
+                        self.attention.apply(n, now);
+                    }
+                }
+            }
             // The cursor, where the pane has focus and the program shows it.
             let focused = focused && term.cursor_visible();
             let history = term.scrollback();
@@ -3267,16 +3363,28 @@ keys:
     }
 
     /// Draw the dividers of `placement`, those touching the focused pane in
-    /// the focus colour.
-    fn draw_dividers(placement: &Placement, focus: PaneId, frame: &mut Frame, pen: &mut Pen) {
-        let f = placement
-            .panes
-            .iter()
-            .find(|(id, _)| *id == focus)
-            .map(|(_, r)| *r)
-            .unwrap_or_default();
+    /// the focus colour, and the brackets of the panes whose bell is
+    /// `flashing` in the error colour for the moment it lasts.
+    fn draw_dividers(
+        placement: &Placement,
+        focus: PaneId,
+        flashing: &[PaneId],
+        frame: &mut Frame,
+        pen: &mut Pen,
+    ) {
+        let rect_of = |id: PaneId| {
+            placement
+                .panes
+                .iter()
+                .find(|(p, _)| *p == id)
+                .map(|(_, r)| *r)
+                .unwrap_or_default()
+        };
+        let f = rect_of(focus);
+        let flash: Vec<Rect> = flashing.iter().map(|&id| rect_of(id)).collect();
         for &(row, col, ch) in &placement.dividers {
             let near = in_bracket(row, col, f);
+            let rang = flash.iter().any(|r| in_bracket(row, col, *r));
             let glyph = pen.atlas.slot(
                 GlyphKey {
                     ch,
@@ -3290,7 +3398,9 @@ keys:
                 col,
                 CellInstance {
                     glyph,
-                    fg: if near {
+                    fg: if rang {
+                        pen.theme.error
+                    } else if near {
                         pen.theme.accent
                     } else {
                         pen.theme.rule
@@ -3615,6 +3725,7 @@ keys:
                 exited: AtomicBool::new(false),
                 blocks: Mutex::new(blocks::Blocks::default()),
                 marks_out: None,
+                notices: Mutex::new(Vec::new()),
                 history_reply: Mutex::new(None),
                 host_lines: Mutex::new(hostlines::HostLines::default()),
                 host_died: AtomicBool::new(false),
@@ -3696,6 +3807,7 @@ keys:
                     folds: fold::Folds::default(),
                     row_lines: Vec::new(),
                     restarts: Vec::new(),
+                    attention: attention::Attention::default(),
                 });
             }
             let session = start_session(
@@ -3725,6 +3837,7 @@ keys:
                 folds: fold::Folds::default(),
                 row_lines: Vec::new(),
                 restarts: Vec::new(),
+                attention: attention::Attention::default(),
             })
         }
     }
@@ -3861,6 +3974,9 @@ keys:
                             });
                         }
                         continue;
+                    }
+                    Ok(wire::FromHost::Notice(n)) => {
+                        shared.notices.lock().unwrap().push(n);
                     }
                     Ok(wire::FromHost::Exited(_)) => {
                         // The program ended: the pane closes, as any pane does.
@@ -4463,6 +4579,23 @@ keys:
             found.clear();
             scanner.feed(bytes, &mut found);
             feed_marked(term, shared, bytes, &found, base);
+            // Bells, toasts and progress replayed from the log are old news;
+            // the title the replay ends on stands.
+            if let Emu::Local(t) = term {
+                if t.has_notices() {
+                    let titled = t
+                        .take_notices()
+                        .iter()
+                        .any(|n| matches!(n, vterm::Notice::Title(_)));
+                    if let (true, Some(title)) = (titled, t.title()) {
+                        shared
+                            .notices
+                            .lock()
+                            .unwrap()
+                            .push(vterm::Notice::Title(title.to_string()));
+                    }
+                }
+            }
         };
         loop {
             flush_logger(tx)?;
@@ -4717,6 +4850,15 @@ keys:
         let mut looked_at: HashSet<(u32, u64, u64)> = HashSet::new();
         let mut roots_checked = Instant::now() - agents::EVERY;
         let mut paste_ask: Option<(PaneId, String, usize)> = None;
+        // Attention (design §8.7c): bells not yet looked at, the title bar's
+        // text and the taskbar's progress as last set, when a flash or toast
+        // on show ends, and where toasts go (`notify` in the settings).
+        let mut bell_asks: Vec<agents::Ask> = Vec::new();
+        let mut window_title = args.title.clone();
+        let mut taskbar_shown: Option<attention::Progress> = None;
+        let mut attention_until: Option<Instant> = None;
+        let (mut notify_bar, mut notify_windows) =
+            attention::notify_mode(settings().1.notify.as_deref());
         // The instrument strip's last line, when it next reads, and the log
         // drive's free space (read every 5 s).
         let mut strip_line: Vec<(char, strip::Kind)> = Vec::new();
@@ -4827,8 +4969,22 @@ keys:
                 (Some(_), None) => Some(EDGE_SCROLL_EVERY),
                 (None, t) => t,
             };
+            // A flash or a toast on show ends on its own time.
+            let timeout = match attention_until {
+                Some(at) => Some(
+                    timeout
+                        .unwrap_or(Duration::MAX)
+                        .min(at.saturating_duration_since(Instant::now())),
+                ),
+                None => timeout,
+            };
             events.clear();
             surface.window().wait(timeout, &mut events);
+            if attention_until.is_some_and(|at| Instant::now() >= at) {
+                // The brackets and the bottom row go back to the panes'.
+                attention_until = None;
+                layout_dirty = true;
+            }
             // The pointer merely moving over the window is not input the
             // frame rate should rise for (it lights the strip's buttons and
             // nothing else); a key, a click, a drag or the wheel is.
@@ -4978,6 +5134,8 @@ keys:
                                 }
                             }
                             paste_warning = conf.paste_warning.unwrap_or(true);
+                            (notify_bar, notify_windows) =
+                                attention::notify_mode(conf.notify.as_deref());
                             let rows = usize::from(conf.instruments.unwrap_or(true));
                             let rib = conf.ribbon.unwrap_or(true);
                             if rows != strip_rows || rib != ribbon {
@@ -5321,8 +5479,8 @@ keys:
                         // finished or failed; else the next one waiting),
                         // zooming to it if another pane is zoomed.
                         if vk == 0x4A && ctrl && shift {
-                            let target =
-                                agents::next_to_show(&report.asks, &looked_at, focus).cloned();
+                            let asks = all_asks(&report, &bell_asks);
+                            let target = agents::next_to_show(&asks, &looked_at, focus).cloned();
                             if let Some(d) = target {
                                 if panes.iter().any(|p| p.id == d.pane) {
                                     focus = d.pane;
@@ -5788,7 +5946,9 @@ keys:
             // Agents' open decisions, when they change; the panes' root
             // processes for the watcher, now and then.
             while let Ok(open) = decisions_rx.try_recv() {
-                looked_at.retain(|k| open.asks.iter().any(|d| d.key == *k));
+                looked_at.retain(|k| {
+                    open.asks.iter().any(|d| d.key == *k) || bell_asks.iter().any(|d| d.key == *k)
+                });
                 report = open;
                 layout_dirty = true;
             }
@@ -5885,11 +6045,88 @@ keys:
                         .filter(|(id, _)| *id == p.id)
                         .map(|(_, s)| s);
                     p.draw(p.id == focus, sel, args.pipe, ribbon, &mut frame, &mut pen);
+                    p.draw_badge(&mut frame, &mut pen);
                     drew = true;
                 }
             }
+            // What the programs said since the last frame (§8.7c): a bell
+            // flashes its pane's brackets and the taskbar button and, in a
+            // pane without the focus, asks; a toast goes to the bar and, if
+            // asked, to Windows; the title bar follows the focused pane's
+            // title and the taskbar the panes' progress.
+            {
+                let now = Instant::now();
+                let mut changed = false;
+                for i in 0..panes.len() {
+                    panes[i].take_notices();
+                    let acts = panes[i].attention.take_acts();
+                    let p = &panes[i];
+                    for act in acts {
+                        changed = true;
+                        match act {
+                            attention::Act::Rang => {
+                                if p.id != focus {
+                                    bell_asks.push(agents::Ask {
+                                        pane: p.id,
+                                        key: (0, p.id as u64, p.attention.bells),
+                                        kind: agents::AskKind::Bell,
+                                        from: None,
+                                        text: attention::bell_text(
+                                            i + 1,
+                                            p.attention.title.as_deref(),
+                                        ),
+                                        ts_ms: logstore::now_ms(),
+                                    });
+                                }
+                                surface.window().flash_taskbar();
+                            }
+                            attention::Act::Toasted(text) => {
+                                if notify_windows {
+                                    surface
+                                        .window()
+                                        .notify(&format!("fwterm \u{b7} pane {}", i + 1), &text);
+                                }
+                            }
+                        }
+                    }
+                }
+                // A bell's ask is answered by looking at its pane.
+                bell_asks.retain(|a| a.pane != focus && panes.iter().any(|p| p.id == a.pane));
+                let want = panes
+                    .iter()
+                    .find(|p| p.id == focus)
+                    .and_then(|p| p.attention.title.clone())
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| args.title.clone());
+                if want != window_title {
+                    surface.window().set_title(&want);
+                    window_title = want;
+                }
+                let progress: Vec<(bool, Option<attention::Progress>)> = panes
+                    .iter()
+                    .map(|p| (p.id == focus, p.attention.progress))
+                    .collect();
+                let taskbar = attention::taskbar(&progress);
+                if taskbar != taskbar_shown {
+                    surface.window().set_progress(taskbar.map(Into::into));
+                    taskbar_shown = taskbar;
+                }
+                attention_until = panes
+                    .iter()
+                    .filter_map(|p| p.attention.next_change(now))
+                    .min();
+                if changed {
+                    layout_dirty = true;
+                }
+            }
             if layout_dirty {
-                draw_dividers(&placement, focus, &mut frame, &mut pen);
+                let now = Instant::now();
+                let flashing: Vec<PaneId> = panes
+                    .iter()
+                    .filter(|p| p.attention.flashing(now))
+                    .map(|p| p.id)
+                    .collect();
+                draw_dividers(&placement, focus, &flashing, &mut frame, &mut pen);
                 layout_dirty = false;
             }
             // The instrument strip, over the grid's top row: its readings
@@ -5928,6 +6165,11 @@ keys:
                         .iter()
                         .position(|p| p.id == focus)
                         .map_or(1, |i| i + 1),
+                    title: panes
+                        .iter()
+                        .find(|p| p.id == focus)
+                        .and_then(|p| p.attention.title.clone())
+                        .filter(|t| !t.is_empty()),
                     cpu: (share != NO_READING).then(|| share as f64 / 1e6),
                     log: log_free.as_ref().and_then(|(_, v)| v.clone()),
                     index: if index_counts.is_some() {
@@ -5945,7 +6187,7 @@ keys:
                         .iter()
                         .filter(|a| a.kind == agents::AskKind::Decision)
                         .count(),
-                    ask: newest_ask(&report.asks, &looked_at, &panes),
+                    ask: newest_ask(&all_asks(&report, &bell_asks), &looked_at, &panes),
                 };
                 let line = strip::line(&readings);
                 if relayout || line != strip_line || hover != drawn_hover {
@@ -6006,10 +6248,36 @@ keys:
                 );
                 drew = true;
             }
+            // A program's notification (OSC 9) on the bottom row for a few
+            // seconds, the newest of any pane's; the search and paste bars
+            // come first.
+            let toast = if notify_bar && find_bar.is_none() && paste_ask.is_none() {
+                let now = Instant::now();
+                panes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, p)| p.attention.toast_at(now).map(|(t, at)| (at, i + 1, t)))
+                    .max_by_key(|(at, _, _)| *at)
+                    .map(|(_, n, t)| attention::toast_line(n, t))
+            } else {
+                None
+            };
+            if let Some((text, lead)) = &toast {
+                draw_bar(
+                    text,
+                    *lead,
+                    grid_rows.saturating_sub(1),
+                    grid_cols,
+                    &mut frame,
+                    &mut pen,
+                );
+                drew = true;
+            }
             // Without the strip, a decision not yet looked at shows on the
             // bottom row instead (the search and paste bars come first).
-            if strip_rows == 0 && find_bar.is_none() && paste_ask.is_none() {
-                if let Some(ask) = newest_ask(&report.asks, &looked_at, &panes) {
+            if strip_rows == 0 && find_bar.is_none() && paste_ask.is_none() && toast.is_none() {
+                let asks = all_asks(&report, &bell_asks);
+                if let Some(ask) = newest_ask(&asks, &looked_at, &panes) {
                     let text = format!(" AGENT › Ctrl+Shift+J · {ask}");
                     draw_bar(
                         &text,
@@ -6527,6 +6795,7 @@ keys:
                 exited: AtomicBool::new(false),
                 blocks: Mutex::new(blocks::Blocks::default()),
                 marks_out: None,
+                notices: Mutex::new(Vec::new()),
                 history_reply: Mutex::new(None),
                 host_lines: Mutex::new(hostlines::HostLines::default()),
                 host_died: AtomicBool::new(false),

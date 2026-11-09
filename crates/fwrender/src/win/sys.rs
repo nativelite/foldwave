@@ -440,6 +440,136 @@ extern "system" {
     ) -> i32;
 }
 
+// --- Attention: the title bar's text, a taskbar flash, taskbar progress and
+// a notification (design §8.7c, slice 2). user32 and shell32 are OS
+// libraries; the taskbar's COM object lives in the shell (ole32 makes it).
+
+/// `FLASHWINFO` (winuser.h).
+#[repr(C)]
+pub struct FlashWInfo {
+    pub cb_size: u32,
+    pub hwnd: Hwnd,
+    pub flags: u32,
+    pub count: u32,
+    pub timeout: u32,
+}
+/// `FLASHW_TRAY`: flash the taskbar button only.
+pub const FLASHW_TRAY: u32 = 0x0000_0002;
+
+#[link(name = "user32")]
+extern "system" {
+    pub fn SetWindowTextW(hwnd: Hwnd, text: *const u16) -> Bool;
+    pub fn GetForegroundWindow() -> Hwnd;
+    pub fn FlashWindowEx(info: *const FlashWInfo) -> Bool;
+}
+
+/// `GUID` (guiddef.h).
+#[repr(C)]
+pub struct Guid {
+    pub data1: u32,
+    pub data2: u16,
+    pub data3: u16,
+    pub data4: [u8; 8],
+}
+
+/// `CLSID_TaskbarList` and `IID_ITaskbarList3` (shobjidl_core.h).
+pub const CLSID_TASKBAR_LIST: Guid = Guid {
+    data1: 0x56FD_F344,
+    data2: 0xFD6D,
+    data3: 0x11D0,
+    data4: [0x95, 0x8A, 0x00, 0x60, 0x97, 0xC9, 0xA0, 0x90],
+};
+pub const IID_ITASKBAR_LIST3: Guid = Guid {
+    data1: 0xEA1A_FB91,
+    data2: 0x9E28,
+    data3: 0x4B86,
+    data4: [0x90, 0xE9, 0x9E, 0x9F, 0x8A, 0x5E, 0xEF, 0xAF],
+};
+
+/// `ITaskbarList3`'s vtable (shobjidl_core.h), as far as the two methods
+/// used: `IUnknown`, then `ITaskbarList`, `ITaskbarList2`, then the first two
+/// of `ITaskbarList3`. The methods after those are never called, so they are
+/// left off; nothing here depends on the vtable's full length.
+#[repr(C)]
+pub struct ITaskbarList3Vtbl {
+    pub query_interface:
+        unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32,
+    pub add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    pub release: unsafe extern "system" fn(*mut c_void) -> u32,
+    pub hr_init: unsafe extern "system" fn(*mut c_void) -> i32,
+    pub add_tab: unsafe extern "system" fn(*mut c_void, Hwnd) -> i32,
+    pub delete_tab: unsafe extern "system" fn(*mut c_void, Hwnd) -> i32,
+    pub activate_tab: unsafe extern "system" fn(*mut c_void, Hwnd) -> i32,
+    pub set_active_alt: unsafe extern "system" fn(*mut c_void, Hwnd) -> i32,
+    pub mark_fullscreen_window: unsafe extern "system" fn(*mut c_void, Hwnd, Bool) -> i32,
+    pub set_progress_value: unsafe extern "system" fn(*mut c_void, Hwnd, u64, u64) -> i32,
+    pub set_progress_state: unsafe extern "system" fn(*mut c_void, Hwnd, u32) -> i32,
+}
+
+/// `TBPFLAG`.
+pub const TBPF_NOPROGRESS: u32 = 0;
+pub const TBPF_INDETERMINATE: u32 = 1;
+pub const TBPF_NORMAL: u32 = 2;
+pub const TBPF_ERROR: u32 = 4;
+pub const TBPF_PAUSED: u32 = 8;
+
+pub const COINIT_APARTMENTTHREADED: u32 = 2;
+pub const CLSCTX_INPROC_SERVER: u32 = 1;
+/// `RPC_E_CHANGED_MODE`: COM is already up on this thread in the other
+/// apartment model; it is usable all the same.
+pub const RPC_E_CHANGED_MODE: i32 = 0x8001_0106u32 as i32;
+
+#[link(name = "ole32")]
+extern "system" {
+    pub fn CoInitializeEx(reserved: *mut c_void, coinit: u32) -> i32;
+    pub fn CoCreateInstance(
+        clsid: *const Guid,
+        outer: *mut c_void,
+        context: u32,
+        iid: *const Guid,
+        out: *mut *mut c_void,
+    ) -> i32;
+}
+
+/// `NOTIFYICONDATAW` (shellapi.h), the Vista-and-later layout.
+#[repr(C)]
+pub struct NotifyIconDataW {
+    pub cb_size: u32,
+    pub hwnd: Hwnd,
+    pub id: u32,
+    pub flags: u32,
+    pub callback_message: u32,
+    pub icon: Handle,
+    pub tip: [u16; 128],
+    pub state: u32,
+    pub state_mask: u32,
+    pub info: [u16; 256],
+    /// `uTimeout` / `uVersion` (a union).
+    pub version: u32,
+    pub info_title: [u16; 64],
+    pub info_flags: u32,
+    pub guid_item: Guid,
+    pub balloon_icon: Handle,
+}
+
+pub const NIM_ADD: u32 = 0;
+pub const NIM_MODIFY: u32 = 1;
+pub const NIM_DELETE: u32 = 2;
+pub const NIM_SETVERSION: u32 = 4;
+pub const NIF_ICON: u32 = 0x02;
+pub const NIF_TIP: u32 = 0x04;
+pub const NIF_INFO: u32 = 0x10;
+pub const NIIF_INFO: u32 = 0x01;
+pub const NIIF_USER: u32 = 0x04;
+pub const NIIF_NOSOUND: u32 = 0x10;
+pub const NIIF_LARGE_ICON: u32 = 0x20;
+pub const NOTIFYICON_VERSION_4: u32 = 4;
+
+#[link(name = "shell32")]
+extern "system" {
+    pub fn Shell_NotifyIconW(message: u32, data: *mut NotifyIconDataW) -> Bool;
+}
+
 #[link(name = "kernel32")]
 extern "system" {
     pub fn GetModuleHandleW(name: *const u16) -> Hinstance;
@@ -501,4 +631,7 @@ const _: () = {
     assert!(size_of::<BitmapInfoHeader>() == 40);
     assert!(size_of::<BitmapInfo>() == 44);
     assert!(size_of::<TrackMouseEvent>() == 24);
+    assert!(size_of::<FlashWInfo>() == 32);
+    assert!(size_of::<Guid>() == 16);
+    assert!(size_of::<NotifyIconDataW>() == 976);
 };

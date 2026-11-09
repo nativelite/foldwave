@@ -67,7 +67,12 @@ failed), so an agent behind a zoomed pane is still present. The activity
 ribbon at each pane's right edge maps the lines the pane holds onto its rows:
 where commands started, in red where one failed, and where the view is.
 `instruments = off` and `ribbon = off` in the settings file (or the settings
-sheet) hide them. The strip's SETTINGS and HELP buttons, at its right end,
+sheet) hide them. A program's title shows after FOCUS in the strip and in the
+title bar; its bell colours its pane's brackets for a moment, flashes the
+taskbar button, and asks for Ctrl+Shift+J when the pane is not the focused
+one; its notification (OSC 9) shows in the bar for a few seconds (`notify =
+windows` also raises a Windows notification, `off` shows neither); its
+progress (OSC 9;4) is a badge on the pane and on the taskbar button. The strip's SETTINGS and HELP buttons, at its right end,
 light up under the pointer and open the settings sheet and this help.
 
 `fwterm --help` lists every option and key.

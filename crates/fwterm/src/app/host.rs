@@ -40,6 +40,7 @@ pub fn run(args: &Args) -> io::Result<i32> {
         })),
         blocks: Mutex::new(blocks::Blocks::default()),
         marks_out: Some(Mutex::new(Vec::new())),
+        notices: Mutex::new(Vec::new()),
         history_reply: Mutex::new(None),
         host_lines: Mutex::new(crate::hostlines::HostLines::default()),
         host_died: AtomicBool::new(false),
@@ -226,10 +227,19 @@ pub fn run(args: &Args) -> io::Result<i32> {
         // Readers wake this loop only when they set `pending`; clear it
         // before reading the screen, so output after this read wakes it again.
         shared.pending.store(false, Ordering::Release);
+        // What the program said (titles, bells, toasts, progress) goes
+        // with the update: the emulator's since the last one, and anything
+        // a catch-up left for the window.
+        let mut notices = std::mem::take(&mut *shared.notices.lock().unwrap());
         let update = {
-            let term = shared.term.lock().unwrap();
-            match &*term {
-                Emu::Local(t) => sender.update(t),
+            let mut term = shared.term.lock().unwrap();
+            match &mut *term {
+                Emu::Local(t) => {
+                    if t.has_notices() {
+                        notices.extend(t.take_notices());
+                    }
+                    sender.update(t)
+                }
                 Emu::Remote(_) => None,
             }
         };
@@ -244,6 +254,9 @@ pub fn run(args: &Args) -> io::Result<i32> {
             .unwrap_or_default();
         for (kind, line, exit) in marks {
             FromHost::Mark { kind, line, exit }.write(&mut *o)?;
+        }
+        for n in notices {
+            FromHost::Notice(n).write(&mut *o)?;
         }
         o.flush()?;
         drop(o);

@@ -55,7 +55,7 @@ pub enum Key {
     Char(char),
 }
 
-pub const SECTIONS: [&str; 4] = ["Appearance", "Paste", "Logs", "Shell"];
+pub const SECTIONS: [&str; 5] = ["Appearance", "Attention", "Paste", "Logs", "Shell"];
 
 /// The sheet: its fields, then the Save and Cancel buttons.
 #[derive(Debug, Clone, PartialEq)]
@@ -66,6 +66,15 @@ pub struct Form {
     pub at: usize,
     /// Text being typed into the focused field.
     pub editing: Option<String>,
+}
+
+/// The `notify` choice's index for the file's value (`bar` unless it says).
+fn notify_index(v: Option<&str>) -> usize {
+    match v {
+        Some("windows") => 1,
+        Some("off") => 2,
+        _ => 0,
+    }
 }
 
 impl Form {
@@ -119,6 +128,16 @@ impl Form {
                     "Activity ribbon",
                     "ribbon",
                     Value::Switch(s.ribbon.unwrap_or(true)),
+                    true,
+                ),
+                f(
+                    "Attention",
+                    "Notifications",
+                    "notify",
+                    Value::Choice(
+                        vec!["bar", "windows", "off"],
+                        notify_index(s.notify.as_deref()),
+                    ),
                     true,
                 ),
                 f(
@@ -427,6 +446,7 @@ mod tests {
                 ("px", Some("72".into())),
                 ("instruments", Some("off".into())),
                 ("ribbon", Some("on".into())),
+                ("notify", Some("bar".into())),
                 ("paste_warning", Some("on".into())),
                 ("log_dir", None),
                 ("log_cap_gib", Some("10".into())),
@@ -700,11 +720,11 @@ mod render_tests {
             "the theme applies at once"
         );
         // Down to the paste switch: its section shows instead.
-        for _ in 0..5 {
+        for _ in 0..6 {
             f.key(Key::Down);
         }
         let g = render(&f, 90, 20);
-        assert!(text(&g, 4).contains("▸ Paste"));
+        assert!(text(&g, 6).contains("▸ Paste"));
         assert!(text(&g, 2).contains("Ask before several lines") && text(&g, 2).contains("[■] on"));
         assert!(text(&g, 17).contains("[ SAVE ]") && text(&g, 17).contains("[ CANCEL ]"));
         // A long value is cut before its note, never over it.
@@ -714,7 +734,7 @@ mod render_tests {
             "deep\\".repeat(20)
         )));
         let mut f = Form::new(&s, "mirai");
-        for _ in 0..6 {
+        for _ in 0..7 {
             f.key(Key::Down);
         }
         let g = render(&f, 90, 20);
@@ -765,8 +785,8 @@ mod render_tests {
         // A section on the left shows it, its first field focused.
         let (r, c) = find(&g, "  Paste");
         f.click(r, c + 2, w, h);
-        assert_eq!((f.at, f.section()), (5, "Paste"));
-        assert!(text(&render(&f, w, h), 4).contains("▸ Paste"));
+        assert_eq!((f.at, f.section()), (6, "Paste"));
+        assert!(text(&render(&f, w, h), 6).contains("▸ Paste"));
         // The buttons.
         let (r, c) = find(&g, "[ CANCEL ]");
         assert_eq!(f.click(r, c + 3, w, h), Action::Close);
