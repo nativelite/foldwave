@@ -1946,6 +1946,53 @@ is a promise to build).
    format is agreed with foldwave. *Answer:* no current plan in atrium; the
    proposal stays here for the founder to pick up.
 
+**State of atrium's side, 2026-11-08 evening** (from the atrium session, at
+atrium main `f180ef5`; issue numbers are on `nativelite/atrium`).
+
+- atrium 0.42.0 has not shipped: it is main as of `962398f`, gated on the
+  founder's live probe (a real Claude Code lead in `atrium --allow-ctl claude`
+  spawning a split-pane teammate). Its `PLAN.md` is now the 0.43.0 plan, in the
+  order #13, then #14, then #15.
+- #13: the shared tmux verb crate (§11 row 19), after 0.42.0; name and repo
+  not chosen. Until then `src/tmux_shim.rs` is the source of truth. Its backend
+  trait, which the crate keeps: `caller()`, `list()` (id, parent, role, title),
+  `spawn(here, role, argv)`, `kill(id)`, `send(id, text)`; `run(Verb, &mut dyn
+  Broker) -> Outcome { stdout, stderr, code }`, `parse(&[String]) -> Verb`,
+  `expand(fmt, …)` for `#{…}` strings, `sh_words(cmd)` (a POSIX-sh word split,
+  so no shell is needed, Windows included).
+- #14: `nativelite-ipc` (§11 row 20), milestone 0.43.0, not started. The API
+  fwterm builds against is what `src/ipc.rs` exposes today, expected to carry
+  over in shape: server `Listener::bind(addr)`, `poll() -> Option<String>`
+  (non-blocking, one complete request line), `respond(&str)` (never blocks),
+  `take_security_event()`, `default_address()`; client `request(addr, line) ->
+  String`, one JSON line each way, one request per connection. #15 adds a
+  held-connection mode beside it (the ctl doorbell and a held inbox); nothing
+  builds on that until it exists.
+- #19: the attention sequences, build-or-retire, still unbuilt. #20: the
+  stability promise for the token-free reads, 0.43.0, not yet written. The pipe
+  name and the token-free verb list are unchanged since the morning.
+- New: a `teams` key (`show` or `off`, config and per fleet, `962398f`); the
+  shim's directory is prepended only for claude panes in ctl sessions with
+  `teams = show`.
+
+**Values fwterm's shim matches** (so a Claude Code lead moves between hosts
+without surprises; from atrium's shim, read against `claude.exe` 2.1.289):
+`TMUX=<endpoint>,<host pid>,0` (Claude Code reads the first field as the socket
+and may hand it back as `-S <path>`, so the shim accepts and ignores `-S`, `-L`
+and `-f`); `TMUX_PANE=%<pane id>`; pane ids `%N`, one window `@0`;
+`#{session_name}` is the host's name (atrium uses `atrium`, fwterm would use
+`foldwave`), and Claude Code validates `display-message -p
+'#{session_name}:#{window_id}.#{pane_id}'` against
+`^[A-Za-z0-9_.-]{1,64}:@?\d+\.%?\d+$`; `tmux -V` prints `tmux 3.5a-<host>`
+(major 2 or more required); `CLAUDE_CODE_TMUX_TRUECOLOR=1` set beside, or
+Claude Code drops to 256 colours. PATH: atrium prepends
+`%LOCALAPPDATA%\atrium\shim`, holding a `tmux.exe` that is a hard link or copy
+of its own binary, refreshed when the binary changes; fwterm would do the same
+under its own folder. The teammate's argv arrives as one sh-quoted string after
+`--`, and its role is its `--agent-name`. atrium refuses `capture-pane` on
+purpose; for fwterm the proposal stands to serve it from the pane's memory or
+log, since reading a pane back is what fwterm is for (slice 4).
+
 **Decided (founder, 2026-11-08; §11 rows 19 and 20).** Both shims are built
 and share one small crate for the tmux verb parsing, atrium's shim inside
 atrium's panes and fwterm's everywhere else. atrium's `ipc` module moves to a
