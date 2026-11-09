@@ -72,7 +72,18 @@ title bar; its bell colours its pane's brackets for a moment, flashes the
 taskbar button, and asks for Ctrl+Shift+J when the pane is not the focused
 one; its notification (OSC 9) shows in the bar for a few seconds (`notify =
 windows` also raises a Windows notification, `off` shows neither); its
-progress (OSC 9;4) is a badge on the pane and on the taskbar button. The strip's SETTINGS and HELP buttons, at its right end,
+progress (OSC 9;4) is a badge on the pane and on the taskbar button.
+
+Claude Code's agent teams open as panes. Every pane carries `TMUX` and a
+`tmux.exe` on its PATH that is fwterm itself, so a lead's teammates split the
+window beside it (70 % wide, as Claude Code asks, without taking the
+keyboard), each a pane that is logged, searchable and present in the strip;
+`list-panes`, `send-keys` and `kill-pane` work inside the lead's own panes,
+and `capture-pane` is refused, since a terminal never hands one pane another's
+text. A `claude` started as a pane's program (`fwterm -- claude`) gets
+`--teammate-mode auto`; one typed into a shell needs `teammateMode` set to
+`auto` in Claude Code's settings. Inside atrium's panes atrium's own shim
+serves instead. The strip's SETTINGS and HELP buttons, at its right end,
 light up under the pointer and open the settings sheet and this help.
 
 `fwterm --help` lists every option and key.

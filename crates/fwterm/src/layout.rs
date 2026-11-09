@@ -132,19 +132,21 @@ impl Node {
     }
 
     /// Replace leaf `target` with a split of it and `new`; false if absent.
-    fn split(&mut self, target: PaneId, dir: Dir, new: PaneId) -> bool {
+    fn split(&mut self, target: PaneId, dir: Dir, new: PaneId, share: f32) -> bool {
         match self {
             Node::Leaf(id) if *id == target => {
                 *self = Node::Split {
                     dir,
-                    ratio: 0.5,
+                    ratio: share,
                     a: Box::new(Node::Leaf(target)),
                     b: Box::new(Node::Leaf(new)),
                 };
                 true
             }
             Node::Leaf(_) => false,
-            Node::Split { a, b, .. } => a.split(target, dir, new) || b.split(target, dir, new),
+            Node::Split { a, b, .. } => {
+                a.split(target, dir, new, share) || b.split(target, dir, new, share)
+            }
         }
     }
 
@@ -251,9 +253,21 @@ impl Layout {
     /// Split pane `target` in two, `new` taking the right (`Across`) or lower
     /// (`Down`) half. False if `target` is not in the layout.
     pub fn split(&mut self, target: PaneId, dir: Dir, new: PaneId) -> bool {
+        self.split_with(target, dir, new, 0.5)
+    }
+
+    /// [`Layout::split`] with `target` keeping `share` of the room (0 to 1;
+    /// a tmux `-l 70%` for the new pane is a share of 0.3), which the split
+    /// keeps through resizes.
+    pub fn split_with(&mut self, target: PaneId, dir: Dir, new: PaneId, share: f32) -> bool {
+        let share = if share.is_finite() {
+            share.clamp(0.05, 0.95)
+        } else {
+            0.5
+        };
         self.root
             .as_mut()
-            .map_or(false, |r| r.split(target, dir, new))
+            .map_or(false, |r| r.split(target, dir, new, share))
     }
 
     /// Take pane `id` out; its sibling grows into the room. Returns the pane
@@ -401,6 +415,39 @@ mod tests {
         let p = Layout::single(7).place(24, 80);
         assert_eq!(p.panes, [(7, rect(0, 0, 24, 80))]);
         assert!(p.dividers.is_empty());
+    }
+
+    #[test]
+    fn a_split_can_give_the_new_pane_most_of_the_room() {
+        let mut l = Layout::single(0);
+        assert!(l.split_with(0, Dir::Across, 1, 0.3));
+        let p = l.place(10, 101);
+        let cols = |id: PaneId| {
+            p.panes
+                .iter()
+                .find(|(i, _)| *i == id)
+                .map(|(_, r)| r.cols)
+                .unwrap()
+        };
+        assert!(
+            (28..=32).contains(&cols(0)),
+            "the target keeps 30 %: {}",
+            cols(0)
+        );
+        assert!(
+            (68..=72).contains(&cols(1)),
+            "the new pane gets 70 %: {}",
+            cols(1)
+        );
+        assert_eq!(cols(0) + cols(1), 100, "one column is the divider");
+        assert!(
+            !l.split_with(9, Dir::Down, 2, 0.5),
+            "a pane not in the layout"
+        );
+        assert!(
+            l.split_with(1, Dir::Down, 2, f32::NAN),
+            "a bad share is half"
+        );
     }
 
     #[test]

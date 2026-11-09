@@ -23,6 +23,7 @@ abus = { package = "nativelite-abus", version = "0.2.1", path = "../../../abus" 
 json = { package = "nativelite-json", version = "0.1.0", path = "../../../json-rs" }
 fwbench = { package = "nativelite-fwbench", version = "0.1.0", path = "../fwbench" }
 nlipc = { package = "nativelite-ipc", version = "0.2.1", path = "../../../ipc" }
+tmuxproto = { package = "nativelite-tmuxproto", version = "0.3", path = "../../../tmuxproto" }
 
 [[bin]]
 name = "fwterm"

@@ -59,6 +59,7 @@ dependencies = [
  "nativelite-panelog",
  "nativelite-pty",
  "nativelite-resmon",
+ "nativelite-tmuxproto",
  "nativelite-vterm",
 ]
 
@@ -85,6 +86,10 @@ version = "0.4.1"
 [[package]]
 name = "nativelite-resmon"
 version = "0.1.0"
+
+[[package]]
+name = "nativelite-tmuxproto"
+version = "0.3.0"
 
 [[package]]
 name = "nativelite-uwidth"

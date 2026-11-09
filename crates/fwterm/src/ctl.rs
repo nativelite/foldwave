@@ -25,12 +25,6 @@ use std::collections::BTreeMap;
 /// The `list` request: the org chart.
 pub const LIST: &str = r#"{"cmd":"list"}"#;
 
-/// The `status` request for one pane (its caption, `doing`, when the mod
-/// reports one; not read yet).
-pub fn status_request(id: u64) -> String {
-    format!(r#"{{"cmd":"status","target":"{id}"}}"#)
-}
-
 /// The `bus feed` request a host sends: the whole bus, every look, since a
 /// decision's `resolved` flips on an event already read.
 pub const FEED: &str = r#"{"cmd":"bus","op":"feed","since":0}"#;
@@ -332,7 +326,6 @@ mod tests {
     #[test]
     fn requests_are_what_atrium_ctl_sends() {
         assert_eq!(LIST, r#"{"cmd":"list"}"#);
-        assert_eq!(status_request(3), r#"{"cmd":"status","target":"3"}"#);
         assert_eq!(FEED, r#"{"cmd":"bus","op":"feed","since":0}"#);
     }
 

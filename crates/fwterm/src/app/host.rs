@@ -112,6 +112,9 @@ pub fn run(args: &Args) -> io::Result<i32> {
         wake.clone(),
         log.clone(),
         &Arc::new(Vec::new()),
+        &args.shell,
+        &args.host_token,
+        args.host_shim.as_deref().map(std::path::Path::new),
     )?;
 
     // From the window: keys, resizes, requests for history. Its end is the

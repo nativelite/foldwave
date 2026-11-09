@@ -81,6 +81,7 @@ mod select;
 mod settings_ui;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod strip;
+mod team;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod theme;
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -126,6 +127,7 @@ mod app {
     use crate::select::{self, Point, Selection};
     use crate::settings_ui;
     use crate::strip;
+    use crate::team;
     use crate::theme::Theme;
     use fwrender::win::{display_refresh_hz, CpuPresenter, Cursor, Event, Waker, Window};
     use fwrender::{
@@ -187,6 +189,14 @@ options:
   button, and asks for Ctrl+Shift+J when its pane is not the focused one;
   a program's title, OSC 0 or 2, shows in the strip and the title bar;
   its progress, OSC 9;4, as a badge on the pane and on the taskbar)
+  Claude Code's agent teams: every pane carries TMUX and a PATH led by a
+  tmux.exe that is fwterm itself (%LOCALAPPDATA%\\foldwave\\shim), so a
+  lead's teammates open as panes beside it, 70 % wide as it asks, without
+  taking the keyboard. A claude started as a pane's program gets
+  --teammate-mode auto; one started from a shell needs teammateMode set
+  to auto in Claude Code's settings
+  --tmux-shim ARGS  serve one tmux command line as that shim would (a probe:
+                --tmux-shim -V prints tmux 3.5a-fwterm)
   --theme T     colours: mirai (default, foldwave's own) or classic; any
                 colour can be changed in the settings file with
                 color.<name> = #rrggbb (bg, fg, selection, dim, accent,
@@ -310,6 +320,13 @@ keys:
         /// The window's process id, for `FOLDWAVE_WINDOW` in the pane's
         /// environment (§8.7c); 0 means this process is the window.
         host_window: u32,
+        /// The pane's token for the teams channel and the tmux shim to lead
+        /// its PATH with (§8.7c, slice 4), handed to a pane host by the window.
+        host_token: String,
+        host_shim: Option<String>,
+        /// `--tmux-shim <tmux args>`: serve one tmux command line as the
+        /// panes' shim would, for a probe.
+        tmux_shim: Option<Vec<String>>,
         /// The window builds this pane host's search signatures (GPU).
         host_window_signs: bool,
         hidden: Hidden,
@@ -357,6 +374,9 @@ keys:
             host_gen: 256 << 20,
             host_id: 0,
             host_window: 0,
+            host_token: String::new(),
+            host_shim: None,
+            tmux_shim: None,
             host_window_signs: false,
             hidden: Hidden::Always,
             zoom: false,
@@ -513,6 +533,12 @@ keys:
                 "--host-window" => {
                     let v = value(&mut i, "--host-window")?;
                     a.host_window = v.parse().map_err(|_| format!("bad --host-window {v:?}"))?;
+                }
+                "--host-token" => a.host_token = value(&mut i, "--host-token")?,
+                "--host-shim" => a.host_shim = Some(value(&mut i, "--host-shim")?),
+                "--tmux-shim" => {
+                    a.tmux_shim = Some(argv[i + 1..].to_vec());
+                    break;
                 }
                 "--shell-integration" => {
                     let v = value(&mut i, "--shell-integration")?;
@@ -2569,6 +2595,13 @@ keys:
         restarts: Vec<Instant>,
         /// What the program said rather than drew, as shown (§8.7c).
         attention: attention::Attention,
+        /// Claude Code's teams (§8.7c, slice 4): the pane that spawned this
+        /// one over the channel, the role it was given, its token, and the
+        /// program it runs (a restarted host runs it again).
+        parent: Option<PaneId>,
+        role: Option<String>,
+        token: String,
+        program: Vec<String>,
     }
 
     impl Pane {
@@ -3645,6 +3678,20 @@ keys:
         activity: Arc<Activity>,
         /// The pane hosts' CPU time, counted as fwterm's own by the governor.
         hosts: Arc<Mutex<governor::Family>>,
+        /// The panes' tmux shim, placed at start (none: no TMUX in the panes).
+        shim: Option<PathBuf>,
+        /// Whether the installed Claude Code takes `--teammate-mode`, probed
+        /// at the first claude pane.
+        claude_teams: std::sync::OnceLock<bool>,
+    }
+
+    /// How a pane is started beyond the defaults: a program other than the
+    /// shell and, over the teams channel, who spawned it and as what.
+    #[derive(Debug, Clone, Default)]
+    struct SpawnAs {
+        program: Option<Vec<String>>,
+        parent: Option<PaneId>,
+        role: Option<String>,
     }
 
     /// Restarts a crashed host at most this often before its pane closes.
@@ -3694,6 +3741,9 @@ keys:
                 &self.hosts,
                 wake,
                 &note,
+                &pane.program,
+                &pane.token,
+                self.shim.as_deref(),
             ) {
                 Ok(session) => {
                     pane.session = session;
@@ -3708,7 +3758,31 @@ keys:
         }
 
         fn spawn(&self, id: PaneId, rect: Rect) -> io::Result<Pane> {
+            self.spawn_as(id, rect, &SpawnAs::default())
+        }
+
+        /// The program a pane runs: `how`'s, else the shell; a Claude Code
+        /// that takes it gets `--teammate-mode auto` (§8.7c, slice 4).
+        fn program_for(&self, how: &SpawnAs) -> Vec<String> {
+            let program = how
+                .program
+                .clone()
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| self.args.shell.clone());
+            if self.shim.is_none() {
+                return program;
+            }
+            team::with_teammate_mode(&program, || {
+                *self
+                    .claude_teams
+                    .get_or_init(|| team::claude_takes_teammate_mode(&program[0]))
+            })
+        }
+
+        fn spawn_as(&self, id: PaneId, rect: Rect, how: &SpawnAs) -> io::Result<Pane> {
             let args = self.args;
+            let program = self.program_for(how);
+            let token = team::token();
             let (rows, cols) = (rect.rows.max(1), rect.cols.max(1));
             let shared = Arc::new(Shared {
                 term: Mutex::new(Emu::Local({
@@ -3791,6 +3865,9 @@ keys:
                     &self.hosts,
                     wake,
                     "",
+                    &program,
+                    &token,
+                    self.shim.as_deref(),
                 )?;
                 return Ok(Pane {
                     id,
@@ -3809,6 +3886,10 @@ keys:
                     row_lines: Vec::new(),
                     restarts: Vec::new(),
                     attention: attention::Attention::default(),
+                    parent: how.parent,
+                    role: how.role.clone(),
+                    token: token.clone(),
+                    program: program.clone(),
                 });
             }
             let session = start_session(
@@ -3821,6 +3902,9 @@ keys:
                 wake,
                 log.clone(),
                 &self.place,
+                &program,
+                &token,
+                self.shim.as_deref(),
             )?;
             Ok(Pane {
                 id,
@@ -3839,6 +3923,10 @@ keys:
                 row_lines: Vec::new(),
                 restarts: Vec::new(),
                 attention: attention::Attention::default(),
+                parent: how.parent,
+                role: how.role.clone(),
+                token: token.clone(),
+                program: program.clone(),
             })
         }
     }
@@ -3860,6 +3948,9 @@ keys:
         hosts: &Mutex<governor::Family>,
         wake: Wake,
         note: &str,
+        program: &[String],
+        token: &str,
+        shim: Option<&Path>,
     ) -> io::Result<Arc<Mutex<Session>>> {
         use std::process::{Command, Stdio};
         *shared.term.lock().unwrap() = Emu::Remote(wire::Mirror::new(rows, cols));
@@ -3887,7 +3978,11 @@ keys:
         if fetch.is_some() {
             cmd.arg("--host-window-signs");
         }
-        cmd.arg("--").args(&args.shell);
+        cmd.args(["--host-token", token]);
+        if let Some(shim) = shim {
+            cmd.arg("--host-shim").arg(shim);
+        }
+        cmd.arg("--").args(program);
         cmd.env("FWTERM_BANNER", format!("{}{note}", logs.banner()));
         let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
         // Every host is in one job that closes with this process: if the
@@ -4013,8 +4108,16 @@ keys:
         wake: Wake,
         log: Option<LogLink>,
         place: &Arc<Vec<u32>>,
+        program: &[String],
+        token: &str,
+        shim: Option<&Path>,
     ) -> io::Result<Arc<Mutex<Session>>> {
-        let shell_args: Vec<&str> = args.shell[1..].iter().map(String::as_str).collect();
+        let program = if program.is_empty() {
+            &args.shell[..]
+        } else {
+            program
+        };
+        let shell_args: Vec<&str> = program[1..].iter().map(String::as_str).collect();
         let pump = |source, session, last| {
             pump(
                 source,
@@ -4035,14 +4138,22 @@ keys:
             std::process::id()
         };
         let mut env = pane_identity(id, window);
+        // Claude Code's teams find fwterm through TMUX and the shim (slice 4).
+        env.extend(team::pane_env(
+            window,
+            id,
+            token,
+            shim,
+            std::env::var_os("PATH").as_deref(),
+        ));
         if args.shell_integration {
-            env.extend(shell_integration(&args.shell[0]));
+            env.extend(shell_integration(&program[0]));
         }
         let session = if args.pipe {
             use std::os::windows::process::CommandExt;
             use std::process::{Command, Stdio};
             // CREATE_NO_WINDOW: no console at all, not even a hidden one.
-            let mut child = Command::new(&args.shell[0])
+            let mut child = Command::new(&program[0])
                 .args(&shell_args)
                 .envs(env.iter().map(|(k, v)| (k, v)))
                 .stdin(Stdio::piped())
@@ -4068,13 +4179,8 @@ keys:
                 _job: job,
             }))
         } else {
-            let pty = pty::Pty::spawn_with_env(
-                &args.shell[0],
-                &shell_args,
-                rows as u16,
-                cols as u16,
-                &env,
-            )?;
+            let pty =
+                pty::Pty::spawn_with_env(&program[0], &shell_args, rows as u16, cols as u16, &env)?;
             let mut reader = pty.reader()?;
             let session = Arc::new(Mutex::new(Session::Console(pty)));
             pump(
@@ -4177,6 +4283,10 @@ keys:
 
     pub fn run() -> i32 {
         let argv: Vec<String> = std::env::args().skip(1).collect();
+        // Started as `tmux`: the panes' shim (§8.7c, slice 4).
+        if team::invoked_as_shim() {
+            return i32::from(team::main(&argv));
+        }
         let args = match parse(&argv) {
             Ok(a) => a,
             Err(msg) => {
@@ -4188,6 +4298,9 @@ keys:
             // What fwterm ships and their licenses, compiled in with it.
             say!("{}", include_str!("../../../THIRD-PARTY-NOTICES.md"));
             return 0;
+        }
+        if let Some(rest) = &args.tmux_shim {
+            return i32::from(team::main(rest));
         }
         if args.choose_log_drive {
             return choose_log_drive(&args);
@@ -4816,6 +4929,14 @@ keys:
             waker: surface.window().waker(),
             activity: activity.clone(),
             hosts,
+            shim: match team::place_shim() {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    say!("fwterm: teams: no tmux shim ({e}); Claude Code's teams stay in-process");
+                    None
+                }
+            },
+            claude_teams: std::sync::OnceLock::new(),
         };
         let ids: Vec<PaneId> = (0..args.panes).collect();
         let mut layout = Layout::grid(&ids);
@@ -4826,6 +4947,23 @@ keys:
             .map(|&(id, rect)| spawner.spawn(id, rect))
             .collect::<io::Result<Vec<Pane>>>()?;
         let waker = surface.window().waker();
+        // Claude Code's teams (§8.7c, slice 4): the host channel the panes'
+        // tmux shim talks to; a connect wakes this loop.
+        let mut channel = {
+            let w = waker.clone();
+            match nlipc::Listener::bind_waking(
+                &team::address(std::process::id()),
+                Box::new(move || w.wake()),
+            ) {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    say!(
+                        "fwterm: teams: no host channel ({e}); Claude Code's teams stay in-process"
+                    );
+                    None
+                }
+            }
+        };
         let mut next_id = args.panes;
         let mut focus: PaneId = 0;
         let mut zoom: Option<PaneId> = (args.zoom && args.panes > 1).then_some(0);
@@ -4858,6 +4996,10 @@ keys:
         let mut window_title = args.title.clone();
         let mut taskbar_shown: Option<attention::Progress> = None;
         let mut attention_until: Option<Instant> = None;
+        // The host channel's doorbell rings on connect, before the request
+        // line lands: after a wake that showed nothing, look again for a
+        // moment (§8.7c, slice 4).
+        let mut channel_recheck: Option<Instant> = None;
         let (mut notify_bar, mut notify_windows) =
             attention::notify_mode(settings().1.notify.as_deref());
         // The instrument strip's last line, when it next reads, and the log
@@ -4979,8 +5121,32 @@ keys:
                 ),
                 None => timeout,
             };
+            let timeout = match channel_recheck {
+                Some(until) if until > Instant::now() => Some(
+                    timeout
+                        .unwrap_or(Duration::MAX)
+                        .min(Duration::from_millis(5)),
+                ),
+                Some(_) => {
+                    channel_recheck = None;
+                    timeout
+                }
+                None => timeout,
+            };
             events.clear();
+            let wait_from = Instant::now();
             surface.window().wait(timeout, &mut events);
+            // A wake with nothing to show for it (no event, no output, not
+            // the timeout) may be the channel's doorbell.
+            if channel.is_some()
+                && events.is_empty()
+                && !timeout.is_some_and(|t| wait_from.elapsed() >= t)
+                && !panes
+                    .iter()
+                    .any(|p| p.shared.pending.load(Ordering::Acquire))
+            {
+                channel_recheck = Some(Instant::now() + Duration::from_millis(150));
+            }
             if attention_until.is_some_and(|at| Instant::now() >= at) {
                 // The brackets and the bottom row go back to the panes'.
                 attention_until = None;
@@ -5000,6 +5166,189 @@ keys:
             input.clear();
             // Panes to take out after the events: (pane, kill it).
             let mut closing: Vec<(PaneId, bool)> = Vec::new();
+            // Requests from the panes' tmux shims (§8.7c, slice 4): one at a
+            // time, answered before the next is read.
+            let mut channel_broke = false;
+            if let Some(ch) = channel.as_mut() {
+                loop {
+                    let line = match ch.poll() {
+                        Ok(Some(line)) => line,
+                        Ok(None) => break,
+                        Err(e) => {
+                            say!("fwterm: teams: the host channel failed ({e}); closed");
+                            channel_broke = true;
+                            break;
+                        }
+                    };
+                    channel_recheck = None;
+                    let reply = match team::parse_request(&line) {
+                        Err(e) => team::reply_err(&e),
+                        Ok(env) => {
+                            let parents: Vec<(PaneId, Option<PaneId>)> =
+                                panes.iter().map(|p| (p.id, p.parent)).collect();
+                            let known = panes
+                                .iter()
+                                .any(|p| p.id == env.caller && p.token == env.token);
+                            if !known {
+                                team::reply_err("unauthenticated: not a pane of this window")
+                            } else {
+                                match env.request {
+                                    team::Request::List => team::reply_list(
+                                        &panes
+                                            .iter()
+                                            .map(|p| team::PaneInfo {
+                                                id: p.id,
+                                                parent: p.parent,
+                                                role: p.role.clone(),
+                                                title: p
+                                                    .attention
+                                                    .title
+                                                    .clone()
+                                                    .filter(|t| !t.is_empty())
+                                                    .unwrap_or_else(|| {
+                                                        p.program
+                                                            .first()
+                                                            .cloned()
+                                                            .unwrap_or_default()
+                                                    }),
+                                            })
+                                            .collect::<Vec<_>>(),
+                                    ),
+                                    team::Request::Spawn {
+                                        focus: take,
+                                        beside,
+                                        size,
+                                        role,
+                                        argv,
+                                    } => {
+                                        // Beside the pane named if the caller may
+                                        // see it, else beside the caller.
+                                        let target = beside
+                                            .filter(|b| team::in_subtree(*b, env.caller, &parents))
+                                            .filter(|b| panes.iter().any(|p| p.id == *b))
+                                            .unwrap_or(env.caller);
+                                        if zoom.take().is_some() {
+                                            placement = place_panes(
+                                                &layout, zoom, grid_rows, grid_cols, strip_rows,
+                                                ribbon,
+                                            );
+                                            place_all(&mut panes, &placement);
+                                            layout_dirty = true;
+                                        }
+                                        let r = panes
+                                            .iter()
+                                            .find(|p| p.id == target)
+                                            .map(|p| p.rect)
+                                            .unwrap_or_default();
+                                        let dir = if r.cols as u32 * m.cell_w
+                                            >= r.rows as u32 * m.cell_h
+                                        {
+                                            Dir::Across
+                                        } else {
+                                            Dir::Down
+                                        };
+                                        let room = match dir {
+                                            Dir::Across => r.cols,
+                                            Dir::Down => r.rows,
+                                        };
+                                        let id = next_id;
+                                        let share = team::share_for(size.as_deref(), room);
+                                        if argv.is_empty() {
+                                            team::reply_err("spawn: no command")
+                                        } else if room < 3 {
+                                            team::reply_err("no room for another pane here")
+                                        } else if !layout.split_with(target, dir, id, share) {
+                                            team::reply_err("the target pane is gone")
+                                        } else {
+                                            next_id += 1;
+                                            placement = place_panes(
+                                                &layout, zoom, grid_rows, grid_cols, strip_rows,
+                                                ribbon,
+                                            );
+                                            let rect = placement
+                                                .panes
+                                                .iter()
+                                                .find(|(p, _)| *p == id)
+                                                .map(|(_, r)| *r)
+                                                .unwrap_or_default();
+                                            let how = SpawnAs {
+                                                program: Some(argv.clone()),
+                                                parent: Some(env.caller),
+                                                role,
+                                            };
+                                            match spawner.spawn_as(id, rect, &how) {
+                                                Ok(p) => {
+                                                    panes.push(p);
+                                                    if take {
+                                                        focus = id;
+                                                    }
+                                                    place_all(&mut panes, &placement);
+                                                    layout_dirty = true;
+                                                    selection = None;
+                                                    press = None;
+                                                    team::reply_spawned(id)
+                                                }
+                                                Err(e) => {
+                                                    layout.remove(id);
+                                                    placement = place_panes(
+                                                        &layout, zoom, grid_rows, grid_cols,
+                                                        strip_rows, ribbon,
+                                                    );
+                                                    place_all(&mut panes, &placement);
+                                                    layout_dirty = true;
+                                                    team::reply_err(&format!(
+                                                        "cannot start {:?}: {e}",
+                                                        argv[0]
+                                                    ))
+                                                }
+                                            }
+                                        }
+                                    }
+                                    team::Request::Kill(id) => {
+                                        if id == env.caller
+                                            || !team::in_subtree(id, env.caller, &parents)
+                                        {
+                                            team::reply_err(&format!(
+                                                "pane {id} is not one the caller spawned"
+                                            ))
+                                        } else {
+                                            closing.push((id, true));
+                                            team::reply_ok()
+                                        }
+                                    }
+                                    team::Request::Send(id, text) => {
+                                        if !team::in_subtree(id, env.caller, &parents) {
+                                            team::reply_err(&format!(
+                                                "pane {id} is outside the caller's panes"
+                                            ))
+                                        } else {
+                                            match panes.iter().find(|p| p.id == id) {
+                                                Some(p) => {
+                                                    let mut bytes = text.into_bytes();
+                                                    bytes.push(b'\r');
+                                                    match p.session.lock().unwrap().write(&bytes) {
+                                                        Ok(()) => team::reply_ok(),
+                                                        Err(e) => team::reply_err(&e.to_string()),
+                                                    }
+                                                }
+                                                None => {
+                                                    team::reply_err(&format!("pane {id} is gone"))
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    if let Err(e) = ch.respond(&reply) {
+                        say!("fwterm: teams: reply not delivered: {e}");
+                    }
+                }
+            }
+            if channel_broke {
+                channel = None;
+            }
             for e in &events {
                 let Some(fi) = panes.iter().position(|p| p.id == focus) else {
                     break;
