@@ -1,6 +1,6 @@
 [package]
 name = "nativelite-fwrender"
-version = "0.1.0"
+version = "0.2.0"
 description = "foldwave's M3 renderer spike: a cell frame with row damage, a glyph atlas, a CPU reference renderer and a hand-bound Vulkan backend, using only the Rust standard library."
 license = "MIT"
 keywords = ["terminal", "renderer", "vulkan", "gpu", "nativelite"]

@@ -1,6 +1,6 @@
 [package]
 name = "nativelite-fwterm"
-version = "0.1.0"
+version = "0.2.0"
 description = "foldwave's minimal terminal prototype: split panes in one window, each a real shell through ConPTY or a program over pipes, vterm, and the fwrender window - built to be measured against other terminals."
 # The foldwave app: FSL-1.1-Apache-2.0, the repository's LICENSE (design
 # section 11 row 2). The engine crates it is built on stay MIT.
@@ -16,7 +16,7 @@ pty = { package = "nativelite-pty", version = "0.4.1", path = "../../../pty-rs" 
 ansi = { package = "nativelite-ansi", version = "0.4.1", path = "../../../ansi-rs" }
 vterm = { package = "nativelite-vterm", version = "0.5.6", path = "../../../vterm-rs" }
 panelog = { package = "nativelite-panelog", version = "0.1.0", path = "../../../panelog-rs" }
-fwrender = { package = "nativelite-fwrender", version = "0.1.0", path = "../fwrender" }
+fwrender = { package = "nativelite-fwrender", version = "0.2.0", path = "../fwrender" }
 fwcuda = { package = "nativelite-fwcuda", version = "0.1.0", path = "../fwcuda" }
 resmon = { package = "nativelite-resmon", version = "0.1.0", path = "../resmon" }
 abus = { package = "nativelite-abus", version = "0.2.1", path = "../../../abus" }

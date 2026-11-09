@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "nativelite-fwrender"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nativelite-ansi",
  "nativelite-glyphs",
@@ -47,7 +47,7 @@ dependencies = [
 
 [[package]]
 name = "nativelite-fwterm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nativelite-abus",
  "nativelite-ansi",
