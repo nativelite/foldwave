@@ -54,6 +54,7 @@ dependencies = [
  "nativelite-fwbench",
  "nativelite-fwcuda",
  "nativelite-fwrender",
+ "nativelite-ipc",
  "nativelite-json",
  "nativelite-panelog",
  "nativelite-pty",
@@ -64,6 +65,10 @@ dependencies = [
 [[package]]
 name = "nativelite-glyphs"
 version = "0.1.0"
+
+[[package]]
+name = "nativelite-ipc"
+version = "0.2.1"
 
 [[package]]
 name = "nativelite-json"

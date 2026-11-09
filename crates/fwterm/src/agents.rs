@@ -14,6 +14,14 @@
 //! atrium marks it answered; `status=done` and `status=failed` are what
 //! atrium's fleet rules have agents post, so they are read as finished and
 //! failed.
+//!
+//! Since slice 3 of design §8.7c an atrium started with `--allow-ctl` is also
+//! asked for its org chart over its control channel ([`crate::ctl`], one
+//! token-free `list` per look): the roles come from the live tree instead of
+//! the snapshot, and atrium's own reading of each agent (agsess's
+//! `waiting-approval`, `errored`, `ended`) joins what the bus says. The bus
+//! sidecar stays the source for decisions and status words, and the whole
+//! fallback for an atrium that does not answer.
 
 use crate::layout::PaneId;
 use resmon::RawProc;
@@ -35,6 +43,10 @@ pub const EVERY: Duration = Duration::from_secs(2);
 /// this, and an idle window pays for a folder listing only this often
 /// (measured: every 2 s cost 1-1.5 ms of CPU a second, idle).
 pub const EVERY_IDLE: Duration = Duration::from_secs(10);
+
+/// Looks skipped before the control channel of an atrium that did not answer
+/// is tried again (ctl off, or not up yet): 10 s at [`EVERY`].
+pub const CTL_RETRY_LOOKS: u32 = 5;
 
 /// The folder atrium keeps its sessions in: `ATRIUM_STATE_DIR`, else
 /// `%LOCALAPPDATA%\atrium\sessions` (atrium's `session_store::root_from`).
@@ -320,8 +332,15 @@ pub fn roles(snapshot: &Path) -> Vec<String> {
 
 /// The agents of one session, under `pane`: those atrium lists, in its
 /// order, then any that only the bus names. An open decision from an agent
-/// makes it waiting, whatever it said last; else its last status word says.
-pub fn agents_of(pane: PaneId, roles: &[String], read: &BusRead) -> Vec<Agent> {
+/// makes it waiting, whatever it said last; else its last status word says;
+/// else what atrium itself reports of the pane over its control channel
+/// (`ctl`, by role: waiting on an approval, errored, ended), else running.
+pub fn agents_of(
+    pane: PaneId,
+    roles: &[String],
+    read: &BusRead,
+    ctl: &[(String, Status)],
+) -> Vec<Agent> {
     let mut names: Vec<&str> = roles.iter().map(String::as_str).collect();
     for (role, ..) in &read.statuses {
         if !names.contains(&role.as_str()) {
@@ -335,13 +354,19 @@ pub fn agents_of(pane: PaneId, roles: &[String], read: &BusRead) -> Vec<Agent> {
                 .decisions
                 .iter()
                 .any(|(_, from, _, _)| from.as_deref() == Some(role));
+            let said = read
+                .statuses
+                .iter()
+                .find(|s| s.0 == role)
+                .map_or(Status::Running, |s| status_of(&s.2));
             let status = if waiting {
                 Status::Waiting
+            } else if said != Status::Running {
+                said
             } else {
-                read.statuses
-                    .iter()
-                    .find(|s| s.0 == role)
-                    .map_or(Status::Running, |s| status_of(&s.2))
+                ctl.iter()
+                    .find(|(r, _)| r == role)
+                    .map_or(Status::Running, |(_, s)| *s)
             };
             Agent {
                 pane,
@@ -422,6 +447,9 @@ pub fn watch(
             // when the panes change.
             let mut placed: HashMap<(u32, u64), Option<PaneId>> = HashMap::new();
             let mut placed_for: Vec<(PaneId, u32)> = Vec::new();
+            // Sessions whose control channel did not answer, and how many
+            // looks to skip before asking again.
+            let mut ctl_down: HashMap<(u32, u64), u32> = HashMap::new();
             loop {
                 let mut any_live = false;
                 let found = match sessions_root(|k| std::env::var_os(k)) {
@@ -467,22 +495,65 @@ pub fn watch(
                                         read
                                     }
                                 };
-                                let at = modified(&s.snapshot);
-                                let roles = match role_cache.get(&s.snapshot) {
-                                    Some((t, roles)) if *t == at => roles.clone(),
-                                    _ => {
-                                        let roles = roles(&s.snapshot);
-                                        role_cache.insert(s.snapshot.clone(), (at, roles.clone()));
-                                        roles
+                                // atrium's own org chart over its control
+                                // channel, when it answers; after a failure
+                                // the next try waits a few looks.
+                                let key = (s.pid, s.started_ms);
+                                let tree = match ctl_down.get_mut(&key) {
+                                    Some(left) if *left > 0 => {
+                                        *left -= 1;
+                                        None
+                                    }
+                                    _ => match crate::ctl::list(s.pid) {
+                                        Ok(t) => {
+                                            ctl_down.remove(&key);
+                                            Some(t)
+                                        }
+                                        Err(_) => {
+                                            ctl_down.insert(key, CTL_RETRY_LOOKS);
+                                            None
+                                        }
+                                    },
+                                };
+                                let roles = match &tree {
+                                    Some(t) => t.roles(),
+                                    None => {
+                                        let at = modified(&s.snapshot);
+                                        match role_cache.get(&s.snapshot) {
+                                            Some((t, roles)) if *t == at => roles.clone(),
+                                            _ => {
+                                                let roles = roles(&s.snapshot);
+                                                role_cache.insert(
+                                                    s.snapshot.clone(),
+                                                    (at, roles.clone()),
+                                                );
+                                                roles
+                                            }
+                                        }
                                     }
                                 };
+                                // Decisions and status words over the channel
+                                // too, from an atrium that serves a host's
+                                // feed; else the sidecar's.
+                                let read = match &tree {
+                                    Some(t) if crate::ctl::serves_host_feed(&t.atrium) => {
+                                        crate::ctl::feed(s.pid).unwrap_or(read)
+                                    }
+                                    _ => read,
+                                };
+                                let ctl_status =
+                                    tree.as_ref().map(|t| t.statuses()).unwrap_or_default();
                                 found
                                     .asks
                                     .extend(asks_of(pane, (s.pid, s.started_ms), &read));
-                                found.agents.extend(agents_of(pane, &roles, &read));
+                                found
+                                    .agents
+                                    .extend(agents_of(pane, &roles, &read, &ctl_status));
                             }
                             cache.retain(|p, _| live.iter().any(|s| &s.bus == p));
                             role_cache.retain(|p, _| live.iter().any(|s| &s.snapshot == p));
+                            ctl_down
+                                .retain(|k, _| live.iter().any(|s| (s.pid, s.started_ms) == *k));
                             found.asks.sort_by_key(|d| (d.ts_ms, d.key));
                             found.agents.sort_by_key(|a| a.pane);
                             found
@@ -767,7 +838,7 @@ mod tests {
         .unwrap();
         assert_eq!(roles(&snap), ["lead", "dev_1", "dev_2"]);
         assert!(roles(&root.join("none.json")).is_empty());
-        let agents = agents_of(7, &roles(&snap), &read);
+        let agents = agents_of(7, &roles(&snap), &read, &[]);
         let got: Vec<(&str, Status)> = agents.iter().map(|a| (a.role.as_str(), a.status)).collect();
         assert_eq!(
             got,
@@ -801,6 +872,43 @@ mod tests {
         );
         assert_eq!(asks[1].key, (1, 2, 6), "the status event's own sequence");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn atriums_own_status_joins_the_bus_and_the_bus_wins() {
+        let read = BusRead {
+            decisions: vec![(5, Some("lead".into()), "deploy: merge?".into(), 1_000)],
+            statuses: vec![(
+                "dev_2".into(),
+                6,
+                "done".into(),
+                "status: built".into(),
+                1_001,
+            )],
+        };
+        let roles: Vec<String> = ["lead", "dev_1", "dev_2", "dev_3"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let ctl = vec![
+            ("lead".to_string(), Status::Failed),
+            ("dev_1".to_string(), Status::Waiting),
+            ("dev_2".to_string(), Status::Failed),
+        ];
+        let got: Vec<Status> = agents_of(1, &roles, &read, &ctl)
+            .iter()
+            .map(|a| a.status)
+            .collect();
+        assert_eq!(
+            got,
+            [
+                Status::Waiting,
+                Status::Waiting,
+                Status::Finished,
+                Status::Running
+            ],
+            "a decision beats errored; waiting-approval shows; done beats errored; nothing said runs"
+        );
     }
 
     #[test]

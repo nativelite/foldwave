@@ -44,6 +44,7 @@ mod altscreen;
 mod attention;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod blocks;
+mod ctl;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod emu;
 #[cfg_attr(not(windows), allow(dead_code))]
