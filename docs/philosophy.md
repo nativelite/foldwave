@@ -301,8 +301,9 @@ Nothing above is assumed. These are the calls it needs:
    for one; this would be the decision record.
 8. ~~Which Unix comes first.~~ **Decided 2026-11-16: Linux** (design §11 row
    24). When macOS follows is open.
-9. ~~`libwayland-client` on Linux.~~ **Decided 2026-11-16: loaded at run
-   time** (design §11 row 25), and the Wayland window is built.
+9. ~~`libwayland-client` on Linux.~~ **Decided 2026-11-16: nativelite's own
+   implementation, in progress** (design §11 row 25). The window as built
+   uses the system library until it is ready.
 10. **Durability on macOS (§5).** A full flush per write, a barrier, or a
     cadence.
 11. **Targets beyond §4.** The founder's direction is to push beyond, and the
@@ -311,7 +312,8 @@ Nothing above is assumed. These are the calls it needs:
     refresh at p99, idle and under a flood (E7); idle cost stated in wakeups
     per second and watts, not only CPU share (E8); 16 panes at the measured
     transport ceiling instead of 1 GB/min each; search under 1 s at 1 TB.
-12. **`libxkbcommon` for keyboard layouts.** The Wayland window types a US
+12. ~~`libxkbcommon` for keyboard layouts.~~ **Decided 2026-11-16: our own,
+    in progress** (design §11 row 25). As it stood: The Wayland window types a US
     layout only. Reading the compositor's keymap needs this library (on
     every Wayland desktop, loaded as `libwayland-client` is) or a keymap
     compiler of our own, which is a large piece of work.
