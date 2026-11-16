@@ -1,6 +1,10 @@
 //! A job that takes its processes down when it closes (Windows job objects,
 //! `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`).
 //!
+//! On Linux there is no such object. The job ends its processes, and the
+//! process group of each that leads one, when it is dropped; it does not
+//! cover the holder being killed (`sys/linux.rs`, `Job`).
+//!
 //! foldwave puts a pane's program in one, held by the process that started
 //! it (the window, or a pane host with `--isolate`). If that process ends in
 //! any way, a crash or a kill included, Windows closes the job and ends the

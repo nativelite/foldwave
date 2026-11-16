@@ -4,7 +4,8 @@
 
 use std::io;
 
-/// One logical processor, as the OS schedules it (a Windows CPU set).
+/// One logical processor, as the OS schedules it (a Windows CPU set, a Linux
+/// CPU number).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cpu {
     /// The id thread placement names it by.
@@ -14,7 +15,8 @@ pub struct Cpu {
     /// The physical core it is on: hyper-threads share one.
     pub core: u8,
     /// Higher is faster. On a hybrid Intel part, P-cores are 1 and E-cores 0;
-    /// on a uniform part, every core is 0.
+    /// on a uniform part, every core is 0. On Linux the kinds are ranked by
+    /// the kernel's `cpu_capacity`, so a part with three kinds has 0, 1, 2.
     pub efficiency_class: u8,
 }
 
@@ -205,20 +207,50 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     fn this_machine_reports_its_processors_and_times() {
         let cpus = topology().unwrap();
-        assert_eq!(
-            cpus.len(),
-            std::thread::available_parallelism().unwrap().get()
-        );
+        // Linux lists every online CPU; a container may be allowed fewer.
+        let usable = std::thread::available_parallelism().unwrap().get();
+        if cfg!(windows) {
+            assert_eq!(cpus.len(), usable);
+        } else {
+            assert!(cpus.len() >= usable, "{} < {usable}", cpus.len());
+        }
         let t0 = times().unwrap();
         let spin = std::time::Instant::now();
         while spin.elapsed() < std::time::Duration::from_millis(50) {}
         let l = load(&t0, &times().unwrap());
         assert!(l.process > 0.0 && l.machine >= l.process * 0.5, "{l:?}");
         // Placing on one CPU and back succeeds.
-        place_current_thread(&[cpus[1].id]).unwrap();
+        place_current_thread(&[cpus[cpus.len() - 1].id]).unwrap();
         place_current_thread(&[]).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_clock_reads_a_childs_cpu_time_until_and_after_it_exits() {
+        // A shell counting burns CPU until it is killed.
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "while :; do :; done"])
+            .spawn()
+            .unwrap();
+        let clock = ProcessClock::of(&child).unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let running = loop {
+            let t = clock.read().unwrap();
+            assert!(!t.exited, "still running");
+            if t.cpu_ns > 0 {
+                break t;
+            }
+            assert!(std::time::Instant::now() < until, "it never used the CPU");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let done = clock.read().unwrap();
+        assert!(done.exited);
+        assert!(done.cpu_ns >= running.cpu_ns, "it does not go back");
+        assert_eq!(clock.read().unwrap(), done, "final once exited");
     }
 }

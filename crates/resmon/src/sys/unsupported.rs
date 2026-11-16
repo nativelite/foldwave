@@ -1,8 +1,7 @@
 //! Sampling stub for platforms with no backend yet.
 //!
-//! Windows is the implemented target (`docs/design.md` section 11, decision 5).
-//! A Linux `/proc` backend is the obvious next one; until it exists these
-//! functions fail loudly. Reporting an error rather than empty data matters:
+//! Windows and Linux (64-bit x86 and ARM) are implemented (`docs/design.md`
+//! section 11, decisions 5 and 24). Elsewhere these functions fail loudly. Reporting an error rather than empty data matters:
 //! zeros would read as "nothing is using this machine", which is exactly the
 //! wrong answer for an attribution tool.
 
@@ -13,7 +12,7 @@ use std::io;
 fn unsupported<T>() -> io::Result<T> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "resmon has no sampling backend for this platform yet (Windows only)",
+        "resmon has no sampling backend for this platform yet (Windows and Linux only)",
     ))
 }
 

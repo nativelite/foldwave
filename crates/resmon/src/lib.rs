@@ -5,8 +5,8 @@
 //! what share of it is the terminal itself?* Answering that is what decides
 //! whether moving work to the GPU is worth building.
 //!
-//! Zero third-party dependencies: Win32 is reached through this crate's own
-//! extern blocks.
+//! Zero third-party dependencies: Win32, and on Linux `/proc`, `/sys` and a few
+//! libc calls, are reached through this crate's own extern blocks.
 //!
 //! # Example
 //!
@@ -32,6 +32,8 @@
 //!   it is not a measurement of SSD traffic on its own.
 //! - **GPU** comes from whichever backend answered, named in
 //!   [`GpuSample::backend`]. Today that is `nvidia-smi` or `none`.
+//! - **Pressure** ([`pressure`]) is Linux's own measure of contention: the
+//!   share of time work stood waiting for a CPU, for memory or for I/O.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
@@ -40,6 +42,7 @@ pub mod cpu;
 pub mod delta;
 pub mod gpu;
 pub mod job;
+pub mod pressure;
 pub mod proc;
 pub mod report;
 pub mod sys;
@@ -70,7 +73,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     fn measure_over_a_short_window_attributes_this_process() {
         let at = measure(Duration::from_millis(120)).expect("measure a window");
         assert!(at.elapsed_secs >= 0.1, "elapsed was {}", at.elapsed_secs);
@@ -81,7 +84,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     fn percentages_never_exceed_what_the_machine_can_do() {
         let at = measure(Duration::from_millis(120)).expect("measure a window");
         let total: f64 = at.by_class.iter().map(|g| g.cpu_pct_machine).sum();

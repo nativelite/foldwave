@@ -1,8 +1,12 @@
 # foldwave: what "best" means, and where the next gains are
 
-> **Status:** proposal, 2026-11-16. A review of foldwave as built, and a
-> research direction that follows from its own measurements. **Nothing here is
-> a founder decision**; the ones it raises are listed in §8. Numbers marked
+> **Status:** 2026-11-16. A review of foldwave as built, and a research
+> direction that follows from its own measurements. **The founder accepted the
+> direction the same day, with Linux as the first Unix** ([design §11](design.md),
+> rows 23 and 24), and with one correction that §3 and §4 now carry: foldwave
+> is about speed and efficiency, and about pushing beyond, as the fold engine
+> it is named for does. Everything else here is still a proposal; the
+> decisions still open are listed in §8. Numbers marked
 > *measured* are quoted from [`design.md`](design.md) with their section.
 > Facts about other projects and about operating systems are in
 > [`prior-art.md`](prior-art.md) and [`compute.md`](compute.md), each with its
@@ -92,9 +96,18 @@ benchmarks in use stop at the parser or the frame counter
 ([prior-art](prior-art.md#what-the-benchmarks-in-use-leave-out)). None of them
 measures what a person feels or what the machine pays.
 
-foldwave is past that contest. Its own numbers say the terminal is already
-fast enough by a wide margin and already nearly free. So "the best terminal in
-the world" has to mean three things that no benchmark in use scores:
+foldwave is named for the fold engine: a drive that does not cross space
+faster but removes the space to be crossed. That is already how it got its
+speed. Logging before parsing took the parser off the ingest path. Not parsing
+a hidden pane returned about 40 % of fwterm's CPU. Handing out spans, not
+tokens, made emulation 1.76× faster by not allocating. None of these made a
+stage work harder; each removed a trip.
+
+So speed and efficiency are one goal here, not a trade, and the §4 targets are
+a floor, not a finish. The pipeline clears them by 4–9×; the question now is
+where the next folds are. The measurements say they are not inside the
+pipeline's stages any more. They are in three places no benchmark in use
+scores:
 
 1. **Instant.** The time from a key to a photon, and its worst case, are at
    the floor the display allows, whether the machine is idle or saturated.
@@ -108,12 +121,16 @@ the world" has to mean three things that no benchmark in use scores:
 
 These extend [design §5](design.md); they replace nothing in it.
 
-1. **Fast enough, then small.** Past the target, more speed is worth nothing.
-   Headroom is a budget to spend on footprint: run derived work on the slow
-   cores, at low clocks, later, or not at all. *Evidence:* parsing on one
-   E-core ran at 55.4 MiB/s against 125.5 on a P-core (E4, before the span
-   tokenizer), and one pane's target is 17.1 MiB/s. A slow core covers a pane
-   three times over, and the P-core it leaves free goes to a compiler.
+1. **Fold the distance.** The fastest path is the one with the least in it:
+   fewer copies, fewer wake-ups, fewer trips between devices, less work done
+   for nobody. Every gain is looked for as something to remove before
+   something to speed up, and a target once met is replaced by the next
+   ceiling, not retired. Speed that is not needed in one place is spent in
+   another: headroom on the fast cores goes back to the agents, so the whole
+   session runs faster. *Evidence:* parsing on one E-core ran at 55.4 MiB/s
+   against 125.5 on a P-core (E4, before the span tokenizer), and one pane's
+   target is 17.1 MiB/s. A slow core covers a pane three times over, and the
+   P-core it leaves free goes to a compiler.
 2. **The right silicon is a class, not only a device.** "CPU or GPU" is one
    axis. The others are which kind of core, at what clock, with what I/O and
    memory priority. Every modern OS has a way to say "this work is not urgent"
@@ -265,8 +282,9 @@ beside the others'. Proposed columns, each from E7 or E8:
 
 Nothing above is assumed. These are the calls it needs:
 
-1. **Is this the direction?** That is, whether "instant, invisible, a lever"
-   replaces "throughput" as what foldwave optimizes after M5.
+1. ~~Is this the direction?~~ **Decided 2026-11-16: yes** (design §11 row
+   23). Speed and efficiency stay the point; the three places in §3 are where
+   they are pursued next.
 2. **Report or act (E9, E11).** A session ledger that only *shows* a runaway
    process is clearly inside the non-goal "host the user's own unmodified
    tools". Lowering the scheduling class of a hidden pane's process tree does
@@ -281,10 +299,15 @@ Nothing above is assumed. These are the calls it needs:
    named terminals, and when.
 7. **A compression codec as its own crate (E12).** Design §8.4 already allows
    for one; this would be the decision record.
-8. **Which Unix comes first, and when.** Linux reuses the Vulkan renderer and
-   has the strongest per-pane controls. macOS needs a Metal renderer but shows
-   the shared-memory idea at its best.
+8. ~~Which Unix comes first.~~ **Decided 2026-11-16: Linux** (design §11 row
+   24). When macOS follows is open.
 9. **`libwayland-client` on Linux (§5).** Whether loading a library every
    Wayland desktop ships counts as a dependency, as `vulkan-1.dll` does not.
 10. **Durability on macOS (§5).** A full flush per write, a barrier, or a
     cadence.
+11. **Targets beyond §4.** The founder's direction is to push beyond, and the
+    §4 targets are met. Candidates for the next set, each a proposal until
+    confirmed and each needing its benchmark first: key to photon within one
+    refresh at p99, idle and under a flood (E7); idle cost stated in wakeups
+    per second and watts, not only CPU share (E8); 16 panes at the measured
+    transport ceiling instead of 1 GB/min each; search under 1 s at 1 TB.

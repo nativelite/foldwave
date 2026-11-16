@@ -79,10 +79,26 @@ going", and misfiles anything it has no rule for into `other`.
 
 ## Platforms
 
-Windows, per `docs/design.md` §11 decision 5 (Windows first). Other platforms
-compile and fail loudly as unsupported rather than reporting zeros, which would
-read as "nothing is using this machine" — exactly the wrong answer for an
-attribution tool. A Linux `/proc` backend is the obvious next one.
+Windows (`docs/design.md` §11 decision 5) and Linux on 64-bit x86 and ARM
+(decision 24). Other platforms compile and fail loudly as unsupported rather
+than reporting zeros, which would read as "nothing is using this machine" —
+exactly the wrong answer for an attribution tool.
+
+What Linux reads, with no privilege and no library beyond libc:
+
+| Reading | From |
+| --- | --- |
+| processes, their parents, CPU time, memory | `/proc/<pid>/stat`, `statm` |
+| I/O | `/proc/<pid>/io`; another user's process is marked denied |
+| machine load, memory | `/proc/stat`, `/proc/meminfo` |
+| which CPUs are fast or efficient | `cpu_capacity`, else the `cpu_core` and `cpu_atom` lists |
+| volumes | `statvfs` and `/proc/self/mountinfo`; a fixed volume is a writable block device on a disk that cannot be removed |
+| pressure (`resmon::pressure`) | `/proc/pressure/cpu`, `memory`, `io`: the share of time work stood waiting, which Windows does not report |
+
+One difference to know: `job::KillOnClose` ends its processes (and each one's
+process group) when it is dropped, but not when its holder is killed, which a
+Windows job object does cover. Linux needs that set up when the program is
+spawned (a cgroup or a parent-death signal), not after.
 
 ## Develop
 
