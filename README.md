@@ -93,10 +93,12 @@ light up under the pointer and open the settings sheet and this help.
 
 foldwave builds and runs on Linux (64-bit x86 and ARM) on a Wayland desktop,
 as a first cut: `cargo build --release --bin fwterm`, then
-`target/release/fwterm`. It needs nothing installed beyond what a Wayland
-desktop with a Vulkan driver already has (`libwayland-client`, `libvulkan`,
-both loaded at run time). What works and what does not yet (US keyboard
-layout only, no clipboard, no title bar on GNOME, no installer) is in
+`target/release/fwterm`. It needs nothing installed: Wayland is spoken by
+[`nativelite-wayland`](https://github.com/nativelite/wayland-rs) and the
+keyboard read by [`nativelite-xkb`](https://github.com/nativelite/xkb-rs),
+nativelite's own, and the binary links libc alone. For now the window is
+drawn by the CPU renderer. What works and what does not yet (no GPU drawing,
+no clipboard, no title bar on GNOME, no installer) is in
 [`docs/design.md`](docs/design.md) §8.9.
 
 ## Install (Windows)

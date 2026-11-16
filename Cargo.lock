@@ -43,6 +43,8 @@ version = "0.2.0"
 dependencies = [
  "nativelite-ansi",
  "nativelite-glyphs",
+ "nativelite-wayland",
+ "nativelite-xkb",
 ]
 
 [[package]]
@@ -102,3 +104,11 @@ dependencies = [
  "nativelite-ansi",
  "nativelite-uwidth",
 ]
+
+[[package]]
+name = "nativelite-wayland"
+version = "0.1.0"
+
+[[package]]
+name = "nativelite-xkb"
+version = "0.1.0"

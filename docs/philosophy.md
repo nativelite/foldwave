@@ -302,8 +302,7 @@ Nothing above is assumed. These are the calls it needs:
 8. ~~Which Unix comes first.~~ **Decided 2026-11-16: Linux** (design §11 row
    24). When macOS follows is open.
 9. ~~`libwayland-client` on Linux.~~ **Decided 2026-11-16: nativelite's own
-   implementation, in progress** (design §11 row 25). The window as built
-   uses the system library until it is ready.
+   (`nativelite-wayland`), and wired in** (design §11 row 25).
 10. **Durability on macOS (§5).** A full flush per write, a barrier, or a
     cadence.
 11. **Targets beyond §4.** The founder's direction is to push beyond, and the
@@ -312,14 +311,17 @@ Nothing above is assumed. These are the calls it needs:
     refresh at p99, idle and under a flood (E7); idle cost stated in wakeups
     per second and watts, not only CPU share (E8); 16 panes at the measured
     transport ceiling instead of 1 GB/min each; search under 1 s at 1 TB.
-12. ~~`libxkbcommon` for keyboard layouts.~~ **Decided 2026-11-16: our own,
-    in progress** (design §11 row 25). As it stood: The Wayland window types a US
-    layout only. Reading the compositor's keymap needs this library (on
-    every Wayland desktop, loaded as `libwayland-client` is) or a keymap
-    compiler of our own, which is a large piece of work.
+12. ~~`libxkbcommon` for keyboard layouts.~~ **Decided 2026-11-16: nativelite's
+    own (`nativelite-xkb`), and wired in** (design §11 row 25).
 13. **Where foldwave's folder lives on Linux.** Built as
     `$XDG_DATA_HOME/foldwave`, else `~/.local/share/foldwave`, for settings
     and default logs together; the convention would split them (settings
     under `~/.config`, logs under `~/.local/state`).
 14. **A title bar on GNOME.** GNOME draws none for an application. Our own,
     in the grid like the instrument strip, or the `libdecor` library.
+15. **Vulkan frames on Linux.** With our own Wayland library there is no
+    Vulkan surface to draw to, so Linux draws on the CPU renderer. The way
+    back to the GPU is Vulkan images handed to the compositor as dmabufs, with
+    our own frame pacing: whether to build it now, or run on the CPU renderer
+    while the rest of the Linux port catches up. It decides E7 (key to
+    photon) on Linux.

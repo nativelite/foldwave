@@ -25,7 +25,7 @@ fn unavailable(e: &Error) -> bool {
             | Error::NoSuitableDevice
             | Error::Unsupported(_)
             | Error::Vulkan {
-                call: "vkCreateInstance" | "vkCreateWin32SurfaceKHR" | "vkCreateWaylandSurfaceKHR",
+                call: "vkCreateInstance" | "vkCreateWin32SurfaceKHR",
                 ..
             }
     )
@@ -252,6 +252,7 @@ fn the_wrong_atlas_is_rejected() {
     );
 }
 
+#[cfg(windows)]
 #[test]
 fn a_window_swapchain_draws_resizes_and_draws_again() {
     let palette = Palette::default();
@@ -261,7 +262,7 @@ fn a_window_swapchain_draws_resizes_and_draws_again() {
     let mut frame = Frame::new();
     frame.update(&s, true, &palette, &mut atlas, &mut raster);
 
-    let mut window = match crate::vk::PlatformWindow::new("fwrender vk test", 96, 80) {
+    let mut window = match crate::win::Window::new("fwrender vk test", 96, 80) {
         Ok(w) => w,
         Err(e) => {
             println!("skipping: could not create a window: {e}");
@@ -271,23 +272,10 @@ fn a_window_swapchain_draws_resizes_and_draws_again() {
     let mut events = Vec::new();
     let (w, h) = window.client_size();
     // SAFETY: the window outlives the renderer (dropped after it below).
-    #[cfg(windows)]
     let made = unsafe {
         VkRenderer::for_window(
             window.hinstance(),
             window.hwnd(),
-            w,
-            h,
-            &atlas,
-            PresentMode::Fifo,
-        )
-    };
-    // SAFETY: as above.
-    #[cfg(target_os = "linux")]
-    let made = unsafe {
-        VkRenderer::for_wayland(
-            window.display(),
-            window.surface(),
             w,
             h,
             &atlas,
@@ -337,4 +325,25 @@ fn a_window_swapchain_draws_resizes_and_draws_again() {
     }
     drop(gpu);
     drop(window);
+}
+
+/// On Linux a window is drawn by the CPU renderer for now: asking for a
+/// Vulkan one says so and hands the window back, which is what lets a
+/// caller fall back.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_vulkan_window_on_wayland_is_refused_and_the_window_comes_back() {
+    let atlas = Atlas::new(M, 256, 256);
+    let window = match crate::wl::Window::new("fwrender vk test", 96, 80) {
+        Ok(w) => w,
+        Err(e) => {
+            println!("skipping: could not create a window: {e}");
+            return;
+        }
+    };
+    match VkWindow::try_new(window, &atlas, PresentMode::Fifo) {
+        Err((Error::Unsupported(_), window)) => assert_eq!(window.client_size(), (96, 80)),
+        Err((e, _)) => panic!("expected Unsupported, got {e}"),
+        Ok(_) => panic!("a Vulkan window on Wayland is not built"),
+    }
 }

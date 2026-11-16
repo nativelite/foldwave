@@ -161,7 +161,6 @@ pub const ST_MEMORY_BARRIER: VkEnum = 46;
 pub const ST_SWAPCHAIN_CREATE_INFO_KHR: VkEnum = 1_000_001_000;
 pub const ST_PRESENT_INFO_KHR: VkEnum = 1_000_001_001;
 pub const ST_WIN32_SURFACE_CREATE_INFO_KHR: VkEnum = 1_000_009_000;
-pub const ST_WAYLAND_SURFACE_CREATE_INFO_KHR: VkEnum = 1_000_006_000;
 
 /// `VK_MAKE_API_VERSION(0, 1, 0, 0)`: major in bits 22..28.
 pub const VK_API_VERSION_1_0: u32 = 1 << 22;
@@ -263,14 +262,12 @@ pub const COMPOSITE_ALPHA_OPAQUE_BIT_KHR: VkFlags = 0x1;
 
 pub const KHR_SURFACE: &str = "VK_KHR_surface\0";
 pub const KHR_WIN32_SURFACE: &str = "VK_KHR_win32_surface\0";
-pub const KHR_WAYLAND_SURFACE: &str = "VK_KHR_wayland_surface\0";
 
-/// The surface extension of the window system this build draws on.
+/// The surface extension of the window system this build draws on. Linux
+/// has none here: Vulkan's Wayland surface (`VK_KHR_wayland_surface`) takes
+/// the C `libwayland-client`'s display, which foldwave does not load.
 #[cfg(windows)]
 pub const KHR_PLATFORM_SURFACE: &str = KHR_WIN32_SURFACE;
-/// The surface extension of the window system this build draws on.
-#[cfg(target_os = "linux")]
-pub const KHR_PLATFORM_SURFACE: &str = KHR_WAYLAND_SURFACE;
 pub const KHR_SWAPCHAIN: &str = "VK_KHR_swapchain\0";
 
 // ---------------------------------------------------------------- structures
@@ -946,17 +943,6 @@ pub struct VkWin32SurfaceCreateInfoKHR {
     pub hwnd: *mut c_void,
 }
 
-/// `vulkan_wayland.h`: `display` is a `struct wl_display *` and `surface` a
-/// `struct wl_surface *`, both from `libwayland-client`.
-#[repr(C)]
-pub struct VkWaylandSurfaceCreateInfoKHR {
-    pub sType: VkEnum,
-    pub pNext: *const c_void,
-    pub flags: VkFlags,
-    pub display: *mut c_void,
-    pub surface: *mut c_void,
-}
-
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct VkSurfaceCapabilitiesKHR {
@@ -1097,18 +1083,12 @@ fns!(SurfaceFns {
         fn(VkPhysicalDevice, VkSurfaceKHR, *mut u32, *mut VkEnum) -> VkResult;
 });
 
-// The one entry point that differs by window system, in a table of its own
-// so the rest of `SurfaceFns` is the same everywhere.
+// The one entry point that belongs to the window system, in a table of its
+// own so the rest of `SurfaceFns` is the same everywhere.
 #[cfg(windows)]
 fns!(PlatformSurfaceFns {
     create_win32_surface: "vkCreateWin32SurfaceKHR" =
         fn(VkInstance, *const VkWin32SurfaceCreateInfoKHR, Alloc, *mut VkSurfaceKHR) -> VkResult;
-});
-
-#[cfg(target_os = "linux")]
-fns!(PlatformSurfaceFns {
-    create_wayland_surface: "vkCreateWaylandSurfaceKHR" =
-        fn(VkInstance, *const VkWaylandSurfaceCreateInfoKHR, Alloc, *mut VkSurfaceKHR) -> VkResult;
 });
 
 fns!(DeviceFns {

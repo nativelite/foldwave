@@ -2767,23 +2767,40 @@ What they say:
 the same day as the first Linux build, in `fwrender::wl`
 ([`wl/`](../crates/fwrender/src/wl)):
 
-- **`libwayland-client` is loaded at run time and bound by hand**
-  (`wl/sys.rs`): `dlopen`, thirteen functions and the core protocol's tables
-  looked up by name. `xdg-shell`'s tables are not in the library (a C program
-  generates them), so they are written out from the protocol's XML. Nothing
-  is linked; without the library or a compositor, opening a window is an
-  error, not a failed start.
+- **Wayland is spoken by nativelite's own client library, and the keyboard
+  read by its own keymap library** (2026-11-16, later the same day; row 25):
+  [`nativelite-wayland`](https://github.com/nativelite/wayland-rs) and
+  [`nativelite-xkb`](https://github.com/nativelite/xkb-rs), both on the
+  standard library alone. The first cut, hours earlier, loaded the system's
+  `libwayland-client` through hand-written bindings; that file (`wl/sys.rs`)
+  is gone. `ldd fwterm` now lists libc and nothing else.
 - **`wl::Window` has `win::Window`'s method names and reports the same
   `Event` type** (now `fwrender/src/event.rs`, shared), so a caller is written
-  once. Keys arrive as Linux key codes and are turned into the virtual-key
-  codes and characters fwterm already handles (`wl/keys.rs`); a held key
-  repeats on our own clock, as Wayland leaves that to the client. One thread
-  owns the window; a `Waker` is an `eventfd`.
+  once. Events are pulled from the connection one at a time; there are no
+  callbacks and no raw pointers, and the window is ordinary safe Rust but for
+  two calls (`ppoll`, to sleep on the compositor and a waker together, and
+  `memfd_create`). One thread owns the window; a `Waker` is a socket pair.
+- **Keys go through the compositor's own keymap.** `nativelite-xkb` reads the
+  keymap text the compositor sends and says what each key types under the
+  layout and modifiers in force, with dead keys and Compose sequences from
+  the locale's Compose file. A letter or digit key takes the virtual-key code
+  of what it types, as on Windows (the key at Q's place on a French keyboard
+  is the A key to a shortcut); other keys take their place's (`wl/keys.rs`).
+  A held key repeats on our own clock, as Wayland leaves that to the client.
 - **`wl::CpuPresenter`** shows the CPU renderer's frames through shared memory
   (`wl_shm`, `memfd`), reusing buffers as the compositor releases them.
-- **The Vulkan backend runs on Linux.** Its loader is `libvulkan.so.1` there,
-  and its surface `VK_KHR_wayland_surface` (`VkRenderer::for_wayland`); the
-  rest of `vk/` is unchanged.
+- **A Vulkan frame in the window is not built, and this is the cost of the
+  decision.** Vulkan's own Wayland surface (`VK_KHR_wayland_surface`) takes
+  the C library's `wl_display`, and the driver calls that library on it. The
+  first cut drew through it (a swapchain on the window, checked); without the
+  C library there is nothing to hand it. `VkWindow::try_new` refuses on Linux
+  and hands the window back, so fwterm falls back to the CPU renderer and
+  says so. The Vulkan renderer itself still runs on Linux off screen, loaded
+  from `libvulkan.so.1`, and matches the CPU reference. The way back to the
+  GPU is to draw into ordinary Vulkan images and hand them to the compositor
+  as dmabufs (`linux-dmabuf-v1`, which `nativelite-wayland`'s scanner can
+  generate), pacing frames ourselves ([`compute.md`](compute.md), "Display
+  path"); it is unbuilt and unproven.
 - **`fwterm` builds and runs on Linux.** With the window's names matching,
   turning its whole `app` on left nine compile errors, in four places that
   are Windows' own (a console check, a process flag, the uninstaller's
@@ -2794,17 +2811,20 @@ the same day as the first Linux build, in `fwrender::wl`
 - **`fwbench render` runs on Linux**, with the built-in JetBrains Mono.
 
 Checked on that machine against a real compositor (weston 13, headless) and
-Mesa's software Vulkan driver (llvmpipe):
+Mesa's software Vulkan driver (llvmpipe), after the move to nativelite's own
+libraries:
 
 | Check | Result |
 | --- | --- |
 | A window opens, sleeps, is woken from another thread, resizes | pass (3 tests) |
 | CPU frames reach the compositor; buffers are reused; a presenter outlives its window | pass |
-| Vulkan against the CPU reference, pixel for pixel | 21,037 pixels, largest channel difference 0 |
-| A Vulkan swapchain on the Wayland window draws, resizes, draws again | pass |
-| `fwbench render`, CPU and Vulkan, 900x500 | both run; idle draws 0 frames at 0.00 % of a core |
-| `fwterm`, CPU and Vulkan, a shell printing 20,000 lines | both exit 0 |
+| A keymap as a compositor sends it: what keys type, with Shift, Control and Alt; a Compose sequence; no keymap at all | pass (4 tests, no compositor needed) |
+| Vulkan off screen against the CPU reference, pixel for pixel | 21,037 pixels, largest channel difference 0 |
+| A Vulkan window on Wayland | refused, and the window handed back (1 test) |
+| `fwbench render`, CPU, 900x500 | 128 fps at 2 MiB/s of output; idle draws 0 frames at 0.00 % of a core |
+| `fwterm` with `--backend cpu`, and with `vulkan` falling back, a shell printing 20,000 lines | both exit 0 |
 | `fwterm --panes 4` with defaults (pane hosts, ptys, logs) | exit 0; four logs with checkpoints, line index and signatures, a marker line found in each; no process left behind |
+| The two libraries' own suites on that machine | `nativelite-wayland` 51 pass, `nativelite-xkb` 64 pass |
 | The Windows build | still type-checks, tests included (`x86_64-pc-windows-gnu`) |
 | With no compositor | the window tests skip and pass |
 
@@ -2819,7 +2839,7 @@ with a GPU.
 
 | Missing | What it needs |
 | --- | --- |
-| Any keyboard layout but US | the compositor's keymap read, through `libxkbcommon` (a system library, as `libwayland-client` is) or our own; a founder decision |
+| A Vulkan frame in the window | Vulkan images handed to the compositor as dmabufs (above); until then Linux draws on the CPU renderer |
 | A title bar on GNOME, which draws none for an application | our own, drawn in the grid like the strip; or `libdecor` |
 | Sharp text on a scaled display | `fractional-scale-v1` and `viewporter`; today the surface is one pixel a point |
 | Clipboard, dropped files, pointer shapes | `wl_data_device`, `cursor-shape-v1` |
@@ -2918,7 +2938,7 @@ Founder answers of 2026-09-15.
 | 22 | Order of the agent-layer slices | **Founder decision (2026-11-08): the order in §8.7c stands**: pane identity, then attention, then fwterm as a ctl client, then fwterm's own shim; the first two start now, since they wait on nothing | Slices 3 and 4 waited on `nativelite-ipc` (row 20) and the shared verb crate (row 19); both existed by 2026-11-09, so no slice is blocked; all four slices were built that day. The beta check in a window (§10 M5 status) is unchanged and runs when the founder is at the machine |
 | 23 | Direction after M5 | **Founder decision (2026-11-16): the direction in [`philosophy.md`](philosophy.md) stands**: with the §4 targets met, speed and efficiency are pursued at the photon (key-to-photon latency), in the footprint (fast-core time, memory, disk, energy, wakeups) and across the session (what the panes' programs cost), by removing work before speeding it up | The founder's correction, recorded with it: foldwave is about speed and efficiency and "the ability to push beyond", as the fold engine it is named for does; the targets are a floor. Experiments E7 to E16 are proposals, each kept or dropped by its own measurement; the decisions still open are in philosophy §8 (report or act, the default signer, a camera for E7, drawing below the display's rate, a public scorecard, a compression crate, `libwayland-client`, targets beyond §4) |
 | 24 | The first Unix | **Founder decision (2026-11-16): Linux first** | It reuses the Vulkan renderer and has the strongest per-pane controls (a cgroup per pane, pressure-stall information; [`compute.md`](compute.md)). First step, **built 2026-11-16**: `resmon`'s Linux backend ([`sys/linux.rs`](../crates/resmon/src/sys/linux.rs)), which the governor and the measurement harness stand on. Processes with their parents, CPU time, memory and I/O from `/proc`; machine load and memory; which CPUs are fast or efficient (`cpu_capacity`, else the `cpu_core` and `cpu_atom` lists), written as the records `cpu::topology` already parses; thread placement (`sched_setaffinity`); volumes and their mount points (`statvfs`, `mountinfo`), a fixed volume being a writable block device on a disk that cannot be removed; a child's CPU clock named by id and start time; and `resmon::pressure`, Linux's pressure-stall information for CPU, memory and I/O, a governor input Windows has no counterpart for (§8.8). No privilege, no library beyond libc through our own `extern` block; 64-bit x86 and ARM. Checked on Linux 6.18 in a 4-CPU container: 74 unit tests (17 new) pass five runs in a row, `resmon 2` attributes the machine, and the crate still type-checks for Windows (`x86_64-pc-windows-gnu`). **Not checked:** a hybrid CPU (the container's are one kind) and a machine with real disks (`volume::fixed` listed none there). **The whole workspace was built on Linux the same day** (§8.9, "Linux: the first build and the first numbers"): every crate but `fwterm` builds and passes its tests, and `fwbench` gave the first Linux measurements. **A known gap:** `job::KillOnClose` on Linux ends its processes and their process groups when dropped, not when its holder is killed; that needs the pane's program started in a cgroup or with a parent-death signal, which belongs to the spawn in `pty-rs` ([`compute.md`](compute.md), "A job per pane"). macOS needs a Metal renderer (§8.6) and has no date |
-| 25 | The Linux window | **Superseded the same day (founder, 2026-11-16): foldwave will use nativelite's own implementations of the Wayland client library and of the keymap library, not the system's C ones** ("in C, which is a pain for vulnerabilities"); the founder is building both and will say when they are ready. Until then `fwrender::wl` stays as built on the system library, behind `wl/sys.rs`, which is the one file a replacement has to meet. One thing the replacement must answer: Vulkan's own Wayland surface takes the C library's `wl_display` and the driver calls that library on it, so without the C library frames reach the compositor another way (the CPU presenter's shared memory, or Vulkan images exported as dmabufs; [`compute.md`](compute.md), "Display path"). ~~Founder decision (2026-11-16): Wayland first, and `libwayland-client` is loaded at run time~~, on the footing of `vulkan-1.dll` on Windows: a library the system ships, bound by our own code, nothing of it shipped or linked | Wayland is what the main Linux desktops now run; X11 is a later, optional backend. The library is needed, not only convenient: Vulkan's Wayland surface takes its `wl_display` and the driver calls the library on it ([`compute.md`](compute.md), "Display path"). **Built the same day**: `fwrender::wl`, the Vulkan backend on Linux, and fwterm running there (§8.9, "The Wayland window, and fwterm on Linux"). Open from it: `libxkbcommon` for keyboard layouts, the same kind of library and the same question; where fwterm's folder lives on Linux (`~/.local/share/foldwave` as built); a title bar on GNOME |
+| 25 | The Linux window | **Founder decision (2026-11-16): Wayland first, on nativelite's own implementations of the Wayland client library and of the keymap library, not the system's C ones** ("in C, which is a pain for vulnerabilities"): [`nativelite-wayland`](https://github.com/nativelite/wayland-rs) and [`nativelite-xkb`](https://github.com/nativelite/xkb-rs), std only, MIT, being published; fwrender depends on them by version and path like every org crate, on Linux only. **Wired in the same day**: `fwrender::wl` speaks Wayland and reads keymaps through them, and no system library is loaded for the window (§8.9, "The Wayland window, and fwterm on Linux"). The cost, known when it was decided: Vulkan's own Wayland surface needs the C library's `wl_display`, so a Linux window is drawn by the CPU renderer until Vulkan images are handed to the compositor as dmabufs. This replaced, hours later, the day's first ruling: ~~`libwayland-client` loaded at run time, on the footing of `vulkan-1.dll` on Windows~~ | Wayland is what the main Linux desktops now run; X11 is a later, optional backend. The first cut was built on the system library and checked (a Vulkan swapchain on the window included) before the libraries were ready; `wl/sys.rs`, its binding, was removed when they were. Open from it: the dmabuf path for Vulkan frames; where fwterm's folder lives on Linux (`~/.local/share/foldwave` as built); a title bar on GNOME |
 
 **Experiment E2: built-in console host vs OpenConsole (part of M0).**
 

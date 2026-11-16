@@ -19,3 +19,9 @@ glyphs = { package = "nativelite-glyphs", version = "0.1.0", path = "../../../gl
 [lib]
 name = "fwrender"
 path = "src/lib.rs"
+
+# The Wayland window (Linux): nativelite's own client library and keymap
+# reader, both std-only. Nothing of the system's is linked or loaded for it.
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland = { package = "nativelite-wayland", version = "0.1.0", path = "../../../wayland-rs" }
+xkb = { package = "nativelite-xkb", version = "0.1.0", path = "../../../xkb-rs" }

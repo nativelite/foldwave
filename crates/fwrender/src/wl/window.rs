@@ -5,38 +5,39 @@
 //! Wayland has no counterpart for says so and does nothing, as documented on
 //! each method.
 //!
-//! One thread owns the window and everything on its connection. Requests go
-//! out when [`Window::poll`], [`Window::wait`] or a present flushes them;
-//! events are read there and turned into [`Event`]s by the listeners below.
+//! The protocol is spoken by `nativelite-wayland` and the keyboard read by
+//! `nativelite-xkb`: no system library is loaded. One thread owns the window
+//! and its connection. Requests go out when [`Window::poll`],
+//! [`Window::wait`] or a present flushes them; events are read there, one at
+//! a time, and turned into [`Event`]s.
 
 use super::keys;
-use super::sys::*;
 use crate::cpu::CpuRenderer;
 pub use crate::event::{Cursor, Event, TaskbarProgress};
-use std::ffi::{c_char, c_int, c_long, c_void, CStr, CString};
-use std::io;
+use std::cell::RefCell;
+use std::ffi::{c_char, c_int, c_long, c_void};
+use std::fs::File;
+use std::io::{self, Read, Write};
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::FileExt;
+use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
+use wayland::protocol::wayland::{
+    wl_buffer, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm, WlBuffer, WlCompositor,
+    WlKeyboard, WlPointer, WlSeat, WlShm, WlSurface,
+};
+use wayland::protocol::xdg_shell::{
+    xdg_surface, xdg_toplevel, xdg_wm_base, XdgSurface, XdgToplevel, XdgWmBase,
+};
+use wayland::{Connection, Proxy};
+use xkb::compose;
 
 extern "C" {
-    fn eventfd(initial: u32, flags: c_int) -> c_int;
-    fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
-    fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
-    fn close(fd: c_int) -> c_int;
     fn ppoll(fds: *mut PollFd, count: u64, timeout: *const Timespec, mask: *const c_void) -> c_int;
     fn memfd_create(name: *const c_char, flags: u32) -> c_int;
-    fn ftruncate(fd: c_int, length: i64) -> c_int;
-    fn mmap(
-        addr: *mut c_void,
-        length: usize,
-        prot: c_int,
-        flags: c_int,
-        fd: c_int,
-        offset: i64,
-    ) -> *mut c_void;
-    fn munmap(addr: *mut c_void, length: usize) -> c_int;
 }
 
 #[repr(C)]
@@ -53,39 +54,32 @@ struct Timespec {
 }
 
 const POLLIN: i16 = 1;
-const EFD_CLOEXEC: c_int = 0o2000000;
-const EFD_NONBLOCK: c_int = 0o4000;
 const MFD_CLOEXEC: u32 = 1;
-const PROT_READ_WRITE: c_int = 3;
-const MAP_SHARED: c_int = 1;
 const BTN_LEFT: u32 = 0x110;
+/// The keysyms of Delete and the keypad's: they have a character (0x7F),
+/// but Windows reports the key alone, and fwterm handles it as a key.
+const DELETE_SYMS: [u32; 2] = [0xffff, 0xff9f];
 /// Two clicks this close in time and place are a double click, as Windows'
 /// defaults have it.
 const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 const DOUBLE_CLICK_PX: i32 = 4;
+/// The versions bound, no higher than this code handles.
+const COMPOSITOR_VERSION: u32 = 4;
+const SEAT_VERSION: u32 = 5;
 
 /// Shift, Ctrl and Alt as the keyboard last reported them, for
 /// [`shift_down`] and the others, which take no window.
 static MODS: AtomicU32 = AtomicU32::new(0);
 
-/// A file descriptor closed on drop.
-struct Fd(c_int);
-
-impl Drop for Fd {
-    fn drop(&mut self) {
-        // SAFETY: ours, closed once.
-        unsafe { close(self.0) };
-    }
+fn other(e: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, e.to_string())
 }
-
-/// What [`Waker`]s write to and [`Window::wait`] sleeps on: an eventfd.
-struct WakeFd(Fd);
 
 /// Wakes a [`Window`] blocked in [`Window::wait`] from any thread; the window
 /// then reports [`Event::Woken`]. Waking a dropped window does nothing.
 #[derive(Clone)]
 pub struct Waker {
-    target: Weak<WakeFd>,
+    target: Weak<UnixStream>,
 }
 
 impl std::fmt::Debug for Waker {
@@ -97,21 +91,11 @@ impl std::fmt::Debug for Waker {
 impl Waker {
     /// Queue [`Event::Woken`]. Cheap and non-blocking.
     pub fn wake(&self) {
-        if let Some(fd) = self.target.upgrade() {
-            let one = 1u64;
-            // SAFETY: eight bytes from a live u64 to a live eventfd. A full
-            // counter (it never is) would only mean the wake is already
-            // pending.
-            unsafe { write(fd.0 .0, (&one as *const u64).cast(), 8) };
+        if let Some(stream) = self.target.upgrade() {
+            // A full socket means a wake is already waiting to be read.
+            let _ = (&*stream).write(&[1]);
         }
     }
-}
-
-/// A global the registry announced: its name and version.
-#[derive(Clone, Copy, Default)]
-struct Global {
-    name: u32,
-    version: u32,
 }
 
 /// A key being held, for auto-repeat, which a Wayland client does itself.
@@ -121,20 +105,146 @@ struct Held {
     next: Instant,
 }
 
-/// Everything the listeners write. It lives in its own allocation, reached
-/// only through a raw pointer, so a listener running inside
-/// [`Window::poll`] never aliases a borrow of the [`Window`].
-struct State {
-    lib: &'static Lib,
+/// The keyboard: the compositor's keymap and the state it reports.
+struct Keyboard {
+    /// `None` until the compositor sends a keymap this code can read; keys
+    /// then type a US layout (`keys::typed`).
+    state: Option<xkb::State>,
+    /// Dead keys and Compose sequences, from the locale's Compose file.
+    compose: Option<compose::State>,
+    /// Modifiers as [`keys`] names them, whichever way they were learned.
+    mods: u32,
+    locked: u32,
+    held: Option<Held>,
+    /// Keys a second, and the wait before the first repeat.
+    repeat: (u32, Duration),
+}
+
+impl Keyboard {
+    fn new() -> Keyboard {
+        Keyboard {
+            state: None,
+            compose: None,
+            mods: 0,
+            locked: 0,
+            held: None,
+            repeat: (25, Duration::from_millis(600)),
+        }
+    }
+
+    /// Take the keymap the compositor sent: `size` bytes of text in `fd`.
+    fn load(&mut self, fd: OwnedFd, size: u32) {
+        let mut text = vec![0u8; size as usize];
+        let file = File::from(fd);
+        // The descriptor is a shared-memory file; one that will not read at
+        // an offset is read from where it stands.
+        let read = file
+            .read_exact_at(&mut text, 0)
+            .or_else(|_| (&file).read_exact(&mut text));
+        self.state = read
+            .ok()
+            .and_then(|()| xkb::Keymap::from_bytes(&text).ok())
+            .map(xkb::State::new);
+        if self.compose.is_none() {
+            let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+                .iter()
+                .find_map(|name| std::env::var(name).ok().filter(|v| !v.is_empty()))
+                .unwrap_or_else(|| "C".into());
+            self.compose = compose::Table::from_locale(&locale, &compose::Paths::from_env())
+                .ok()
+                .map(compose::State::new);
+        }
+    }
+
+    /// `wl_keyboard.modifiers`.
+    fn modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
+        match &mut self.state {
+            Some(state) => {
+                state.update_mask(depressed, latched, locked, 0, 0, group);
+                let on = |name, part| state.mod_name_is_active(name, part);
+                let bit = |name, bit| {
+                    if on(name, xkb::Component::Effective) {
+                        bit
+                    } else {
+                        0
+                    }
+                };
+                self.mods = bit("Shift", keys::MOD_SHIFT)
+                    | bit("Control", keys::MOD_CTRL)
+                    | bit("Mod1", keys::MOD_ALT);
+                self.locked = if on("Lock", xkb::Component::Locked) {
+                    keys::MOD_CAPS
+                } else {
+                    0
+                };
+            }
+            None => {
+                self.mods = depressed | latched;
+                self.locked = locked;
+            }
+        }
+        MODS.store(self.mods, Ordering::Relaxed);
+    }
+
+    /// The virtual-key code of a Linux key code.
+    fn vk(&self, key: u32) -> Option<u32> {
+        let first = self.state.as_ref().and_then(|state| {
+            let code = key + 8;
+            let layout = state.key_layout(code)?;
+            let sym = state.keymap().key_syms_by_level(code, layout, 0).first()?;
+            Some(sym.to_utf32())
+        });
+        keys::vk_in_layout(key, first)
+    }
+
+    /// What a key press types, as Windows' `WM_CHAR` would report it:
+    /// nothing with Alt held, nothing in the middle of a Compose sequence,
+    /// the sequence's result when it completes.
+    fn typed(&mut self, key: u32) -> String {
+        if self.mods & keys::MOD_ALT != 0 {
+            return String::new();
+        }
+        let Some(state) = &self.state else {
+            return keys::typed(key, self.mods, self.locked)
+                .map(String::from)
+                .unwrap_or_default();
+        };
+        let code = key + 8;
+        let sym = state.key_one_sym(code);
+        if let Some(compose) = &mut self.compose {
+            match compose.feed(sym) {
+                compose::Status::Composing | compose::Status::Cancelled => return String::new(),
+                compose::Status::Composed => return compose.utf8(),
+                compose::Status::Nothing => {}
+            }
+        }
+        if DELETE_SYMS.contains(&sym.0) {
+            return String::new();
+        }
+        state.key_utf8(code)
+    }
+
+    fn repeats(&self, key: u32) -> bool {
+        match &self.state {
+            Some(state) => state.key_repeats(key + 8),
+            None => !keys::is_modifier(key),
+        }
+    }
+}
+
+/// The connection and everything learned from it.
+struct Inner {
+    conn: Connection,
+    shm: WlShm,
+    wm_base: XdgWmBase,
+    surface: WlSurface,
+    xdg: XdgSurface,
+    toplevel: XdgToplevel,
+    seat: Option<WlSeat>,
+    pointer: Option<WlPointer>,
+    keyboard: Option<WlKeyboard>,
+    keys: Keyboard,
     events: Vec<Event>,
-    compositor: Global,
-    shm: Global,
-    seat: Global,
-    wm_base: Global,
-    seat_proxy: *mut Proxy,
-    pointer: *mut Proxy,
-    keyboard: *mut Proxy,
-    xdg_surface: *mut Proxy,
     /// The size the next `xdg_surface.configure` applies; 0 leaves it to us.
     pending: (i32, i32),
     size: (u32, u32),
@@ -143,14 +253,13 @@ struct State {
     pointer_at: Option<(i32, i32)>,
     button_down: bool,
     last_click: Option<(Instant, i32, i32)>,
-    mods: u32,
-    locked: u32,
-    held: Option<Held>,
-    /// Keys a second, and the wait before the first repeat.
-    repeat: (u32, Duration),
+    /// Buffers the compositor has finished with, for the presenter.
+    released: Vec<u32>,
+    /// The connection failed; said once, as a close request.
+    lost: bool,
 }
 
-impl State {
+impl Inner {
     fn push(&mut self, event: Event) {
         // A pointer move behind another replaces it, as on Windows.
         if let (Event::Move(..), Some(last @ Event::Move(..))) = (event, self.events.last_mut()) {
@@ -160,406 +269,239 @@ impl State {
         }
     }
 
+    /// The compositor is gone or refused something: there is no window to
+    /// keep, so the caller is asked to close.
+    fn lose(&mut self) {
+        if !self.lost {
+            self.lost = true;
+            self.push(Event::CloseRequested);
+        }
+    }
+
     /// The events a key going down produces, also used for each repeat.
     fn key_down(&mut self, key: u32) {
-        let Some(vk) = keys::vk(key) else { return };
-        let alt = self.mods & keys::MOD_ALT != 0;
+        let Some(vk) = self.keys.vk(key) else { return };
         // Windows reports a key with Alt held, and F10, as a system key.
-        if alt || vk == keys::VK_F10 {
+        if self.keys.mods & keys::MOD_ALT != 0 || vk == keys::VK_F10 {
             self.push(Event::SysKey { vk, down: true });
         } else {
             self.push(Event::Key { vk, down: true });
         }
-        if let Some(c) = keys::typed(key, self.mods, self.locked) {
+        for c in self.keys.typed(key).chars() {
             self.push(Event::Char(c));
         }
     }
-}
 
-/// A 24.8 fixed-point number to whole pixels.
-fn fixed(v: i32) -> i32 {
-    v >> 8
-}
-
-// ---------------------------------------------------------------- listeners
-//
-// Each function's parameters are the event's arguments as the protocol XML
-// gives them, after the listener's data pointer and the object itself. The
-// library calls them from inside `wl_display_dispatch_pending`, on the
-// window's thread. `data` is always the window's `*mut State`.
-
-unsafe extern "C" fn registry_global(
-    data: *mut c_void,
-    _registry: *mut Proxy,
-    name: u32,
-    interface: *const c_char,
-    version: u32,
-) {
-    // SAFETY: `data` is the live State; `interface` is a C string.
-    let (state, interface) = unsafe { (&mut *data.cast::<State>(), CStr::from_ptr(interface)) };
-    let global = Global { name, version };
-    match interface.to_bytes() {
-        b"wl_compositor" => state.compositor = global,
-        b"wl_shm" => state.shm = global,
-        b"wl_seat" if state.seat.version == 0 => state.seat = global,
-        b"xdg_wm_base" => state.wm_base = global,
-        _ => {}
-    }
-}
-
-unsafe extern "C" fn registry_global_remove(_: *mut c_void, _: *mut Proxy, _name: u32) {}
-
-unsafe extern "C" fn wm_base_ping(data: *mut c_void, wm_base: *mut Proxy, serial: u32) {
-    // SAFETY: the live State; `pong` takes the serial.
-    unsafe {
-        let state = &mut *data.cast::<State>();
-        state
-            .lib
-            .request(wm_base, XDG_WM_BASE_PONG, &mut [Arg::uint(serial)]);
-    }
-}
-
-unsafe extern "C" fn toplevel_configure(
-    data: *mut c_void,
-    _toplevel: *mut Proxy,
-    width: i32,
-    height: i32,
-    _states: *mut Array,
-) {
-    // SAFETY: the live State.
-    unsafe { (*data.cast::<State>()).pending = (width, height) };
-}
-
-unsafe extern "C" fn toplevel_close(data: *mut c_void, _toplevel: *mut Proxy) {
-    // SAFETY: the live State.
-    unsafe { (*data.cast::<State>()).push(Event::CloseRequested) };
-}
-
-unsafe extern "C" fn surface_configure(data: *mut c_void, xdg_surface: *mut Proxy, serial: u32) {
-    // SAFETY: the live State; `ack_configure` takes the serial.
-    unsafe {
-        let state = &mut *data.cast::<State>();
-        state.lib.request(
-            xdg_surface,
-            XDG_SURFACE_ACK_CONFIGURE,
-            &mut [Arg::uint(serial)],
-        );
-        let (w, h) = state.pending;
-        if w > 0 && h > 0 && (w as u32, h as u32) != state.size {
-            state.size = (w as u32, h as u32);
-            state.push(Event::Resized(w as u32, h as u32));
+    fn key_up(&mut self, key: u32) {
+        if self.keys.held.is_some_and(|h| h.key == key) {
+            self.keys.held = None;
         }
-        state.configured = true;
-        // The compositor wants a frame for this state.
-        state.push(Event::Paint);
-    }
-}
-
-unsafe extern "C" fn seat_capabilities(data: *mut c_void, seat: *mut Proxy, caps: u32) {
-    // SAFETY: the live State; each request creates one object of the
-    // interface named, and each listener table matches that interface.
-    unsafe {
-        let state = &mut *data.cast::<State>();
-        let lib = state.lib;
-        if caps & 1 != 0 && state.pointer.is_null() {
-            state.pointer = lib.create(seat, SEAT_GET_POINTER, lib.pointer, &mut [Arg::new_id()]);
-            if !state.pointer.is_null() {
-                (lib.proxy_add_listener)(state.pointer, POINTER_LISTENER.0.as_ptr(), data);
-            }
-        }
-        if caps & 2 != 0 && state.keyboard.is_null() {
-            state.keyboard =
-                lib.create(seat, SEAT_GET_KEYBOARD, lib.keyboard, &mut [Arg::new_id()]);
-            if !state.keyboard.is_null() {
-                (lib.proxy_add_listener)(state.keyboard, KEYBOARD_LISTENER.0.as_ptr(), data);
-            }
-        }
-    }
-}
-
-unsafe extern "C" fn seat_name(_: *mut c_void, _: *mut Proxy, _name: *const c_char) {}
-
-unsafe extern "C" fn pointer_enter(
-    data: *mut c_void,
-    _pointer: *mut Proxy,
-    _serial: u32,
-    _surface: *mut Proxy,
-    x: i32,
-    y: i32,
-) {
-    // SAFETY: the live State.
-    let state = unsafe { &mut *data.cast::<State>() };
-    state.pointer_at = Some((fixed(x), fixed(y)));
-    state.push(Event::Move(fixed(x), fixed(y)));
-}
-
-unsafe extern "C" fn pointer_leave(
-    data: *mut c_void,
-    _pointer: *mut Proxy,
-    _serial: u32,
-    _surface: *mut Proxy,
-) {
-    // SAFETY: the live State.
-    let state = unsafe { &mut *data.cast::<State>() };
-    state.pointer_at = None;
-    state.push(Event::Leave);
-}
-
-unsafe extern "C" fn pointer_motion(
-    data: *mut c_void,
-    _pointer: *mut Proxy,
-    _time: u32,
-    x: i32,
-    y: i32,
-) {
-    // SAFETY: the live State.
-    let state = unsafe { &mut *data.cast::<State>() };
-    let (x, y) = (fixed(x), fixed(y));
-    state.pointer_at = Some((x, y));
-    if state.button_down {
-        state.push(Event::Drag(x, y));
-    } else {
-        state.push(Event::Move(x, y));
-    }
-}
-
-unsafe extern "C" fn pointer_button(
-    data: *mut c_void,
-    _pointer: *mut Proxy,
-    _serial: u32,
-    _time: u32,
-    button: u32,
-    pressed: u32,
-) {
-    // SAFETY: the live State.
-    let state = unsafe { &mut *data.cast::<State>() };
-    if button != BTN_LEFT {
-        return;
-    }
-    let (x, y) = state.pointer_at.unwrap_or((0, 0));
-    if pressed == 0 {
-        state.button_down = false;
-        state.push(Event::Release(x, y));
-        return;
-    }
-    state.button_down = true;
-    let now = Instant::now();
-    let double = state.last_click.is_some_and(|(at, lx, ly)| {
-        now.duration_since(at) <= DOUBLE_CLICK
-            && (x - lx).abs() <= DOUBLE_CLICK_PX
-            && (y - ly).abs() <= DOUBLE_CLICK_PX
-    });
-    if double {
-        // It comes instead of the second click, and a third starts over.
-        state.last_click = None;
-        state.push(Event::DoubleClick(x, y));
-    } else {
-        state.last_click = Some((now, x, y));
-        state.push(Event::Click(x, y));
-    }
-}
-
-unsafe extern "C" fn pointer_axis(
-    data: *mut c_void,
-    _pointer: *mut Proxy,
-    _time: u32,
-    axis: u32,
-    value: i32,
-) {
-    // Vertical only. A wheel notch is 10 units here, positive toward the
-    // user; Windows' is 120, positive away.
-    if axis == 0 {
-        let delta = -(value as i64 * 12 / 256) as i32;
-        if delta != 0 {
-            // SAFETY: the live State.
-            unsafe { (*data.cast::<State>()).push(Event::Wheel(delta)) };
-        }
-    }
-}
-
-unsafe extern "C" fn pointer_frame(_: *mut c_void, _: *mut Proxy) {}
-unsafe extern "C" fn pointer_axis_source(_: *mut c_void, _: *mut Proxy, _source: u32) {}
-unsafe extern "C" fn pointer_axis_stop(_: *mut c_void, _: *mut Proxy, _time: u32, _axis: u32) {}
-unsafe extern "C" fn pointer_axis_discrete(_: *mut c_void, _: *mut Proxy, _axis: u32, _n: i32) {}
-
-unsafe extern "C" fn keyboard_keymap(
-    _: *mut c_void,
-    _keyboard: *mut Proxy,
-    _format: u32,
-    fd: c_int,
-    _size: u32,
-) {
-    // The keymap is not read yet (`keys.rs`); the descriptor is ours to close.
-    // SAFETY: a descriptor the compositor handed us.
-    unsafe { close(fd) };
-}
-
-unsafe extern "C" fn keyboard_enter(
-    _: *mut c_void,
-    _keyboard: *mut Proxy,
-    _serial: u32,
-    _surface: *mut Proxy,
-    _keys: *mut Array,
-) {
-}
-
-unsafe extern "C" fn keyboard_leave(
-    data: *mut c_void,
-    _keyboard: *mut Proxy,
-    _serial: u32,
-    _surface: *mut Proxy,
-) {
-    // A key held while focus leaves is released elsewhere: stop repeating.
-    // SAFETY: the live State.
-    let state = unsafe { &mut *data.cast::<State>() };
-    state.held = None;
-    state.mods = 0;
-    MODS.store(0, Ordering::Relaxed);
-}
-
-unsafe extern "C" fn keyboard_key(
-    data: *mut c_void,
-    _keyboard: *mut Proxy,
-    _serial: u32,
-    _time: u32,
-    key: u32,
-    pressed: u32,
-) {
-    // SAFETY: the live State.
-    let state = unsafe { &mut *data.cast::<State>() };
-    if pressed == 1 {
-        state.key_down(key);
-        let (rate, delay) = state.repeat;
-        state.held = (rate > 0 && !keys::is_modifier(key)).then(|| Held {
-            key,
-            next: Instant::now() + delay,
-        });
-    } else {
-        if state.held.is_some_and(|h| h.key == key) {
-            state.held = None;
-        }
-        if let Some(vk) = keys::vk(key) {
+        if let Some(vk) = self.keys.vk(key) {
             // A system key if Alt is still held, or is the key coming up.
-            let alt = state.mods & keys::MOD_ALT != 0 || vk == keys::VK_MENU;
+            let alt = self.keys.mods & keys::MOD_ALT != 0 || vk == keys::VK_MENU;
             if alt || vk == keys::VK_F10 {
-                state.push(Event::SysKey { vk, down: false });
+                self.push(Event::SysKey { vk, down: false });
             } else {
-                state.push(Event::Key { vk, down: false });
+                self.push(Event::Key { vk, down: false });
             }
         }
     }
-}
 
-unsafe extern "C" fn keyboard_modifiers(
-    data: *mut c_void,
-    _keyboard: *mut Proxy,
-    _serial: u32,
-    depressed: u32,
-    latched: u32,
-    locked: u32,
-    _group: u32,
-) {
-    // SAFETY: the live State.
-    let state = unsafe { &mut *data.cast::<State>() };
-    state.mods = depressed | latched;
-    state.locked = locked;
-    MODS.store(state.mods, Ordering::Relaxed);
-}
+    /// Turn one protocol event into window events and replies.
+    fn handle(&mut self, event: wayland::Event) -> Result<(), wayland::Error> {
+        let is = |id: Option<u32>| id == Some(event.object);
+        if event.is_for(&self.wm_base) {
+            let xdg_wm_base::Event::Ping { serial } = xdg_wm_base::Event::decode(event)?;
+            self.wm_base.pong(&mut self.conn, serial)?;
+        } else if event.is_for(&self.toplevel) {
+            match xdg_toplevel::Event::decode(event)? {
+                xdg_toplevel::Event::Configure { width, height, .. } => {
+                    self.pending = (width, height);
+                }
+                xdg_toplevel::Event::Close => self.push(Event::CloseRequested),
+                _ => {}
+            }
+        } else if event.is_for(&self.xdg) {
+            let xdg_surface::Event::Configure { serial } = xdg_surface::Event::decode(event)?;
+            self.xdg.ack_configure(&mut self.conn, serial)?;
+            let (w, h) = self.pending;
+            if w > 0 && h > 0 && (w as u32, h as u32) != self.size {
+                self.size = (w as u32, h as u32);
+                self.push(Event::Resized(w as u32, h as u32));
+            }
+            self.configured = true;
+            // The compositor wants a frame for this state.
+            self.push(Event::Paint);
+        } else if is(self.seat.map(|s| s.id())) {
+            if let wl_seat::Event::Capabilities { capabilities } = wl_seat::Event::decode(event)? {
+                let seat = self.seat.expect("matched above");
+                if capabilities & wl_seat::capability::POINTER != 0 && self.pointer.is_none() {
+                    self.pointer = Some(seat.get_pointer(&mut self.conn)?);
+                }
+                if capabilities & wl_seat::capability::KEYBOARD != 0 && self.keyboard.is_none() {
+                    self.keyboard = Some(seat.get_keyboard(&mut self.conn)?);
+                }
+            }
+        } else if is(self.pointer.map(|p| p.id())) {
+            self.pointer_event(wl_pointer::Event::decode(event)?);
+        } else if is(self.keyboard.map(|k| k.id())) {
+            self.keyboard_event(wl_keyboard::Event::decode(event)?);
+        } else if event.interface.name == wl_buffer::INTERFACE.name {
+            self.released.push(event.object);
+        }
+        Ok(())
+    }
 
-unsafe extern "C" fn keyboard_repeat_info(
-    data: *mut c_void,
-    _keyboard: *mut Proxy,
-    rate: i32,
-    delay: i32,
-) {
-    // SAFETY: the live State.
-    let state = unsafe { &mut *data.cast::<State>() };
-    state.repeat = (
-        rate.max(0) as u32,
-        Duration::from_millis(delay.max(0) as u64),
-    );
-}
+    fn pointer_event(&mut self, event: wl_pointer::Event) {
+        use wl_pointer::Event as P;
+        let px = |v: wayland::wire::Fixed| v.to_f64().floor() as i32;
+        match event {
+            P::Enter {
+                surface_x,
+                surface_y,
+                ..
+            } => {
+                self.pointer_at = Some((px(surface_x), px(surface_y)));
+                self.push(Event::Move(px(surface_x), px(surface_y)));
+            }
+            P::Leave { .. } => {
+                self.pointer_at = None;
+                self.push(Event::Leave);
+            }
+            P::Motion {
+                surface_x,
+                surface_y,
+                ..
+            } => {
+                let (x, y) = (px(surface_x), px(surface_y));
+                self.pointer_at = Some((x, y));
+                if self.button_down {
+                    self.push(Event::Drag(x, y));
+                } else {
+                    self.push(Event::Move(x, y));
+                }
+            }
+            P::Button { button, state, .. } if button == BTN_LEFT => {
+                let (x, y) = self.pointer_at.unwrap_or((0, 0));
+                if state != wl_pointer::button_state::PRESSED {
+                    self.button_down = false;
+                    self.push(Event::Release(x, y));
+                    return;
+                }
+                self.button_down = true;
+                let now = Instant::now();
+                let double = self.last_click.is_some_and(|(at, lx, ly)| {
+                    now.duration_since(at) <= DOUBLE_CLICK
+                        && (x - lx).abs() <= DOUBLE_CLICK_PX
+                        && (y - ly).abs() <= DOUBLE_CLICK_PX
+                });
+                if double {
+                    // It comes instead of the second click, and a third
+                    // starts over.
+                    self.last_click = None;
+                    self.push(Event::DoubleClick(x, y));
+                } else {
+                    self.last_click = Some((now, x, y));
+                    self.push(Event::Click(x, y));
+                }
+            }
+            P::Axis { axis, value, .. } if axis == wl_pointer::axis::VERTICAL_SCROLL => {
+                // A wheel notch is 10 units here, positive toward the user;
+                // Windows' is 120, positive away.
+                let delta = (-value.to_f64() * 12.0).round() as i32;
+                if delta != 0 {
+                    self.push(Event::Wheel(delta));
+                }
+            }
+            _ => {}
+        }
+    }
 
-unsafe extern "C" fn buffer_release(data: *mut c_void, _buffer: *mut Proxy) {
-    // SAFETY: `data` is the buffer's own flag, alive as long as the buffer.
-    unsafe { (*data.cast::<AtomicBool>()).store(false, Ordering::Relaxed) };
-}
+    fn keyboard_event(&mut self, event: wl_keyboard::Event) {
+        use wl_keyboard::Event as K;
+        match event {
+            K::Keymap { format, fd, size } => {
+                if format == wl_keyboard::keymap_format::XKB_V1 {
+                    self.keys.load(fd, size);
+                }
+            }
+            K::Leave { .. } => {
+                // A key held while focus leaves is released elsewhere.
+                self.keys.held = None;
+                self.keys.mods = 0;
+                MODS.store(0, Ordering::Relaxed);
+            }
+            K::Key { key, state, .. } => {
+                if state == wl_keyboard::key_state::PRESSED {
+                    self.key_down(key);
+                    let (rate, delay) = self.keys.repeat;
+                    self.keys.held = (rate > 0 && self.keys.repeats(key)).then(|| Held {
+                        key,
+                        next: Instant::now() + delay,
+                    });
+                } else if state == wl_keyboard::key_state::RELEASED {
+                    self.key_up(key);
+                }
+            }
+            K::Modifiers {
+                mods_depressed,
+                mods_latched,
+                mods_locked,
+                group,
+                ..
+            } => self
+                .keys
+                .modifiers(mods_depressed, mods_latched, mods_locked, group),
+            K::RepeatInfo { rate, delay } => {
+                self.keys.repeat = (
+                    rate.max(0) as u32,
+                    Duration::from_millis(delay.max(0) as u64),
+                );
+            }
+            K::Enter { .. } => {}
+        }
+    }
 
-/// A listener: one function for each event of an interface, in order.
-struct Listener<const N: usize>([*const c_void; N]);
-// SAFETY: function addresses, never written.
-unsafe impl<const N: usize> Sync for Listener<N> {}
+    /// Handle every event already read.
+    fn drain(&mut self) -> Result<(), wayland::Error> {
+        while let Some(event) = self.conn.next_event()? {
+            self.handle(event)?;
+        }
+        Ok(())
+    }
 
-static REGISTRY_LISTENER: Listener<2> = Listener([
-    registry_global as *const c_void,
-    registry_global_remove as *const c_void,
-]);
-static WM_BASE_LISTENER: Listener<1> = Listener([wm_base_ping as *const c_void]);
-static XDG_SURFACE_LISTENER: Listener<1> = Listener([surface_configure as *const c_void]);
-static TOPLEVEL_LISTENER: Listener<2> = Listener([
-    toplevel_configure as *const c_void,
-    toplevel_close as *const c_void,
-]);
-static SEAT_LISTENER: Listener<2> = Listener([
-    seat_capabilities as *const c_void,
-    seat_name as *const c_void,
-]);
-/// The pointer's events through version 5, the version the seat is bound at.
-static POINTER_LISTENER: Listener<9> = Listener([
-    pointer_enter as *const c_void,
-    pointer_leave as *const c_void,
-    pointer_motion as *const c_void,
-    pointer_button as *const c_void,
-    pointer_axis as *const c_void,
-    pointer_frame as *const c_void,
-    pointer_axis_source as *const c_void,
-    pointer_axis_stop as *const c_void,
-    pointer_axis_discrete as *const c_void,
-]);
-/// The keyboard's events through version 5.
-static KEYBOARD_LISTENER: Listener<6> = Listener([
-    keyboard_keymap as *const c_void,
-    keyboard_enter as *const c_void,
-    keyboard_leave as *const c_void,
-    keyboard_key as *const c_void,
-    keyboard_modifiers as *const c_void,
-    keyboard_repeat_info as *const c_void,
-]);
-static BUFFER_LISTENER: Listener<1> = Listener([buffer_release as *const c_void]);
-
-/// The seat is bound no higher than this: the listeners above cover it.
-const SEAT_VERSION: u32 = 5;
-/// For `wl_surface.damage_buffer`.
-const COMPOSITOR_VERSION: u32 = 4;
-
-fn other(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, message.into())
+    /// A held key repeats on our clock.
+    fn repeat(&mut self) {
+        let now = Instant::now();
+        while let Some(held) = self.keys.held.filter(|h| h.next <= now) {
+            self.key_down(held.key);
+            let step = Duration::from_millis(1000 / self.keys.repeat.0.max(1) as u64);
+            self.keys.held = Some(Held {
+                key: held.key,
+                next: (held.next + step).max(now),
+            });
+        }
+    }
 }
 
 /// A top-level Wayland window (`xdg_toplevel`).
 ///
-/// The window is drawn by whoever holds it: [`CpuPresenter`], or a Vulkan
-/// swapchain on [`Window::display`] and [`Window::surface`]. It appears on
-/// screen with its first frame, as Wayland windows do.
+/// The window is drawn by [`CpuPresenter`]. It appears on screen with its
+/// first frame, as Wayland windows do.
 ///
-/// **Not built yet:** a title bar where the desktop draws none (GNOME; the
-/// window is then a bare rectangle), sizes on a scaled display (the surface
-/// is one pixel a point, so a desktop scaled to 200 % enlarges it), the
-/// clipboard, dropped files, pointer shapes, and any keyboard layout but US
-/// (`keys.rs`).
+/// **Not built yet:** a Vulkan frame in the window (Vulkan's own Wayland
+/// surface needs the C `libwayland-client`, which foldwave does not load),
+/// a title bar where the desktop draws none (GNOME; the window is then a
+/// bare rectangle), sizes on a scaled display (the surface is one pixel a
+/// point, so a desktop scaled to 200 % enlarges it), the clipboard, dropped
+/// files and pointer shapes.
 ///
 /// A window is used from the thread that created it; dropping it closes it.
 pub struct Window {
-    lib: &'static Lib,
-    display: *mut Proxy,
-    registry: *mut Proxy,
-    compositor: *mut Proxy,
-    shm: *mut Proxy,
-    wm_base: *mut Proxy,
-    surface: *mut Proxy,
-    toplevel: *mut Proxy,
-    state: *mut State,
-    wake: Arc<WakeFd>,
+    inner: RefCell<Inner>,
+    /// What [`Waker`]s write to, and the end [`Window::wait`] sleeps on.
+    wake_tx: Arc<UnixStream>,
+    wake_rx: UnixStream,
     /// Dropped with the window: a presenter holds a weak one, to know
     /// whether its buffers' window is still there.
     alive: Arc<()>,
@@ -575,203 +517,113 @@ impl std::fmt::Debug for Window {
 
 impl Window {
     /// Open a window `width x height` pixels, titled `title`, on the
-    /// compositor `WAYLAND_DISPLAY` names. Fails when the library or a
-    /// compositor is missing, or the compositor lacks `xdg_wm_base`.
+    /// compositor `WAYLAND_DISPLAY` names. Fails when there is no
+    /// compositor, or it lacks `xdg_wm_base`.
     pub fn new(title: &str, width: u32, height: u32) -> io::Result<Window> {
-        let lib = lib().map_err(other)?;
-        // SAFETY: a null name means "the display the environment names".
-        let display = unsafe { (lib.display_connect)(std::ptr::null()) };
-        if display.is_null() {
-            return Err(other(
-                "no Wayland compositor to connect to (is WAYLAND_DISPLAY set?)",
-            ));
+        let (wake_tx, wake_rx) = UnixStream::pair()?;
+        wake_tx.set_nonblocking(true)?;
+        wake_rx.set_nonblocking(true)?;
+        let inner = Window::open(title, width.max(1), height.max(1)).map_err(other)?;
+        Ok(Window {
+            inner: RefCell::new(inner),
+            wake_tx: Arc::new(wake_tx),
+            wake_rx,
+            alive: Arc::new(()),
+        })
+    }
+
+    fn open(title: &str, width: u32, height: u32) -> Result<Inner, wayland::Error> {
+        let mut conn = Connection::connect()?;
+        let registry = conn.display().get_registry(&mut conn)?;
+        conn.roundtrip()?;
+        let mut globals = Vec::new();
+        while let Some(event) = conn.next_event()? {
+            if event.is_for(&registry) {
+                if let wl_registry::Event::Global {
+                    name,
+                    interface,
+                    version,
+                } = wl_registry::Event::decode(event)?
+                {
+                    globals.push((name, interface, version));
+                }
+            }
         }
-        // SAFETY: plain eventfd creation; -1 is checked.
-        let wake = unsafe { eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK) };
-        if wake < 0 {
-            let e = io::Error::last_os_error();
-            // SAFETY: the display just connected, with nothing on it.
-            unsafe { (lib.display_disconnect)(display) };
-            return Err(e);
-        }
-        let state = Box::into_raw(Box::new(State {
-            lib,
+        let find = |wanted: &str| {
+            globals
+                .iter()
+                .find(|(_, interface, _)| interface == wanted)
+                .map(|(name, _, version)| (*name, *version))
+        };
+        let need = |wanted: &'static str| {
+            find(wanted).ok_or_else(|| wayland::Error::NoCompositor(format!("it has no {wanted}")))
+        };
+        let (name, version) = need("wl_compositor")?;
+        let compositor: WlCompositor =
+            registry.bind(&mut conn, name, version.min(COMPOSITOR_VERSION))?;
+        let (name, _) = need("wl_shm")?;
+        let shm: WlShm = registry.bind(&mut conn, name, 1)?;
+        let (name, _) = need("xdg_wm_base")?;
+        let wm_base: XdgWmBase = registry.bind(&mut conn, name, 1)?;
+        let seat: Option<WlSeat> = match find("wl_seat") {
+            Some((name, version)) => {
+                Some(registry.bind(&mut conn, name, version.min(SEAT_VERSION))?)
+            }
+            None => None,
+        };
+
+        let surface = compositor.create_surface(&mut conn)?;
+        let xdg = wm_base.get_xdg_surface(&mut conn, surface)?;
+        let toplevel = xdg.get_toplevel(&mut conn)?;
+        // A NUL inside the text would be refused: drop any.
+        let title: String = title.chars().filter(|c| *c != '\0').collect();
+        toplevel.set_title(&mut conn, &title)?;
+        // The name a desktop groups the window under and finds its icon by.
+        toplevel.set_app_id(&mut conn, "foldwave")?;
+        // A commit with no buffer asks for the first configure, which must
+        // be acknowledged before anything is drawn.
+        surface.commit(&mut conn)?;
+
+        let mut inner = Inner {
+            conn,
+            shm,
+            wm_base,
+            surface,
+            xdg,
+            toplevel,
+            seat,
+            pointer: None,
+            keyboard: None,
+            keys: Keyboard::new(),
             events: Vec::new(),
-            compositor: Global::default(),
-            shm: Global::default(),
-            seat: Global::default(),
-            wm_base: Global::default(),
-            seat_proxy: std::ptr::null_mut(),
-            pointer: std::ptr::null_mut(),
-            keyboard: std::ptr::null_mut(),
-            xdg_surface: std::ptr::null_mut(),
             pending: (0, 0),
-            size: (width.max(1), height.max(1)),
+            size: (width, height),
             configured: false,
             pointer_at: None,
             button_down: false,
             last_click: None,
-            mods: 0,
-            locked: 0,
-            held: None,
-            repeat: (25, Duration::from_millis(600)),
-        }));
-        // Built up field by field, so `Drop` releases whatever exists if a
-        // later step fails.
-        let mut window = Window {
-            lib,
-            display,
-            registry: std::ptr::null_mut(),
-            compositor: std::ptr::null_mut(),
-            shm: std::ptr::null_mut(),
-            wm_base: std::ptr::null_mut(),
-            surface: std::ptr::null_mut(),
-            toplevel: std::ptr::null_mut(),
-            state,
-            wake: Arc::new(WakeFd(Fd(wake))),
-            alive: Arc::new(()),
+            released: Vec::new(),
+            lost: false,
         };
-        window.open(title)?;
-        Ok(window)
-    }
-
-    fn open(&mut self, title: &str) -> io::Result<()> {
-        let lib = self.lib;
-        let data = self.state.cast::<c_void>();
-        // SAFETY: every proxy passed is live, each request's arguments
-        // follow its signature in the protocol XML, each listener table
-        // matches its interface, and `data` outlives every proxy (`Drop`).
-        unsafe {
-            self.registry = lib.create(
-                self.display,
-                DISPLAY_GET_REGISTRY,
-                lib.registry,
-                &mut [Arg::new_id()],
-            );
-            if self.registry.is_null() {
-                return Err(other("the Wayland connection failed at the registry"));
-            }
-            (lib.proxy_add_listener)(self.registry, REGISTRY_LISTENER.0.as_ptr(), data);
-            self.roundtrip()?;
-
-            let globals = &*self.state;
-            let (compositor, shm, seat, wm_base) = (
-                globals.compositor,
-                globals.shm,
-                globals.seat,
-                globals.wm_base,
-            );
-            for (global, name) in [
-                (compositor, "wl_compositor"),
-                (shm, "wl_shm"),
-                (wm_base, "xdg_wm_base"),
-            ] {
-                if global.version == 0 {
-                    return Err(other(format!("the compositor has no {name}")));
-                }
-            }
-            self.compositor = lib.bind(
-                self.registry,
-                compositor.name,
-                lib.compositor,
-                compositor.version.min(COMPOSITOR_VERSION),
-            );
-            self.shm = lib.bind(self.registry, shm.name, lib.shm, 1);
-            self.wm_base = lib.bind(self.registry, wm_base.name, &XDG_WM_BASE, 1);
-            (lib.proxy_add_listener)(self.wm_base, WM_BASE_LISTENER.0.as_ptr(), data);
-            if seat.version > 0 {
-                let proxy = lib.bind(
-                    self.registry,
-                    seat.name,
-                    lib.seat,
-                    seat.version.min(SEAT_VERSION),
-                );
-                (lib.proxy_add_listener)(proxy, SEAT_LISTENER.0.as_ptr(), data);
-                (*self.state).seat_proxy = proxy;
-            }
-
-            self.surface = lib.create(
-                self.compositor,
-                COMPOSITOR_CREATE_SURFACE,
-                lib.surface,
-                &mut [Arg::new_id()],
-            );
-            let xdg_surface = lib.create(
-                self.wm_base,
-                XDG_WM_BASE_GET_XDG_SURFACE,
-                &XDG_SURFACE,
-                &mut [Arg::new_id(), Arg::ptr(self.surface)],
-            );
-            if self.surface.is_null() || xdg_surface.is_null() {
-                return Err(other("the Wayland connection failed creating the surface"));
-            }
-            (*self.state).xdg_surface = xdg_surface;
-            (lib.proxy_add_listener)(xdg_surface, XDG_SURFACE_LISTENER.0.as_ptr(), data);
-            self.toplevel = lib.create(
-                xdg_surface,
-                XDG_SURFACE_GET_TOPLEVEL,
-                &XDG_TOPLEVEL,
-                &mut [Arg::new_id()],
-            );
-            if self.toplevel.is_null() {
-                return Err(other("the Wayland connection failed creating the window"));
-            }
-            (lib.proxy_add_listener)(self.toplevel, TOPLEVEL_LISTENER.0.as_ptr(), data);
+        while !inner.configured {
+            inner.conn.roundtrip()?;
+            inner.drain()?;
         }
-        self.set_title(title);
-        self.set_app_id("foldwave");
-        // A commit with no buffer asks for the first configure, which must
-        // be acknowledged before anything is drawn.
-        self.commit();
-        while !self.state().configured {
-            self.roundtrip()?;
-        }
-        Ok(())
-    }
-
-    fn state(&self) -> &State {
-        // SAFETY: allocated in `new`, freed in `drop`; no listener runs
-        // while this borrow is used (they run only inside dispatch calls).
-        unsafe { &*self.state }
-    }
-
-    fn roundtrip(&self) -> io::Result<()> {
-        // SAFETY: a live display.
-        if unsafe { (self.lib.display_roundtrip)(self.display) } < 0 {
-            return Err(other("the Wayland connection was lost"));
-        }
-        Ok(())
-    }
-
-    fn commit(&self) {
-        // SAFETY: a live surface; `commit` takes no arguments.
-        unsafe { self.lib.request(self.surface, SURFACE_COMMIT, &mut []) };
-    }
-
-    fn set_string(&self, opcode: u32, text: &str) {
-        // A NUL inside the text would end it early: drop any.
-        let text: String = text.chars().filter(|c| *c != '\0').collect();
-        let Ok(text) = CString::new(text) else { return };
-        // SAFETY: a live toplevel; both requests take one string.
-        unsafe {
-            self.lib
-                .request(self.toplevel, opcode, &mut [Arg::ptr(text.as_ptr())])
-        };
+        Ok(inner)
     }
 
     /// Set the window's title.
     pub fn set_title(&self, title: &str) {
-        self.set_string(XDG_TOPLEVEL_SET_TITLE, title);
-    }
-
-    /// The name a desktop groups the window under and finds its icon by.
-    fn set_app_id(&self, id: &str) {
-        self.set_string(XDG_TOPLEVEL_SET_APP_ID, id);
+        let title: String = title.chars().filter(|c| *c != '\0').collect();
+        let inner = &mut *self.inner.borrow_mut();
+        if inner.toplevel.set_title(&mut inner.conn, &title).is_err() {
+            inner.lose();
+        }
     }
 
     /// The window's size in pixels.
     pub fn client_size(&self) -> (u32, u32) {
-        self.state().size
+        self.inner.borrow().size
     }
 
     /// Make the window `width x height`. A Wayland window is as large as
@@ -785,46 +637,25 @@ impl Window {
                 "a window cannot be empty",
             ));
         }
-        // SAFETY: the State is live and no listener is running; the request
-        // takes four integers.
-        unsafe {
-            let state = &mut *self.state;
-            if state.size != (width, height) {
-                state.size = (width, height);
-                state.push(Event::Resized(width, height));
-            }
-            self.lib.request(
-                state.xdg_surface,
-                XDG_SURFACE_SET_WINDOW_GEOMETRY,
-                &mut [
-                    Arg::int(0),
-                    Arg::int(0),
-                    Arg::int(width as i32),
-                    Arg::int(height as i32),
-                ],
-            );
+        let inner = &mut *self.inner.borrow_mut();
+        if inner.size != (width, height) {
+            inner.size = (width, height);
+            inner.push(Event::Resized(width, height));
         }
-        Ok(())
+        inner
+            .xdg
+            .set_window_geometry(&mut inner.conn, 0, 0, width as i32, height as i32)
+            .map_err(other)
     }
 
     /// The pointer's place in the window, while it is over it.
     pub fn pointer(&self) -> Option<(i32, i32)> {
-        self.state().pointer_at
+        self.inner.borrow().pointer_at
     }
 
     /// Dots per inch. Always 96: scaled displays are not handled yet.
     pub fn dpi(&self) -> u32 {
         96
-    }
-
-    /// The `wl_display`, for a Vulkan surface.
-    pub fn display(&self) -> *mut c_void {
-        self.display
-    }
-
-    /// The `wl_surface`, for a Vulkan surface.
-    pub fn surface(&self) -> *mut c_void {
-        self.surface
     }
 
     /// Does nothing yet: pointer shapes need the cursor-shape protocol or a
@@ -891,7 +722,7 @@ impl Window {
     /// A handle that wakes [`Window::wait`] from any thread.
     pub fn waker(&self) -> Waker {
         Waker {
-            target: Arc::downgrade(&self.wake),
+            target: Arc::downgrade(&self.wake_tx),
         }
     }
 
@@ -899,7 +730,7 @@ impl Window {
     /// `events`. Never blocks.
     pub fn poll(&mut self, events: &mut Vec<Event>) {
         self.pump(Some(Duration::ZERO));
-        self.take(events);
+        events.append(&mut self.inner.get_mut().events);
     }
 
     /// As [`Window::poll`], but sleep until something happens or `timeout`
@@ -912,7 +743,9 @@ impl Window {
             let left = deadline.map(|d| d.saturating_duration_since(now));
             // Wake for the next repeat of a held key, if that comes first.
             let repeat = self
-                .state()
+                .inner
+                .get_mut()
+                .keys
                 .held
                 .map(|h| h.next.saturating_duration_since(now));
             let sleep = match (left, repeat) {
@@ -920,134 +753,109 @@ impl Window {
                 (a, b) => a.or(b),
             };
             self.pump(sleep);
-            if !self.state().events.is_empty() || left.is_some_and(|l| l.is_zero()) {
+            let inner = self.inner.get_mut();
+            if !inner.events.is_empty() || left.is_some_and(|l| l.is_zero()) {
                 break;
             }
         }
-        self.take(events);
-    }
-
-    fn take(&mut self, events: &mut Vec<Event>) {
-        // SAFETY: the State is live and no listener is running.
-        events.append(unsafe { &mut (*self.state).events });
+        events.append(&mut self.inner.get_mut().events);
     }
 
     /// One turn of the loop: flush, sleep at most `sleep` for the
-    /// compositor or a waker, read and dispatch, and repeat a held key.
+    /// compositor or a waker, read and handle, and repeat a held key.
     fn pump(&mut self, sleep: Option<Duration>) {
-        let lib = self.lib;
-        // SAFETY: the display is live; the read is announced and then either
-        // made or cancelled, as the library requires of every reader; the
-        // poll set and the timeout outlive the call.
-        unsafe {
-            // Events already read must be dispatched before a read begins.
-            while (lib.display_prepare_read)(self.display) != 0 {
-                (lib.display_dispatch_pending)(self.display);
+        let inner = self.inner.get_mut();
+        if inner.lost {
+            // Nothing more will come; do not spin on a dead socket.
+            if let Some(sleep) = sleep.filter(|_| inner.events.is_empty()) {
+                std::thread::sleep(sleep.min(Duration::from_millis(50)));
             }
-            (lib.display_flush)(self.display);
-            // Something already queued (a resize this call made, say) must
-            // not wait.
-            let sleep = if (*self.state).events.is_empty() {
-                sleep
-            } else {
-                Some(Duration::ZERO)
-            };
-            let timeout = sleep.map(|d| Timespec {
-                sec: d.as_secs() as c_long,
-                nsec: d.subsec_nanos() as c_long,
-            });
-            let mut fds = [
-                PollFd {
-                    fd: (lib.display_get_fd)(self.display),
-                    events: POLLIN,
-                    revents: 0,
-                },
-                PollFd {
-                    fd: self.wake.0 .0,
-                    events: POLLIN,
-                    revents: 0,
-                },
-            ];
-            let ready = ppoll(
+            return;
+        }
+        // Events already read (during a roundtrip, say) come first, and
+        // anything queued must not wait.
+        if inner.drain().is_err() || inner.conn.flush().is_err() {
+            inner.lose();
+            return;
+        }
+        let sleep = if inner.events.is_empty() {
+            sleep
+        } else {
+            Some(Duration::ZERO)
+        };
+        let timeout = sleep.map(|d| Timespec {
+            sec: d.as_secs() as c_long,
+            nsec: d.subsec_nanos() as c_long,
+        });
+        let mut fds = [
+            PollFd {
+                fd: inner.conn.as_raw_fd(),
+                events: POLLIN,
+                revents: 0,
+            },
+            PollFd {
+                fd: self.wake_rx.as_raw_fd(),
+                events: POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: two valid entries and a timeout that outlive the call; a
+        // null mask leaves the signal mask alone.
+        let ready = unsafe {
+            ppoll(
                 fds.as_mut_ptr(),
                 2,
                 timeout
                     .as_ref()
                     .map_or(std::ptr::null(), |t| t as *const Timespec),
                 std::ptr::null(),
-            );
-            if ready > 0 && fds[0].revents != 0 {
-                (lib.display_read_events)(self.display);
-            } else {
-                (lib.display_cancel_read)(self.display);
+            )
+        };
+        if ready > 0 && fds[0].revents != 0 {
+            // The end of the stream reads as nothing here and is reported
+            // by the drain below.
+            if inner.conn.read().is_err() || inner.drain().is_err() {
+                inner.lose();
             }
-            (lib.display_dispatch_pending)(self.display);
-            if ready > 0 && fds[1].revents != 0 {
-                let mut count = 0u64;
-                read(fds[1].fd, (&mut count as *mut u64).cast(), 8);
-                (*self.state).push(Event::Woken);
-            }
-            // A held key repeats on our clock.
-            let state = &mut *self.state;
-            let now = Instant::now();
-            while let Some(held) = state.held.filter(|h| h.next <= now) {
-                state.key_down(held.key);
-                let step = Duration::from_millis(1000 / state.repeat.0.max(1) as u64);
-                state.held = Some(Held {
-                    key: held.key,
-                    next: (held.next + step).max(now),
-                });
-            }
+        }
+        if ready > 0 && fds[1].revents != 0 {
+            let mut sink = [0u8; 64];
+            while matches!((&self.wake_rx).read(&mut sink), Ok(n) if n > 0) {}
+            inner.push(Event::Woken);
+        }
+        inner.repeat();
+        // Replies made while handling (a pong, an acknowledgement) go now.
+        if !inner.lost && inner.conn.flush().is_err() {
+            inner.lose();
         }
     }
 }
 
 impl Drop for Window {
     fn drop(&mut self) {
-        let lib = self.lib;
-        // SAFETY: each proxy is destroyed once, children before parents, and
-        // the State is freed only after the display, so no listener can run
-        // on freed memory.
-        unsafe {
-            let state = &mut *self.state;
-            for proxy in [state.keyboard, state.pointer, state.seat_proxy] {
-                if !proxy.is_null() {
-                    (lib.proxy_destroy)(proxy);
-                }
-            }
-            if !self.toplevel.is_null() {
-                lib.destroy(self.toplevel, XDG_TOPLEVEL_DESTROY);
-            }
-            if !state.xdg_surface.is_null() {
-                lib.destroy(state.xdg_surface, XDG_SURFACE_DESTROY);
-            }
-            if !self.surface.is_null() {
-                lib.destroy(self.surface, SURFACE_DESTROY);
-            }
-            if !self.wm_base.is_null() {
-                lib.destroy(self.wm_base, XDG_WM_BASE_DESTROY);
-            }
-            for proxy in [self.shm, self.compositor, self.registry] {
-                if !proxy.is_null() {
-                    (lib.proxy_destroy)(proxy);
-                }
-            }
-            (lib.display_flush)(self.display);
-            (lib.display_disconnect)(self.display);
-            drop(Box::from_raw(self.state));
+        let inner = self.inner.get_mut();
+        if inner.lost {
+            return;
         }
+        // Children before parents; the socket closes with the connection.
+        let conn = &mut inner.conn;
+        let _ = inner.toplevel.destroy(conn);
+        let _ = inner.xdg.destroy(conn);
+        let _ = inner.surface.destroy(conn);
+        let _ = inner.wm_base.destroy(conn);
+        let _ = conn.flush();
     }
 }
 
 /// One shared-memory buffer the compositor reads a frame from.
 struct Buffer {
-    proxy: *mut Proxy,
-    pixels: *mut u32,
-    bytes: usize,
+    proxy: WlBuffer,
+    /// The memory behind it, written with ordinary file writes.
+    file: File,
     width: u32,
     height: u32,
-    /// Set when the buffer is handed over, cleared by its `release` event.
-    busy: *mut AtomicBool,
+    /// From when the buffer is handed over until its `release` event.
+    busy: bool,
 }
 
 /// Shows [`CpuRenderer`] frames in a [`Window`] through shared memory
@@ -1063,8 +871,8 @@ struct Buffer {
 /// that window: its buffers then go with the connection.
 #[derive(Default)]
 pub struct CpuPresenter {
-    /// The library and the window the buffers were made on.
-    owner: Option<(&'static Lib, Weak<()>)>,
+    /// The window the buffers were made on.
+    owner: Weak<()>,
     buffers: Vec<Buffer>,
 }
 
@@ -1076,79 +884,17 @@ impl std::fmt::Debug for CpuPresenter {
     }
 }
 
+/// A framebuffer's pixels as the bytes a shared-memory buffer holds.
+fn bytes(pixels: &[u32]) -> &[u8] {
+    // SAFETY: a `u32` is four initialized bytes with no padding, `u8` has
+    // no alignment to meet, and the length is the same memory in bytes.
+    unsafe { std::slice::from_raw_parts(pixels.as_ptr().cast(), pixels.len() * 4) }
+}
+
 impl CpuPresenter {
     /// A presenter.
     pub fn new() -> CpuPresenter {
         CpuPresenter::default()
-    }
-
-    fn make(window: &Window, width: u32, height: u32) -> io::Result<Buffer> {
-        let lib = window.lib;
-        let bytes = width as usize * height as usize * 4;
-        // SAFETY: a NUL-terminated name; the descriptor is checked, sized
-        // and mapped, and closed by `Fd` once the compositor has its copy;
-        // each request's arguments follow its signature.
-        unsafe {
-            let fd = memfd_create(b"foldwave-frame\0".as_ptr().cast(), MFD_CLOEXEC);
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let fd = Fd(fd);
-            if ftruncate(fd.0, bytes as i64) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let map = mmap(
-                std::ptr::null_mut(),
-                bytes,
-                PROT_READ_WRITE,
-                MAP_SHARED,
-                fd.0,
-                0,
-            );
-            if map as isize == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            let pool = lib.create(
-                window.shm,
-                SHM_CREATE_POOL,
-                lib.shm_pool,
-                &mut [Arg::new_id(), Arg::int(fd.0), Arg::int(bytes as i32)],
-            );
-            let proxy = if pool.is_null() {
-                pool
-            } else {
-                let buffer = lib.create(
-                    pool,
-                    SHM_POOL_CREATE_BUFFER,
-                    lib.buffer,
-                    &mut [
-                        Arg::new_id(),
-                        Arg::int(0),
-                        Arg::int(width as i32),
-                        Arg::int(height as i32),
-                        Arg::int(width as i32 * 4),
-                        Arg::uint(SHM_FORMAT_XRGB8888),
-                    ],
-                );
-                // The buffer keeps the pool's memory alive.
-                lib.destroy(pool, SHM_POOL_DESTROY);
-                buffer
-            };
-            if proxy.is_null() {
-                munmap(map, bytes);
-                return Err(other("the Wayland connection failed creating a buffer"));
-            }
-            let busy = Box::into_raw(Box::new(AtomicBool::new(false)));
-            (lib.proxy_add_listener)(proxy, BUFFER_LISTENER.0.as_ptr(), busy.cast());
-            Ok(Buffer {
-                proxy,
-                pixels: map.cast(),
-                bytes,
-                width,
-                height,
-                busy,
-            })
-        }
     }
 
     /// How many buffers the presenter holds, for tests.
@@ -1157,30 +903,44 @@ impl CpuPresenter {
         self.buffers.len()
     }
 
-    /// Release a buffer: the compositor keeps its own reference to the
-    /// memory for as long as it still shows it. With `lib` `None` the
-    /// window has closed: its connection took the buffer object with it,
-    /// and only our own memory is left to free.
-    ///
-    /// # Safety
-    /// `buffer` came from [`CpuPresenter::make`]; `lib` is `Some` only
-    /// while that window is open.
-    unsafe fn free(lib: Option<&Lib>, buffer: Buffer) {
-        // SAFETY: the caller's contract; each resource is released once. No
-        // listener can run for a closed window, so the flag is ours alone.
-        unsafe {
-            if let Some(lib) = lib {
-                lib.destroy(buffer.proxy, BUFFER_DESTROY);
+    fn make(inner: &mut Inner, width: u32, height: u32) -> io::Result<Buffer> {
+        let size = width as u64 * height as u64 * 4;
+        let stride = i32::try_from(width as u64 * 4).map_err(other)?;
+        let pool_size = i32::try_from(size).map_err(other)?;
+        // SAFETY: a NUL-terminated name; a descriptor on success, which
+        // `File` then owns, and -1 on failure, which is checked.
+        let file = unsafe {
+            let fd = memfd_create(b"foldwave-frame\0".as_ptr().cast(), MFD_CLOEXEC);
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
             }
-            munmap(buffer.pixels.cast(), buffer.bytes);
-            drop(Box::from_raw(buffer.busy));
-        }
-    }
-
-    /// The library, while the window the buffers were made on is open.
-    fn open_on(&self) -> Option<&'static Lib> {
-        let (lib, alive) = self.owner.as_ref()?;
-        alive.upgrade().map(|_| *lib)
+            File::from_raw_fd(fd)
+        };
+        file.set_len(size)?;
+        let conn = &mut inner.conn;
+        let pool = inner
+            .shm
+            .create_pool(conn, file.as_fd(), pool_size)
+            .map_err(other)?;
+        let proxy = pool
+            .create_buffer(
+                conn,
+                0,
+                width as i32,
+                height as i32,
+                stride,
+                wl_shm::format::XRGB8888,
+            )
+            .map_err(other)?;
+        // The buffer keeps the pool's memory alive.
+        pool.destroy(conn).map_err(other)?;
+        Ok(Buffer {
+            proxy,
+            file,
+            width,
+            height,
+            busy: false,
+        })
     }
 
     /// Show the framebuffer in the window, telling the compositor that rows
@@ -1197,88 +957,64 @@ impl CpuPresenter {
         if start >= end || w == 0 {
             return Ok(());
         }
-        let lib = window.lib;
-        // Buffers made on another window, or one since closed, are no use
-        // on this one.
-        let same = self
-            .owner
-            .as_ref()
-            .is_some_and(|(_, alive)| alive.ptr_eq(&Arc::downgrade(&window.alive)));
-        if !same {
-            let old = self.open_on();
-            for buffer in self.buffers.drain(..) {
-                // SAFETY: made by this presenter; `old` is `Some` only
-                // while their window is open.
-                unsafe { CpuPresenter::free(old, buffer) };
+        let inner = &mut *window.inner.borrow_mut();
+        if inner.lost {
+            return Err(other("the Wayland connection was lost"));
+        }
+        // Buffers made on another window, or one since closed, went with
+        // that connection.
+        if !self.owner.ptr_eq(&Arc::downgrade(&window.alive)) {
+            self.buffers.clear();
+            self.owner = Arc::downgrade(&window.alive);
+        }
+        for id in inner.released.drain(..) {
+            if let Some(b) = self.buffers.iter_mut().find(|b| b.proxy.id() == id) {
+                b.busy = false;
             }
-            self.owner = Some((lib, Arc::downgrade(&window.alive)));
         }
         // Buffers of an old size go as soon as the compositor lets go.
         let mut i = 0;
         while i < self.buffers.len() {
             let b = &self.buffers[i];
-            // SAFETY: the flag lives as long as its buffer.
-            let busy = unsafe { (*b.busy).load(Ordering::Relaxed) };
-            if (b.width, b.height) != (w, h) && !busy {
-                // SAFETY: made on this window, which is open.
-                unsafe { CpuPresenter::free(Some(lib), self.buffers.swap_remove(i)) };
+            if (b.width, b.height) != (w, h) && !b.busy {
+                let old = self.buffers.swap_remove(i);
+                old.proxy.destroy(&mut inner.conn).map_err(other)?;
             } else {
                 i += 1;
             }
         }
-        let free = self.buffers.iter().position(|b| {
-            // SAFETY: as above.
-            (b.width, b.height) == (w, h) && !unsafe { (*b.busy).load(Ordering::Relaxed) }
-        });
+        let free = self
+            .buffers
+            .iter()
+            .position(|b| (b.width, b.height) == (w, h) && !b.busy);
         let index = match free {
             Some(index) => index,
             None => {
-                self.buffers.push(CpuPresenter::make(window, w, h)?);
+                self.buffers.push(CpuPresenter::make(inner, w, h)?);
                 self.buffers.len() - 1
             }
         };
-        let buffer = &self.buffers[index];
-        // SAFETY: the mapping holds `w * h` pixels, as does the framebuffer;
-        // the compositor is not reading a buffer it has released; each
-        // request's arguments follow its signature.
-        unsafe {
-            std::ptr::copy_nonoverlapping(cpu.pixels().as_ptr(), buffer.pixels, (w * h) as usize);
-            (*buffer.busy).store(true, Ordering::Relaxed);
-            lib.request(
-                window.surface,
-                SURFACE_ATTACH,
-                &mut [Arg::ptr(buffer.proxy), Arg::int(0), Arg::int(0)],
-            );
-            let damage = if (lib.proxy_get_version)(window.surface) >= 4 {
-                SURFACE_DAMAGE_BUFFER
+        let buffer = &mut self.buffers[index];
+        buffer.file.write_all_at(bytes(cpu.pixels()), 0)?;
+        buffer.busy = true;
+        let surface = inner.surface;
+        let conn = &mut inner.conn;
+        let version = conn.object(surface.id()).map_or(1, |(_, v)| v);
+        let sent = (|| {
+            surface.attach(conn, Some(buffer.proxy), 0, 0)?;
+            let (x, y, dw, dh) = (0, start as i32, w as i32, (end - start) as i32);
+            if version >= 4 {
+                surface.damage_buffer(conn, x, y, dw, dh)?;
             } else {
-                SURFACE_DAMAGE
-            };
-            lib.request(
-                window.surface,
-                damage,
-                &mut [
-                    Arg::int(0),
-                    Arg::int(start as i32),
-                    Arg::int(w as i32),
-                    Arg::int((end - start) as i32),
-                ],
-            );
-            window.commit();
-            (lib.display_flush)(window.display);
-        }
-        Ok(())
-    }
-}
-
-impl Drop for CpuPresenter {
-    fn drop(&mut self) {
-        let lib = self.open_on();
-        for buffer in self.buffers.drain(..) {
-            // SAFETY: made by this presenter; `lib` is `Some` only while
-            // their window is open.
-            unsafe { CpuPresenter::free(lib, buffer) };
-        }
+                surface.damage(conn, x, y, dw, dh)?;
+            }
+            surface.commit(conn)?;
+            conn.flush()
+        })();
+        sent.map_err(|e| {
+            inner.lose();
+            other(e)
+        })
     }
 }
 
@@ -1317,4 +1053,133 @@ pub fn write_parent_console(text: &str) -> bool {
 /// Returns `false`: there is no system-wide environment to announce to.
 pub fn announce_environment_change() -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A small keymap in the text a compositor sends: a French-style top
+    /// left (the key at Q's place types `a`, the key at 1's place `&`),
+    /// with Shift, Control, Alt, Return and Delete.
+    const KEYMAP: &str = r#"
+xkb_keymap {
+    xkb_keycodes {
+        <AE01> = 10; <AD01> = 24; <RTRN> = 36; <LCTL> = 37; <LFSH> = 50;
+        <LALT> = 64; <DELE> = 119;
+    };
+    xkb_types {
+        type "ONE_LEVEL" { modifiers = none; };
+        type "TWO_LEVEL" { modifiers = Shift; map[Shift] = Level2; };
+        type "ALPHABETIC" {
+            modifiers = Shift+Lock;
+            map[Shift] = Level2;
+            map[Lock] = Level2;
+        };
+    };
+    xkb_compatibility { };
+    xkb_symbols {
+        key <AE01> { type = "TWO_LEVEL", [ ampersand, 1 ] };
+        key <AD01> { type = "ALPHABETIC", [ a, A ] };
+        key <RTRN> { type = "ONE_LEVEL", [ Return ] };
+        key <LCTL> { type = "ONE_LEVEL", [ Control_L ] };
+        key <LFSH> { type = "ONE_LEVEL", [ Shift_L ] };
+        key <LALT> { type = "ONE_LEVEL", [ Alt_L ] };
+        key <DELE> { type = "ONE_LEVEL", [ Delete ] };
+        modifier_map Shift { <LFSH> };
+        modifier_map Control { <LCTL> };
+        modifier_map Mod1 { <LALT> };
+    };
+};"#;
+
+    /// A keyboard that has been sent [`KEYMAP`] the way a compositor sends
+    /// it: as a file descriptor and a size.
+    fn keyboard() -> Keyboard {
+        // Tests run side by side: each keyboard gets a file of its own.
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "fwrender-keymap-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        file.write_all(KEYMAP.as_bytes()).unwrap();
+        file.write_all(&[0]).unwrap();
+        let mut keys = Keyboard::new();
+        // No Compose file: the sequences are the system's, not this test's.
+        keys.compose = Some(compose::State::new(compose::Table::parse("")));
+        keys.load(OwnedFd::from(file), KEYMAP.len() as u32 + 1);
+        assert!(keys.state.is_some(), "the keymap was read");
+        keys
+    }
+
+    // Linux key codes: the keymap's keycodes less 8.
+    const KEY_1: u32 = 2;
+    const KEY_Q: u32 = 16;
+    const KEY_ENTER: u32 = 28;
+    const KEY_DELETE: u32 = 111;
+
+    #[test]
+    fn a_key_types_what_the_compositors_keymap_says() {
+        let mut keys = keyboard();
+        // The key at Q's place types `a`, and is the A key to a shortcut.
+        assert_eq!(keys.typed(KEY_Q), "a");
+        assert_eq!(keys.vk(KEY_Q), Some('A' as u32));
+        // The key at 1's place types `&`; it keeps its place's code.
+        assert_eq!(keys.typed(KEY_1), "&");
+        assert_eq!(keys.vk(KEY_1), Some('1' as u32));
+        assert_eq!(keys.typed(KEY_ENTER), "\r");
+        // Delete is a key, not a character.
+        assert_eq!(keys.typed(KEY_DELETE), "");
+        assert_eq!(keys.vk(KEY_DELETE), Some(0x2E));
+        assert!(keys.repeats(KEY_Q));
+    }
+
+    #[test]
+    fn modifiers_change_what_is_typed_and_what_is_reported_down() {
+        let mut keys = keyboard();
+        // wl_keyboard.modifiers: Shift is bit 0, Control bit 2, Mod1 bit 3.
+        keys.modifiers(1, 0, 0, 0);
+        assert_eq!(keys.typed(KEY_Q), "A");
+        assert_eq!(keys.typed(KEY_1), "1");
+        assert!(shift_down() && !ctrl_down() && !alt_down());
+        keys.modifiers(4, 0, 0, 0);
+        assert_eq!(keys.typed(KEY_Q), "\x01", "Ctrl+A");
+        assert!(ctrl_down() && !shift_down());
+        keys.modifiers(8, 0, 0, 0);
+        assert_eq!(keys.typed(KEY_Q), "", "Alt types nothing");
+        assert!(alt_down());
+        keys.modifiers(0, 0, 0, 0);
+        assert_eq!(keys.typed(KEY_Q), "a");
+        assert!(!shift_down() && !ctrl_down() && !alt_down());
+    }
+
+    #[test]
+    fn a_compose_sequence_types_its_result_and_nothing_on_the_way() {
+        let mut keys = keyboard();
+        keys.compose = Some(compose::State::new(compose::Table::parse(
+            "<ampersand> <a> : \"ä\"\n",
+        )));
+        assert_eq!(keys.typed(KEY_1), "", "the sequence has begun");
+        assert_eq!(keys.typed(KEY_Q), "ä");
+        assert_eq!(keys.typed(KEY_Q), "a", "and is over");
+    }
+
+    #[test]
+    fn without_a_keymap_keys_type_a_us_layout() {
+        let mut keys = Keyboard::new();
+        assert_eq!(keys.typed(KEY_Q), "q");
+        assert_eq!(keys.vk(KEY_Q), Some('Q' as u32));
+        // Set directly: `modifiers` also sets what `shift_down` reports,
+        // which another test is checking.
+        keys.mods = keys::MOD_SHIFT;
+        assert_eq!(keys.typed(KEY_1), "!");
+    }
 }

@@ -39,6 +39,9 @@
 //! the documented one step per channel.
 
 #![allow(clippy::too_many_arguments)]
+// The swapchain half is used only where a surface can be made: on Windows.
+// It stays compiled on Linux, where a window is drawn another way for now.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 mod sys;
 #[cfg(test)]
@@ -174,6 +177,7 @@ struct Instance {
     surface_fns: Option<SurfaceFns>,
     /// The window system's own surface constructor, loaded with
     /// `surface_fns`.
+    #[cfg(windows)]
     platform_fns: Option<PlatformSurfaceFns>,
     handle: VkInstance,
     surface: VkSurfaceKHR,
@@ -205,6 +209,10 @@ fn create_instance(window: bool) -> Result<Instance, Error> {
     let entry = EntryFns::load(|name| unsafe { gipa(null_mut(), name.as_ptr()) })
         .map_err(Error::MissingSymbol)?;
 
+    #[cfg(not(windows))]
+    if window {
+        return Err(Error::Unsupported("a Vulkan surface on this system"));
+    }
     let mut extensions: Vec<*const u8> = Vec::new();
     if window {
         let available = enumerate(
@@ -217,7 +225,13 @@ fn create_instance(window: bool) -> Result<Instance, Error> {
             // two-call idiom passes; the layer name is null (the loader).
             |n, p| unsafe { (entry.enumerate_instance_extension_properties)(null(), n, p) },
         )?;
-        for want in [KHR_SURFACE, KHR_PLATFORM_SURFACE] {
+        #[cfg(windows)]
+        let wanted = [KHR_SURFACE, KHR_PLATFORM_SURFACE];
+        // No window-system surface is bound here (see `sys`); a windowed
+        // instance is refused before this is reached.
+        #[cfg(not(windows))]
+        let wanted = [KHR_SURFACE];
+        for want in wanted {
             let name = want.trim_end_matches('\0');
             if !available.iter().any(|e| c_name(&e.extensionName) == name) {
                 return Err(Error::Unsupported(
@@ -273,14 +287,18 @@ fn create_instance(window: bool) -> Result<Instance, Error> {
     let mut instance = Instance {
         fns,
         surface_fns: None,
+        #[cfg(windows)]
         platform_fns: None,
         handle,
         surface: NULL_HANDLE,
     };
     if window {
         instance.surface_fns = Some(SurfaceFns::load(lookup).map_err(Error::MissingSymbol)?);
-        instance.platform_fns =
-            Some(PlatformSurfaceFns::load(lookup).map_err(Error::MissingSymbol)?);
+        #[cfg(windows)]
+        {
+            instance.platform_fns =
+                Some(PlatformSurfaceFns::load(lookup).map_err(Error::MissingSymbol)?);
+        }
     }
     Ok(instance)
 }
@@ -468,49 +486,8 @@ impl VkRenderer {
         VkRenderer::for_surface(instance, width, height, atlas, mode)
     }
 
-    /// A renderer presenting to a Wayland surface through a swapchain.
-    ///
-    /// A Wayland surface has no size of its own: the swapchain is
-    /// `width x height`, and [`VkRenderer::resize`] follows the window's
-    /// configured size. A `mode` the surface does not offer falls back to
-    /// [`PresentMode::Fifo`].
-    ///
-    /// # Safety
-    /// `display` and `surface` must be the `wl_display` and `wl_surface` of
-    /// a live window, owned by the caller, that outlives the renderer. The
-    /// driver sends requests on that display from the calling thread.
-    #[cfg(target_os = "linux")]
-    pub unsafe fn for_wayland(
-        display: *mut c_void,
-        surface: *mut c_void,
-        width: u32,
-        height: u32,
-        atlas: &Atlas,
-        mode: PresentMode,
-    ) -> Result<VkRenderer, Error> {
-        let mut instance = create_instance(true)?;
-        let info = VkWaylandSurfaceCreateInfoKHR {
-            sType: ST_WAYLAND_SURFACE_CREATE_INFO_KHR,
-            pNext: null(),
-            flags: 0,
-            display,
-            surface,
-        };
-        let mut vk_surface = NULL_HANDLE;
-        {
-            let pf = instance.platform_fns.as_ref().expect("loaded for a window");
-            // SAFETY: the caller guarantees a live display and surface;
-            // `info` lives across the call. On success the surface is owned
-            // by `instance`.
-            check("vkCreateWaylandSurfaceKHR", unsafe {
-                (pf.create_wayland_surface)(instance.handle, &info, null(), &mut vk_surface)
-            })?;
-        }
-        instance.surface = vk_surface;
-        VkRenderer::for_surface(instance, width, height, atlas, mode)
-    }
-
     /// The rest of a windowed renderer, once `instance` owns its surface.
+    #[cfg(windows)]
     fn for_surface(
         instance: Instance,
         width: u32,
@@ -2276,10 +2253,17 @@ impl VkWindow {
         #[cfg(windows)]
         let made =
             unsafe { VkRenderer::for_window(window.hinstance(), window.hwnd(), w, h, atlas, mode) };
-        // SAFETY: as above, for the window's Wayland display and surface.
+        // Vulkan's own Wayland surface takes the C library's display and
+        // the driver calls that library on it; foldwave speaks Wayland with
+        // its own. Until Vulkan frames are handed to the compositor directly
+        // (as dmabufs), a window on Linux is drawn by the CPU renderer, and
+        // a caller that falls back to it does so here.
         #[cfg(target_os = "linux")]
-        let made = unsafe {
-            VkRenderer::for_wayland(window.display(), window.surface(), w, h, atlas, mode)
+        let made: Result<VkRenderer, Error> = {
+            let _ = (w, h, atlas, mode);
+            Err(Error::Unsupported(
+                "a Vulkan frame in a Wayland window (not built yet); use the CPU renderer",
+            ))
         };
         match made {
             Ok(renderer) => Ok(VkWindow { renderer, window }),

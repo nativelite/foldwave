@@ -34,7 +34,6 @@ fn a_window_opens_at_its_size_and_asks_for_a_frame() {
     let mut events = Vec::new();
     window.poll(&mut events);
     assert!(events.contains(&Event::Paint), "{events:?}");
-    assert!(!window.display().is_null() && !window.surface().is_null());
     assert_eq!(window.dpi(), 96);
 }
 

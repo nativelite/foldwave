@@ -1,16 +1,16 @@
-//! Keys: Linux key codes to the virtual-key codes and characters the rest of
-//! foldwave already handles.
+//! Keys: what a Wayland key press means in the terms the rest of foldwave
+//! already handles.
 //!
-//! Wayland hands a client raw key codes (the kernel's `input-event-codes.h`)
-//! and a keymap to interpret them with. **This first cut does not read the
-//! keymap**: it types a US layout. Reading it properly means either
-//! `libxkbcommon` (a system library every Wayland desktop has, like
-//! `libwayland-client`) or our own keymap compiler; that is an open founder
-//! decision (`docs/philosophy.md` section 8), not something assumed here.
+//! The compositor's keymap is read by `nativelite-xkb` (`window.rs`), which
+//! says what a key types under the layout in use. What is here is the part
+//! that is foldwave's own: the virtual-key codes. They are Windows' (`VK_*`),
+//! because [`super::Event`] is the same type on both systems and fwterm's
+//! key handling is written against them. A letter or digit key takes the
+//! code of what it types in the layout, as on Windows; every other key takes
+//! the code of its place on the keyboard.
 //!
-//! The virtual-key codes are Windows' (`VK_*`), because [`super::Event`] is
-//! the same type on both systems and fwterm's key handling is written
-//! against them.
+//! The US table at the end is the fallback for a compositor that sends no
+//! keymap.
 
 /// Modifier bits as the keyboard's `modifiers` event reports them: the first
 /// four of X's eight real modifiers, whose positions are fixed.
@@ -89,6 +89,16 @@ pub fn vk(key: u32) -> Option<u32> {
         125 | 126 => 0x5B,            // the logo keys
         _ => return None,
     })
+}
+
+/// The virtual-key code for a key: the letter or digit its first level
+/// types under the layout (`first`, a keysym), else its place's.
+pub fn vk_in_layout(key: u32, first: Option<u32>) -> Option<u32> {
+    match first.and_then(char::from_u32) {
+        Some(c) if c.is_ascii_alphabetic() => Some(c.to_ascii_uppercase() as u32),
+        Some(c) if c.is_ascii_digit() => Some(c as u32),
+        _ => vk(key),
+    }
 }
 
 /// Whether holding the key does not repeat it.
@@ -186,6 +196,18 @@ mod tests {
         assert_eq!(vk(13), Some(0xBB), "plus, for Alt+Shift+Plus");
         assert_eq!(vk(9999), None);
         assert!(is_modifier(42) && !is_modifier(30));
+    }
+
+    #[test]
+    fn a_letter_key_takes_the_code_of_what_it_types() {
+        // The key at Q's place types `a` on a French keyboard.
+        assert_eq!(vk_in_layout(16, Some('a' as u32)), Some('A' as u32));
+        assert_eq!(vk_in_layout(16, Some('q' as u32)), Some('Q' as u32));
+        assert_eq!(vk_in_layout(2, Some('1' as u32)), Some('1' as u32));
+        // Anything else keeps its place: the top row's `&` is still key 1.
+        assert_eq!(vk_in_layout(2, Some('&' as u32)), Some('1' as u32));
+        assert_eq!(vk_in_layout(103, Some(0xff52)), Some(0x26), "Up");
+        assert_eq!(vk_in_layout(30, None), Some('A' as u32));
     }
 
     #[test]
