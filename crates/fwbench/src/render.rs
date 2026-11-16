@@ -395,34 +395,45 @@ impl Target for Headless {
     }
 }
 
-/// The CPU renderer in a window, blitted with GDI.
+/// The window system this build draws on: the same names on each.
 #[cfg(windows)]
+use fwrender::win as plat;
+#[cfg(target_os = "linux")]
+use fwrender::wl as plat;
+
+/// The CPU renderer in a window: blitted with GDI on Windows, shown through
+/// shared memory on Wayland.
+#[cfg(any(windows, target_os = "linux"))]
 pub struct WindowCpu {
-    window: fwrender::win::Window,
+    window: plat::Window,
     cpu: fwrender::CpuRenderer,
-    presenter: fwrender::win::CpuPresenter,
-    events: Vec<fwrender::win::Event>,
+    presenter: plat::CpuPresenter,
+    events: Vec<plat::Event>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl WindowCpu {
     /// A window with a client area of `size` pixels.
     pub fn new(size: (u32, u32)) -> io::Result<WindowCpu> {
-        let window = fwrender::win::Window::new("fwbench render - cpu", size.0, size.1)?;
+        let window = plat::Window::new("fwbench render - cpu", size.0, size.1)?;
         let (w, h) = window.client_size();
         Ok(WindowCpu {
             window,
             cpu: fwrender::CpuRenderer::new(w, h),
-            presenter: fwrender::win::CpuPresenter::new(),
+            presenter: plat::CpuPresenter::new(),
             events: Vec::new(),
         })
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl Target for WindowCpu {
     fn name(&self) -> String {
-        "cpu (GDI blit)".into()
+        if cfg!(windows) {
+            "cpu (GDI blit)".into()
+        } else {
+            "cpu (wl_shm)".into()
+        }
     }
 
     fn size(&self) -> (u32, u32) {
@@ -456,7 +467,7 @@ impl Target for WindowCpu {
         !self
             .events
             .iter()
-            .any(|e| matches!(e, fwrender::win::Event::CloseRequested))
+            .any(|e| matches!(e, plat::Event::CloseRequested))
     }
 
     fn waker(&self) -> Arc<dyn Fn() + Send + Sync> {
@@ -467,23 +478,23 @@ impl Target for WindowCpu {
 
 /// The Vulkan backend in a window. The renderer is made on the first draw,
 /// because it needs the atlas, which [`run`] owns.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub struct WindowVulkan {
     state: VkState,
     mode: fwrender::vk::PresentMode,
-    events: Vec<fwrender::win::Event>,
+    events: Vec<plat::Event>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 enum VkState {
-    Window(fwrender::win::Window),
+    Window(plat::Window),
     Ready(fwrender::vk::VkWindow),
     Failed,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl WindowVulkan {
-    fn window(&mut self) -> Option<&mut fwrender::win::Window> {
+    fn window(&mut self) -> Option<&mut plat::Window> {
         match &mut self.state {
             VkState::Window(w) => Some(w),
             VkState::Ready(v) => Some(v.window_mut()),
@@ -492,7 +503,7 @@ impl WindowVulkan {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl Target for WindowVulkan {
     fn name(&self) -> String {
         match &self.state {
@@ -545,7 +556,7 @@ impl Target for WindowVulkan {
         }
         let closed = events
             .iter()
-            .any(|e| matches!(e, fwrender::win::Event::CloseRequested));
+            .any(|e| matches!(e, plat::Event::CloseRequested));
         self.events = events;
         !closed
     }
@@ -560,14 +571,14 @@ impl Target for WindowVulkan {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn vk_error(e: fwrender::vk::Error) -> io::Error {
     io::Error::new(io::ErrorKind::Other, e.to_string())
 }
 
 /// Open the Vulkan backend in a window of `size` pixels, presenting with
 /// `present` (`fifo`, `mailbox` or `immediate`).
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub fn open_vulkan(size: (u32, u32), present: &str) -> io::Result<Box<dyn Target>> {
     use fwrender::vk::PresentMode;
     let mode = match present {
@@ -575,7 +586,7 @@ pub fn open_vulkan(size: (u32, u32), present: &str) -> io::Result<Box<dyn Target
         "immediate" => PresentMode::Immediate,
         _ => PresentMode::Fifo,
     };
-    let window = fwrender::win::Window::new("fwbench render - vulkan", size.0, size.1)?;
+    let window = plat::Window::new("fwbench render - vulkan", size.0, size.1)?;
     Ok(Box::new(WindowVulkan {
         state: VkState::Window(window),
         mode,

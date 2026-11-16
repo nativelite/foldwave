@@ -25,7 +25,7 @@ fn unavailable(e: &Error) -> bool {
             | Error::NoSuitableDevice
             | Error::Unsupported(_)
             | Error::Vulkan {
-                call: "vkCreateInstance" | "vkCreateWin32SurfaceKHR",
+                call: "vkCreateInstance" | "vkCreateWin32SurfaceKHR" | "vkCreateWaylandSurfaceKHR",
                 ..
             }
     )
@@ -261,7 +261,7 @@ fn a_window_swapchain_draws_resizes_and_draws_again() {
     let mut frame = Frame::new();
     frame.update(&s, true, &palette, &mut atlas, &mut raster);
 
-    let mut window = match crate::win::Window::new("fwrender vk test", 96, 80) {
+    let mut window = match crate::vk::PlatformWindow::new("fwrender vk test", 96, 80) {
         Ok(w) => w,
         Err(e) => {
             println!("skipping: could not create a window: {e}");
@@ -271,10 +271,23 @@ fn a_window_swapchain_draws_resizes_and_draws_again() {
     let mut events = Vec::new();
     let (w, h) = window.client_size();
     // SAFETY: the window outlives the renderer (dropped after it below).
+    #[cfg(windows)]
     let made = unsafe {
         VkRenderer::for_window(
             window.hinstance(),
             window.hwnd(),
+            w,
+            h,
+            &atlas,
+            PresentMode::Fifo,
+        )
+    };
+    // SAFETY: as above.
+    #[cfg(target_os = "linux")]
+    let made = unsafe {
+        VkRenderer::for_wayland(
+            window.display(),
+            window.surface(),
             w,
             h,
             &atlas,

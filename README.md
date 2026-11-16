@@ -37,7 +37,7 @@ The competitive landscape for the whole suite is in
 | Crate | Concern | License |
 | --- | --- | --- |
 | [`crates/fwterm`](crates/fwterm) | the terminal: split panes, logs, search, blocks, settings, first run, install | FSL-1.1-Apache-2.0 |
-| [`crates/fwrender`](crates/fwrender) | the renderer: cell frames, glyph atlas, Vulkan and CPU backends, the Win32 window | MIT |
+| [`crates/fwrender`](crates/fwrender) | the renderer: cell frames, glyph atlas, Vulkan and CPU backends, the Win32 window and the Wayland window | MIT |
 | [`crates/resmon`](crates/resmon) | CPU, RAM, disk I/O and GPU use by process tree; drives and CPU sets | MIT |
 | [`crates/fwcuda`](crates/fwcuda) | a runtime-loaded binding to the CUDA driver, for the GPU search index | MIT |
 | [`crates/fwbench`](crates/fwbench) | measurement harness: pane floods, key-echo latency, log checks | MIT |
@@ -88,6 +88,16 @@ serves instead. The strip's SETTINGS and HELP buttons, at its right end,
 light up under the pointer and open the settings sheet and this help.
 
 `fwterm --help` lists every option and key.
+
+## Linux
+
+foldwave builds and runs on Linux (64-bit x86 and ARM) on a Wayland desktop,
+as a first cut: `cargo build --release --bin fwterm`, then
+`target/release/fwterm`. It needs nothing installed beyond what a Wayland
+desktop with a Vulkan driver already has (`libwayland-client`, `libvulkan`,
+both loaded at run time). What works and what does not yet (US keyboard
+layout only, no clipboard, no title bar on GNOME, no installer) is in
+[`docs/design.md`](docs/design.md) §8.9.
 
 ## Install (Windows)
 

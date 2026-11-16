@@ -32,9 +32,9 @@ pub enum Progress {
     Paused(u8),
 }
 
-impl From<Progress> for fwrender::win::TaskbarProgress {
+impl From<Progress> for crate::plat::TaskbarProgress {
     fn from(p: Progress) -> Self {
-        use fwrender::win::TaskbarProgress as T;
+        use crate::plat::TaskbarProgress as T;
         match p {
             Progress::Normal(n) => T::Normal(n),
             Progress::Error(n) => T::Error(n),

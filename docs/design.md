@@ -2711,11 +2711,11 @@ repositories checked out beside it (`ansi-rs`, `vterm-rs`, `pty-rs`,
 | `fwbench`, `fwprobe` | yes | 109 and 12 pass, after one fix (below) |
 | `fwrender` | yes: frame, atlas, CPU renderer | 30 pass; the Vulkan backend and the window are Windows-only |
 | `fwcuda` | yes | 7 pass (no CUDA driver there) |
-| `fwterm` | **no**: it stops at `fwrender::win`, the Win32 window | — |
+| `fwterm` | not at first: it stopped at `fwrender::win`, the Win32 window. **Yes since the Wayland window, the same day** (below) | 155 pass, 12 fail; all 12 assert Windows paths, shells or the installer (below) |
 
-So what stands between foldwave and a Linux window is the window itself
-(`fwrender`'s Wayland or X11 side and Vulkan's surface on it) and the parts
-of `fwterm` that call Win32 directly. The engine underneath already runs.
+So what stood between foldwave and a Linux window was the window itself and
+the parts of `fwterm` that call Win32 directly. The engine underneath
+already ran.
 
 - **One Linux bug found and fixed.** `fwbench compose --log single` wrote its
   4 KiB record header from a plain `Vec`. Windows took it; Linux refuses a
@@ -2762,6 +2762,71 @@ What they say:
   disk, a hybrid CPU, 16 panes (the machine has 4 CPUs), and `panelog`'s write
   rate with checkpoints, which read 96 MiB/s in the history run and wants a
   proper A/B before it means anything.
+
+**The Wayland window, and fwterm on Linux (2026-11-16, §11 row 25).** Built
+the same day as the first Linux build, in `fwrender::wl`
+([`wl/`](../crates/fwrender/src/wl)):
+
+- **`libwayland-client` is loaded at run time and bound by hand**
+  (`wl/sys.rs`): `dlopen`, thirteen functions and the core protocol's tables
+  looked up by name. `xdg-shell`'s tables are not in the library (a C program
+  generates them), so they are written out from the protocol's XML. Nothing
+  is linked; without the library or a compositor, opening a window is an
+  error, not a failed start.
+- **`wl::Window` has `win::Window`'s method names and reports the same
+  `Event` type** (now `fwrender/src/event.rs`, shared), so a caller is written
+  once. Keys arrive as Linux key codes and are turned into the virtual-key
+  codes and characters fwterm already handles (`wl/keys.rs`); a held key
+  repeats on our own clock, as Wayland leaves that to the client. One thread
+  owns the window; a `Waker` is an `eventfd`.
+- **`wl::CpuPresenter`** shows the CPU renderer's frames through shared memory
+  (`wl_shm`, `memfd`), reusing buffers as the compositor releases them.
+- **The Vulkan backend runs on Linux.** Its loader is `libvulkan.so.1` there,
+  and its surface `VK_KHR_wayland_surface` (`VkRenderer::for_wayland`); the
+  rest of `vk/` is unchanged.
+- **`fwterm` builds and runs on Linux.** With the window's names matching,
+  turning its whole `app` on left nine compile errors, in four places that
+  are Windows' own (a console check, a process flag, the uninstaller's
+  clean-up, the console host choice), each now behind `cfg(windows)`. Its
+  folder is `$XDG_DATA_HOME/foldwave`, else `~/.local/share/foldwave`
+  (`logstore::user_base`; a proposal), and its default shell `$SHELL`, else
+  `/bin/sh`.
+- **`fwbench render` runs on Linux**, with the built-in JetBrains Mono.
+
+Checked on that machine against a real compositor (weston 13, headless) and
+Mesa's software Vulkan driver (llvmpipe):
+
+| Check | Result |
+| --- | --- |
+| A window opens, sleeps, is woken from another thread, resizes | pass (3 tests) |
+| CPU frames reach the compositor; buffers are reused; a presenter outlives its window | pass |
+| Vulkan against the CPU reference, pixel for pixel | 21,037 pixels, largest channel difference 0 |
+| A Vulkan swapchain on the Wayland window draws, resizes, draws again | pass |
+| `fwbench render`, CPU and Vulkan, 900x500 | both run; idle draws 0 frames at 0.00 % of a core |
+| `fwterm`, CPU and Vulkan, a shell printing 20,000 lines | both exit 0 |
+| `fwterm --panes 4` with defaults (pane hosts, ptys, logs) | exit 0; four logs with checkpoints, line index and signatures, a marker line found in each; no process left behind |
+| The Windows build | still type-checks, tests included (`x86_64-pc-windows-gnu`) |
+| With no compositor | the window tests skip and pass |
+
+**What this does not show.** Nobody has looked at it: the compositor was
+headless and no screenshot could be taken (its screenshot tool fails on a
+headless output). No key or click was sent, since nothing there can inject
+them, so input is checked only through its tables. Frame rates under a
+software driver mean nothing. All of it wants a person at a Linux desktop
+with a GPU.
+
+**Not built on Linux yet:**
+
+| Missing | What it needs |
+| --- | --- |
+| Any keyboard layout but US | the compositor's keymap read, through `libxkbcommon` (a system library, as `libwayland-client` is) or our own; a founder decision |
+| A title bar on GNOME, which draws none for an application | our own, drawn in the grid like the strip; or `libdecor` |
+| Sharp text on a scaled display | `fractional-scale-v1` and `viewporter`; today the surface is one pixel a point |
+| Clipboard, dropped files, pointer shapes | `wl_data_device`, `cursor-shape-v1` |
+| Notifications, taskbar progress | the desktop portal, or nothing |
+| First run's shell list, the installer, the `tmux` shim's name and `PATH` | Linux forms of each: these are the 12 fwterm tests that fail on Linux, each asserting a Windows path, shell or installer file |
+| X11 | a second window backend, if wanted |
+| The program outliving a killed window | a cgroup or parent-death signal at spawn (§11 row 24) |
 
 ## 9. Package plan
 
@@ -2853,6 +2918,7 @@ Founder answers of 2026-09-15.
 | 22 | Order of the agent-layer slices | **Founder decision (2026-11-08): the order in §8.7c stands**: pane identity, then attention, then fwterm as a ctl client, then fwterm's own shim; the first two start now, since they wait on nothing | Slices 3 and 4 waited on `nativelite-ipc` (row 20) and the shared verb crate (row 19); both existed by 2026-11-09, so no slice is blocked; all four slices were built that day. The beta check in a window (§10 M5 status) is unchanged and runs when the founder is at the machine |
 | 23 | Direction after M5 | **Founder decision (2026-11-16): the direction in [`philosophy.md`](philosophy.md) stands**: with the §4 targets met, speed and efficiency are pursued at the photon (key-to-photon latency), in the footprint (fast-core time, memory, disk, energy, wakeups) and across the session (what the panes' programs cost), by removing work before speeding it up | The founder's correction, recorded with it: foldwave is about speed and efficiency and "the ability to push beyond", as the fold engine it is named for does; the targets are a floor. Experiments E7 to E16 are proposals, each kept or dropped by its own measurement; the decisions still open are in philosophy §8 (report or act, the default signer, a camera for E7, drawing below the display's rate, a public scorecard, a compression crate, `libwayland-client`, targets beyond §4) |
 | 24 | The first Unix | **Founder decision (2026-11-16): Linux first** | It reuses the Vulkan renderer and has the strongest per-pane controls (a cgroup per pane, pressure-stall information; [`compute.md`](compute.md)). First step, **built 2026-11-16**: `resmon`'s Linux backend ([`sys/linux.rs`](../crates/resmon/src/sys/linux.rs)), which the governor and the measurement harness stand on. Processes with their parents, CPU time, memory and I/O from `/proc`; machine load and memory; which CPUs are fast or efficient (`cpu_capacity`, else the `cpu_core` and `cpu_atom` lists), written as the records `cpu::topology` already parses; thread placement (`sched_setaffinity`); volumes and their mount points (`statvfs`, `mountinfo`), a fixed volume being a writable block device on a disk that cannot be removed; a child's CPU clock named by id and start time; and `resmon::pressure`, Linux's pressure-stall information for CPU, memory and I/O, a governor input Windows has no counterpart for (§8.8). No privilege, no library beyond libc through our own `extern` block; 64-bit x86 and ARM. Checked on Linux 6.18 in a 4-CPU container: 74 unit tests (17 new) pass five runs in a row, `resmon 2` attributes the machine, and the crate still type-checks for Windows (`x86_64-pc-windows-gnu`). **Not checked:** a hybrid CPU (the container's are one kind) and a machine with real disks (`volume::fixed` listed none there). **The whole workspace was built on Linux the same day** (§8.9, "Linux: the first build and the first numbers"): every crate but `fwterm` builds and passes its tests, and `fwbench` gave the first Linux measurements. **A known gap:** `job::KillOnClose` on Linux ends its processes and their process groups when dropped, not when its holder is killed; that needs the pane's program started in a cgroup or with a parent-death signal, which belongs to the spawn in `pty-rs` ([`compute.md`](compute.md), "A job per pane"). macOS needs a Metal renderer (§8.6) and has no date |
+| 25 | The Linux window | **Founder decision (2026-11-16): Wayland first, and `libwayland-client` is loaded at run time**, on the footing of `vulkan-1.dll` on Windows: a library the system ships, bound by our own code, nothing of it shipped or linked | Wayland is what the main Linux desktops now run; X11 is a later, optional backend. The library is needed, not only convenient: Vulkan's Wayland surface takes its `wl_display` and the driver calls the library on it ([`compute.md`](compute.md), "Display path"). **Built the same day**: `fwrender::wl`, the Vulkan backend on Linux, and fwterm running there (§8.9, "The Wayland window, and fwterm on Linux"). Open from it: `libxkbcommon` for keyboard layouts, the same kind of library and the same question; where fwterm's folder lives on Linux (`~/.local/share/foldwave` as built); a title bar on GNOME |
 
 **Experiment E2: built-in console host vs OpenConsole (part of M0).**
 

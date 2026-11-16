@@ -90,18 +90,25 @@ mod wire;
 #[cfg(test)]
 mod winres;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn main() {
     std::process::exit(app::run());
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 fn main() {
-    eprintln!("fwterm: the prototype is Windows-only for now");
+    eprintln!("fwterm: built for Windows and Linux so far");
     std::process::exit(1);
 }
 
+/// The window system this build draws on: the same names on each.
 #[cfg(windows)]
+pub(crate) use fwrender::win as plat;
+/// The window system this build draws on: the same names on each.
+#[cfg(target_os = "linux")]
+pub(crate) use fwrender::wl as plat;
+
+#[cfg(any(windows, target_os = "linux"))]
 mod app {
     use crate::agents;
     use crate::altscreen;
@@ -123,13 +130,13 @@ mod app {
     use crate::layout::{neighbor, pane_at, Dir, Layout, PaneId, Placement, Rect, Toward};
     use crate::logstore;
     use crate::mouse;
+    use crate::plat::{display_refresh_hz, CpuPresenter, Cursor, Event, Waker, Window};
     use crate::ribbon;
     use crate::select::{self, Point, Selection};
     use crate::settings_ui;
     use crate::strip;
     use crate::team;
     use crate::theme::Theme;
-    use fwrender::win::{display_refresh_hz, CpuPresenter, Cursor, Event, Waker, Window};
     use fwrender::{
         Atlas, CellInstance, CpuRenderer, FontRasterizer, Frame, GlyphKey, GlyphPart, Highlight,
         Metrics, Palette, Rasterizer, Sharpening,
@@ -152,6 +159,7 @@ mod app {
         };
     }
 
+    #[cfg(windows)]
     fn say(msg: &str) {
         use std::os::windows::io::AsRawHandle;
         if !io::stderr().as_raw_handle().is_null() {
@@ -159,8 +167,27 @@ mod app {
         } else {
             // A console wants CR LF.
             let text = format!("{}\r\n", msg.replace('\n', "\r\n"));
-            fwrender::win::write_parent_console(&text);
+            crate::plat::write_parent_console(&text);
         }
+    }
+
+    /// On Linux standard error is always there: the terminal fwterm was
+    /// started from, or wherever it was sent.
+    #[cfg(not(windows))]
+    fn say(msg: &str) {
+        eprintln!("{msg}");
+    }
+
+    /// The shell a pane runs when none is named: `cmd.exe` on Windows; on
+    /// Linux the user's own (`$SHELL`), else `/bin/sh`.
+    fn default_shell() -> String {
+        if cfg!(windows) {
+            return "cmd.exe".into();
+        }
+        std::env::var("SHELL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/bin/sh".into())
     }
 
     const USAGE: &str = "\
@@ -385,7 +412,7 @@ keys:
             uninstall: false,
             quiet: false,
             panes: 1,
-            shell: vec!["cmd.exe".into()],
+            shell: vec![default_shell()],
             shell_set: false,
         };
         let mut i = 0;
@@ -1332,7 +1359,7 @@ keys:
 
     /// The settings file, if there is one.
     fn settings() -> (Option<PathBuf>, logstore::Settings) {
-        let app = logstore::app_dir(std::env::var_os("LOCALAPPDATA"));
+        let app = logstore::app_dir(logstore::user_base());
         let settings = app
             .as_deref()
             .and_then(|a| std::fs::read_to_string(logstore::settings_path(a)).ok())
@@ -1968,7 +1995,7 @@ keys:
         y: i32,
         m: Metrics,
     ) -> bool {
-        if fwrender::win::shift_down() || p.back != 0 || p.deep.is_some() {
+        if crate::plat::shift_down() || p.back != 0 || p.deep.is_some() {
             return false;
         }
         let (tracking, sgr) = p.shared.term.lock().unwrap().mouse();
@@ -1979,8 +2006,8 @@ keys:
         let col = within(x, m.cell_w, p.rect.left, p.rect.cols);
         let mods = mouse::Mods {
             shift: false,
-            alt: fwrender::win::alt_down(),
-            ctrl: fwrender::win::ctrl_down(),
+            alt: crate::plat::alt_down(),
+            ctrl: crate::plat::ctrl_down(),
         };
         match mouse::report(tracking, sgr, button, action, row, col, mods) {
             Some(bytes) => {
@@ -2027,7 +2054,7 @@ keys:
             return true;
         }
         let alt = p.shared.term.lock().unwrap().in_alternate_screen();
-        if alt && !fwrender::win::shift_down() && p.back == 0 {
+        if alt && !crate::plat::shift_down() && p.back == 0 {
             let keys = mouse::wheel_as_arrows(delta > 0, notches * 3);
             let _ = p.session.lock().unwrap().write(&keys);
             return true;
@@ -4150,17 +4177,18 @@ keys:
             env.extend(shell_integration(&program[0]));
         }
         let session = if args.pipe {
-            use std::os::windows::process::CommandExt;
             use std::process::{Command, Stdio};
-            // CREATE_NO_WINDOW: no console at all, not even a hidden one.
-            let mut child = Command::new(&program[0])
+            let mut command = Command::new(&program[0]);
+            command
                 .args(&shell_args)
                 .envs(env.iter().map(|(k, v)| (k, v)))
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .creation_flags(0x0800_0000)
-                .spawn()?;
+                .stderr(Stdio::piped());
+            // CREATE_NO_WINDOW: no console at all, not even a hidden one.
+            #[cfg(windows)]
+            std::os::windows::process::CommandExt::creation_flags(&mut command, 0x0800_0000);
+            let mut child = command.spawn()?;
             let (mut out, mut err) = (
                 child.stdout.take().expect("piped"),
                 child.stderr.take().expect("piped"),
@@ -4245,7 +4273,7 @@ keys:
     fn start_pressure_watch(
         hosts: Arc<Mutex<governor::Family>>,
         cpu: Arc<AtomicU64>,
-        wake: Option<fwrender::win::Waker>,
+        wake: Option<crate::plat::Waker>,
     ) -> Arc<AtomicBool> {
         let busy = Arc::new(AtomicBool::new(false));
         let flag = busy.clone();
@@ -4395,7 +4423,7 @@ keys:
         .and_then(|_| reg(&["import".as_ref(), file.as_os_str()]));
         let _ = std::fs::remove_file(&file);
         written?;
-        fwrender::win::announce_environment_change();
+        crate::plat::announce_environment_change();
         Ok(true)
     }
 
@@ -4515,6 +4543,7 @@ keys:
             say!("fwterm: {dir} stays in your PATH: {e}");
         }
         let left = install::remove_files(&p, &me);
+        #[cfg_attr(not(windows), allow(unused_variables))]
         let (running, busy): (Vec<PathBuf>, Vec<PathBuf>) = left
             .into_iter()
             .partition(|f| std::fs::canonicalize(f).ok() == std::fs::canonicalize(&me).ok());
@@ -4552,6 +4581,7 @@ keys:
                 say!("fwterm: {e}");
             }
         }
+        #[cfg(windows)]
         if !running.is_empty() {
             // This program's own file: removed once it has exited, with the
             // folder if nothing else is left in it.
@@ -4760,6 +4790,15 @@ keys:
 
     /// Console lane host (design §11 row 6), for the window's panes or a pane
     /// host's: set once, before the first console starts.
+    #[cfg(not(windows))]
+    fn choose_console_host(_args: &Args) -> io::Result<()> {
+        // A pty is the kernel's on Linux: there is no console host to choose.
+        Ok(())
+    }
+
+    /// Console lane host (design §11 row 6), for the window's panes or a pane
+    /// host's: set once, before the first console starts.
+    #[cfg(windows)]
     fn choose_console_host(args: &Args) -> io::Result<()> {
         // An explicit --conpty, else a
         // conpty.dll shipped beside fwterm.exe (Microsoft's ConPTY package,
@@ -4845,7 +4884,7 @@ keys:
         }
         // The first run: asked for, or no settings file yet (not for
         // --pipe or --stats, which tests and benchmarks use).
-        let fresh = logstore::app_dir(std::env::var_os("LOCALAPPDATA"))
+        let fresh = logstore::app_dir(logstore::user_base())
             .is_some_and(|a| !logstore::settings_path(&a).exists());
         if args.first_run || (fresh && !args.pipe && args.stats.is_none()) {
             let (s, end) = ask_first_run(surface, &mut atlas, &mut raster, &mut gpu_faults)?;
@@ -5020,7 +5059,7 @@ keys:
 
         // This thread draws: it must win a core when a frame is due, even with
         // every core busy moving output.
-        fwrender::win::raise_thread_priority();
+        crate::plat::raise_thread_priority();
         let hz = args.max_fps.or_else(display_refresh_hz).unwrap_or(60);
         let min_interval = Duration::from_secs_f64(1.0 / hz as f64);
         // The look: --theme, else the settings file's, else Mirai; then the
@@ -5717,7 +5756,7 @@ keys:
                                 f.running = Some(rx);
                             } else if !f.hits.is_empty() {
                                 let n = f.hits.len();
-                                f.at = if fwrender::win::shift_down() {
+                                f.at = if crate::plat::shift_down() {
                                     (f.at + n - 1) % n
                                 } else {
                                     (f.at + 1) % n
@@ -5741,8 +5780,8 @@ keys:
                         Event::Char(_) => continue,
                         Event::Key { vk, down: true }
                             if !(vk == 0x46
-                                && fwrender::win::ctrl_down()
-                                && fwrender::win::shift_down()) =>
+                                && crate::plat::ctrl_down()
+                                && crate::plat::shift_down()) =>
                         {
                             continue
                         }
@@ -5759,10 +5798,9 @@ keys:
                         char_bytes(c, &mut input);
                     }
                     Event::Key { vk, down: true } => {
-                        let (ctrl, shift) =
-                            (fwrender::win::ctrl_down(), fwrender::win::shift_down());
+                        let (ctrl, shift) = (crate::plat::ctrl_down(), crate::plat::shift_down());
                         // AltGr is Ctrl+Alt: leave its characters alone.
-                        let ctrl = ctrl && !fwrender::win::alt_down();
+                        let ctrl = ctrl && !crate::plat::alt_down();
                         let page = panes[fi].rect.rows.max(2) - 1;
                         // Ctrl+Shift+C, or Ctrl+C while something is selected:
                         // copy. Plain Ctrl+C otherwise reaches the program.
@@ -5842,7 +5880,7 @@ keys:
                         }
                         // F1: the help sheet, the keys. (It types no
                         // character either.)
-                        if vk == 0x70 && !ctrl && !shift && !fwrender::win::alt_down() {
+                        if vk == 0x70 && !ctrl && !shift && !crate::plat::alt_down() {
                             help_sheet = Some(help::Sheet::new());
                             layout_dirty = true;
                             continue;
@@ -6002,7 +6040,7 @@ keys:
                         pane.shared.pending.store(true, Ordering::Release);
                     }
                     Event::SysKey { vk, down: true } => {
-                        let shift = fwrender::win::shift_down();
+                        let shift = crate::plat::shift_down();
                         let r = panes[fi].rect;
                         let dir = match vk {
                             // Alt+Shift+Plus / Minus / D: split the pane.
@@ -7143,7 +7181,7 @@ keys:
             assert!(parse(&argv(&["--pipe", "--", "x"])).unwrap().pipe);
             assert!(parse(&argv(&["--backend", "gl"])).is_err());
             assert!(parse(&argv(&["--size", "10x10"])).is_err());
-            assert_eq!(parse(&argv(&[])).unwrap().shell, ["cmd.exe"]);
+            assert_eq!(parse(&argv(&[])).unwrap().shell, [default_shell()]);
             let f = parse(&argv(&["--font", "Cascadia Mono"])).unwrap();
             assert_eq!(f.font.as_deref(), Some("Cascadia Mono"));
             assert!(parse(&argv(&[])).unwrap().font.is_none());

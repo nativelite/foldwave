@@ -430,8 +430,7 @@ pub fn ensure_shim(exe: &Path, app: &Path) -> Result<PathBuf, String> {
 /// Place the shim for this fwterm, or say why not (once, by the caller).
 pub fn place_shim() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let app =
-        crate::logstore::app_dir(std::env::var_os("LOCALAPPDATA")).ok_or("LOCALAPPDATA unset")?;
+    let app = crate::logstore::app_dir(crate::logstore::user_base()).ok_or("LOCALAPPDATA unset")?;
     ensure_shim(&exe, &app)
 }
 

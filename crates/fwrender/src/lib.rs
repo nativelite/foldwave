@@ -33,13 +33,17 @@ mod boxdraw;
 mod boxdraw_table;
 mod catalog;
 mod cpu;
+#[cfg(any(windows, target_os = "linux"))]
+mod event;
 mod font;
 mod frame;
 pub mod spirv;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub mod vk;
 #[cfg(windows)]
 pub mod win;
+#[cfg(target_os = "linux")]
+pub mod wl;
 
 pub use atlas::{Atlas, GlyphKey, GlyphPart, Metrics, Rasterizer, TestRasterizer, BOLD, ITALIC};
 pub use catalog::{

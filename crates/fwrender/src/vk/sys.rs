@@ -9,11 +9,12 @@
 //! field here shows up only as a wrong pixel or a crash: keep the
 //! transcription literal and field-for-field.
 //!
-//! `vulkan-1.dll` (the Khronos loader, installed with every Vulkan driver) is
-//! loaded at run time from System32 with `LoadLibraryExW`; only
-//! `vkGetInstanceProcAddr` is looked up with `GetProcAddress`, and every other
-//! entry point comes from it or from `vkGetDeviceProcAddr`, as the loader
-//! documentation recommends. Nothing Vulkan is linked.
+//! The Khronos loader, installed with every Vulkan driver, is loaded at run
+//! time: `vulkan-1.dll` from System32 with `LoadLibraryExW`, or
+//! `libvulkan.so.1` with `dlopen` on Linux. Only `vkGetInstanceProcAddr` is
+//! looked up in it, and every other entry point comes from it or from
+//! `vkGetDeviceProcAddr`, as the loader documentation recommends. Nothing
+//! Vulkan is linked.
 //!
 //! `VKAPI_CALL` is `__stdcall` on Windows, which is `extern "system"` (and the
 //! plain C ABI on x64).
@@ -160,6 +161,7 @@ pub const ST_MEMORY_BARRIER: VkEnum = 46;
 pub const ST_SWAPCHAIN_CREATE_INFO_KHR: VkEnum = 1_000_001_000;
 pub const ST_PRESENT_INFO_KHR: VkEnum = 1_000_001_001;
 pub const ST_WIN32_SURFACE_CREATE_INFO_KHR: VkEnum = 1_000_009_000;
+pub const ST_WAYLAND_SURFACE_CREATE_INFO_KHR: VkEnum = 1_000_006_000;
 
 /// `VK_MAKE_API_VERSION(0, 1, 0, 0)`: major in bits 22..28.
 pub const VK_API_VERSION_1_0: u32 = 1 << 22;
@@ -261,6 +263,14 @@ pub const COMPOSITE_ALPHA_OPAQUE_BIT_KHR: VkFlags = 0x1;
 
 pub const KHR_SURFACE: &str = "VK_KHR_surface\0";
 pub const KHR_WIN32_SURFACE: &str = "VK_KHR_win32_surface\0";
+pub const KHR_WAYLAND_SURFACE: &str = "VK_KHR_wayland_surface\0";
+
+/// The surface extension of the window system this build draws on.
+#[cfg(windows)]
+pub const KHR_PLATFORM_SURFACE: &str = KHR_WIN32_SURFACE;
+/// The surface extension of the window system this build draws on.
+#[cfg(target_os = "linux")]
+pub const KHR_PLATFORM_SURFACE: &str = KHR_WAYLAND_SURFACE;
 pub const KHR_SWAPCHAIN: &str = "VK_KHR_swapchain\0";
 
 // ---------------------------------------------------------------- structures
@@ -936,6 +946,17 @@ pub struct VkWin32SurfaceCreateInfoKHR {
     pub hwnd: *mut c_void,
 }
 
+/// `vulkan_wayland.h`: `display` is a `struct wl_display *` and `surface` a
+/// `struct wl_surface *`, both from `libwayland-client`.
+#[repr(C)]
+pub struct VkWaylandSurfaceCreateInfoKHR {
+    pub sType: VkEnum,
+    pub pNext: *const c_void,
+    pub flags: VkFlags,
+    pub display: *mut c_void,
+    pub surface: *mut c_void,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct VkSurfaceCapabilitiesKHR {
@@ -1074,8 +1095,20 @@ fns!(SurfaceFns {
         fn(VkPhysicalDevice, VkSurfaceKHR, *mut u32, *mut VkSurfaceFormatKHR) -> VkResult;
     get_physical_device_surface_present_modes: "vkGetPhysicalDeviceSurfacePresentModesKHR" =
         fn(VkPhysicalDevice, VkSurfaceKHR, *mut u32, *mut VkEnum) -> VkResult;
+});
+
+// The one entry point that differs by window system, in a table of its own
+// so the rest of `SurfaceFns` is the same everywhere.
+#[cfg(windows)]
+fns!(PlatformSurfaceFns {
     create_win32_surface: "vkCreateWin32SurfaceKHR" =
         fn(VkInstance, *const VkWin32SurfaceCreateInfoKHR, Alloc, *mut VkSurfaceKHR) -> VkResult;
+});
+
+#[cfg(target_os = "linux")]
+fns!(PlatformSurfaceFns {
+    create_wayland_surface: "vkCreateWaylandSurfaceKHR" =
+        fn(VkInstance, *const VkWaylandSurfaceCreateInfoKHR, Alloc, *mut VkSurfaceKHR) -> VkResult;
 });
 
 fns!(DeviceFns {
@@ -1185,54 +1218,102 @@ fns!(SwapchainFns {
 
 // ------------------------------------------------------------------- loader
 
-type Hmodule = *mut c_void;
-const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
-
-#[link(name = "kernel32")]
-extern "system" {
-    fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> Hmodule;
-    fn GetProcAddress(module: Hmodule, name: *const u8) -> *mut c_void;
-    fn GetLastError() -> u32;
-}
-
 /// Why the loader could not be reached.
 pub enum LoadError {
-    /// `LoadLibraryExW` failed; the Win32 error code.
+    /// The library could not be loaded: the Win32 error code, or 0 on Linux,
+    /// where `dlopen` gives no code.
     Library(u32),
-    /// The DLL, or `vkGetInstanceProcAddr`, lacks this export.
+    /// The library, or `vkGetInstanceProcAddr`, lacks this export.
     Symbol(&'static str),
 }
 
-/// Load `vulkan-1.dll` from System32 and return `vkGetInstanceProcAddr`.
-///
-/// The module is never freed: it is reference-counted by Windows, cheap to
-/// keep, and unloading a driver stack under its own threads is a known crash.
-pub fn load() -> Result<PFN_vkGetInstanceProcAddr, LoadError> {
-    let name: Vec<u16> = "vulkan-1.dll\0".encode_utf16().collect();
-    // SAFETY: `name` is a NUL-terminated UTF-16 string that outlives the call;
-    // the reserved file handle is null as documented. Failure returns null.
-    let module = unsafe {
-        LoadLibraryExW(
-            name.as_ptr(),
-            std::ptr::null_mut(),
-            LOAD_LIBRARY_SEARCH_SYSTEM32,
-        )
-    };
-    if module.is_null() {
-        // SAFETY: a plain thread-local query, read straight after the failure.
-        return Err(LoadError::Library(unsafe { GetLastError() }));
+#[cfg(windows)]
+mod loader {
+    use super::{LoadError, PFN_vkGetInstanceProcAddr};
+    use std::ffi::c_void;
+
+    type Hmodule = *mut c_void;
+    const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> Hmodule;
+        fn GetProcAddress(module: Hmodule, name: *const u8) -> *mut c_void;
+        fn GetLastError() -> u32;
     }
-    // SAFETY: a live module handle and a NUL-terminated ASCII name; a missing
-    // export returns null, which is checked.
-    let p = unsafe { GetProcAddress(module, b"vkGetInstanceProcAddr\0".as_ptr()) };
-    if p.is_null() {
-        return Err(LoadError::Symbol("vkGetInstanceProcAddr"));
+
+    /// Load `vulkan-1.dll` from System32 and return `vkGetInstanceProcAddr`.
+    ///
+    /// The module is never freed: it is reference-counted by Windows, cheap
+    /// to keep, and unloading a driver stack under its own threads is a known
+    /// crash.
+    pub fn load() -> Result<PFN_vkGetInstanceProcAddr, LoadError> {
+        let name: Vec<u16> = "vulkan-1.dll\0".encode_utf16().collect();
+        // SAFETY: `name` is a NUL-terminated UTF-16 string that outlives the
+        // call; the reserved file handle is null as documented. Failure
+        // returns null.
+        let module = unsafe {
+            LoadLibraryExW(
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        };
+        if module.is_null() {
+            // SAFETY: a plain thread-local query, read straight after the
+            // failure.
+            return Err(LoadError::Library(unsafe { GetLastError() }));
+        }
+        // SAFETY: a live module handle and a NUL-terminated ASCII name; a
+        // missing export returns null, which is checked.
+        let p = unsafe { GetProcAddress(module, b"vkGetInstanceProcAddr\0".as_ptr()) };
+        if p.is_null() {
+            return Err(LoadError::Symbol("vkGetInstanceProcAddr"));
+        }
+        // SAFETY: a non-null export of vulkan-1.dll named
+        // vkGetInstanceProcAddr, whose prototype is
+        // `PFN_vkGetInstanceProcAddr`; code and data pointers are the same
+        // size on Windows.
+        Ok(unsafe { std::mem::transmute::<*mut c_void, PFN_vkGetInstanceProcAddr>(p) })
     }
-    // SAFETY: a non-null export of vulkan-1.dll named vkGetInstanceProcAddr,
-    // whose prototype is `PFN_vkGetInstanceProcAddr`; code and data pointers
-    // are the same size on Windows.
-    Ok(unsafe { std::mem::transmute::<*mut c_void, PFN_vkGetInstanceProcAddr>(p) })
 }
+
+#[cfg(target_os = "linux")]
+mod loader {
+    use super::{LoadError, PFN_vkGetInstanceProcAddr};
+    use std::ffi::{c_char, c_int, c_void};
+
+    const RTLD_NOW: c_int = 2;
+
+    extern "C" {
+        fn dlopen(name: *const c_char, flags: c_int) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
+    }
+
+    /// Load `libvulkan.so.1`, the Khronos loader every Vulkan driver package
+    /// installs, and return `vkGetInstanceProcAddr`. Never unloaded, for the
+    /// reason given on Windows.
+    pub fn load() -> Result<PFN_vkGetInstanceProcAddr, LoadError> {
+        // SAFETY: a NUL-terminated name; failure returns null.
+        let lib = unsafe { dlopen(b"libvulkan.so.1\0".as_ptr().cast(), RTLD_NOW) };
+        if lib.is_null() {
+            return Err(LoadError::Library(0));
+        }
+        // SAFETY: a live handle and a NUL-terminated name; a missing symbol
+        // returns null, which is checked.
+        let p = unsafe { dlsym(lib, b"vkGetInstanceProcAddr\0".as_ptr().cast()) };
+        if p.is_null() {
+            return Err(LoadError::Symbol("vkGetInstanceProcAddr"));
+        }
+        // SAFETY: a non-null export of the loader named
+        // vkGetInstanceProcAddr, whose prototype is
+        // `PFN_vkGetInstanceProcAddr`; code and data pointers are the same
+        // size on Linux.
+        Ok(unsafe { std::mem::transmute::<*mut c_void, PFN_vkGetInstanceProcAddr>(p) })
+    }
+}
+
+pub use loader::load;
 
 #[cfg(test)]
 mod tests {

@@ -1,7 +1,7 @@
 //! The Vulkan backend: a hand-bound, runtime-loaded Vulkan 1.0 renderer that
 //! draws a [`Frame`] with one instanced draw.
 //!
-//! `vulkan-1.dll` is loaded at run time (see `sys`); a machine without a
+//! The Vulkan loader is loaded at run time (see `sys`); a machine without a
 //! Vulkan driver gets an [`Error`], never a failed link or a panic. The
 //! shaders are the SPIR-V words of [`crate::spirv`]; there is no shader
 //! compiler and no third-party crate.
@@ -94,7 +94,8 @@ pub struct DrawStats {
 /// Everything that can go wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// `vulkan-1.dll` could not be loaded (no Vulkan driver). Win32 error code.
+    /// The Vulkan loader (`vulkan-1.dll`, `libvulkan.so.1`) could not be
+    /// loaded: no Vulkan driver. The Win32 error code; 0 on Linux.
     LibraryNotFound(u32),
     /// The loader lacks a required entry point (too old).
     MissingSymbol(&'static str),
@@ -109,7 +110,7 @@ pub enum Error {
     /// present to its surface and has `VK_KHR_swapchain`).
     NoSuitableDevice,
     /// The platform or surface lacks something this backend needs, such as
-    /// `VK_KHR_win32_surface` or a UNORM surface format.
+    /// the window system's surface extension or a UNORM surface format.
     Unsupported(&'static str),
     /// An argument this backend rejects before calling the driver.
     InvalidArgument(&'static str),
@@ -120,7 +121,7 @@ impl fmt::Display for Error {
         match self {
             Error::LibraryNotFound(code) => write!(
                 f,
-                "vulkan-1.dll could not be loaded (Win32 error {code}); is a Vulkan driver installed?"
+                "the Vulkan loader could not be loaded (error {code}); is a Vulkan driver installed?"
             ),
             Error::MissingSymbol(s) => write!(f, "the Vulkan loader has no entry point {s}"),
             Error::Vulkan { call, code } => {
@@ -171,6 +172,9 @@ fn c_name(bytes: &[u8]) -> String {
 struct Instance {
     fns: InstanceFns,
     surface_fns: Option<SurfaceFns>,
+    /// The window system's own surface constructor, loaded with
+    /// `surface_fns`.
+    platform_fns: Option<PlatformSurfaceFns>,
     handle: VkInstance,
     surface: VkSurfaceKHR,
 }
@@ -213,10 +217,12 @@ fn create_instance(window: bool) -> Result<Instance, Error> {
             // two-call idiom passes; the layer name is null (the loader).
             |n, p| unsafe { (entry.enumerate_instance_extension_properties)(null(), n, p) },
         )?;
-        for want in [KHR_SURFACE, KHR_WIN32_SURFACE] {
+        for want in [KHR_SURFACE, KHR_PLATFORM_SURFACE] {
             let name = want.trim_end_matches('\0');
             if !available.iter().any(|e| c_name(&e.extensionName) == name) {
-                return Err(Error::Unsupported("VK_KHR_surface / VK_KHR_win32_surface"));
+                return Err(Error::Unsupported(
+                    "VK_KHR_surface or the window system's surface extension",
+                ));
             }
             extensions.push(want.as_ptr());
         }
@@ -267,11 +273,14 @@ fn create_instance(window: bool) -> Result<Instance, Error> {
     let mut instance = Instance {
         fns,
         surface_fns: None,
+        platform_fns: None,
         handle,
         surface: NULL_HANDLE,
     };
     if window {
         instance.surface_fns = Some(SurfaceFns::load(lookup).map_err(Error::MissingSymbol)?);
+        instance.platform_fns =
+            Some(PlatformSurfaceFns::load(lookup).map_err(Error::MissingSymbol)?);
     }
     Ok(instance)
 }
@@ -429,6 +438,7 @@ impl VkRenderer {
     /// # Safety
     /// `hinstance` and `hwnd` must be the raw Win32 `HINSTANCE` and `HWND` of
     /// a live window, owned by the caller, that outlives the renderer.
+    #[cfg(windows)]
     pub unsafe fn for_window(
         hinstance: *mut c_void,
         hwnd: *mut c_void,
@@ -447,14 +457,68 @@ impl VkRenderer {
         };
         let mut surface = NULL_HANDLE;
         {
-            let sf = instance.surface_fns.as_ref().expect("loaded for a window");
+            let pf = instance.platform_fns.as_ref().expect("loaded for a window");
             // SAFETY: the caller guarantees a live window; `info` lives
             // across the call. On success the surface is owned by `instance`.
             check("vkCreateWin32SurfaceKHR", unsafe {
-                (sf.create_win32_surface)(instance.handle, &info, null(), &mut surface)
+                (pf.create_win32_surface)(instance.handle, &info, null(), &mut surface)
             })?;
         }
         instance.surface = surface;
+        VkRenderer::for_surface(instance, width, height, atlas, mode)
+    }
+
+    /// A renderer presenting to a Wayland surface through a swapchain.
+    ///
+    /// A Wayland surface has no size of its own: the swapchain is
+    /// `width x height`, and [`VkRenderer::resize`] follows the window's
+    /// configured size. A `mode` the surface does not offer falls back to
+    /// [`PresentMode::Fifo`].
+    ///
+    /// # Safety
+    /// `display` and `surface` must be the `wl_display` and `wl_surface` of
+    /// a live window, owned by the caller, that outlives the renderer. The
+    /// driver sends requests on that display from the calling thread.
+    #[cfg(target_os = "linux")]
+    pub unsafe fn for_wayland(
+        display: *mut c_void,
+        surface: *mut c_void,
+        width: u32,
+        height: u32,
+        atlas: &Atlas,
+        mode: PresentMode,
+    ) -> Result<VkRenderer, Error> {
+        let mut instance = create_instance(true)?;
+        let info = VkWaylandSurfaceCreateInfoKHR {
+            sType: ST_WAYLAND_SURFACE_CREATE_INFO_KHR,
+            pNext: null(),
+            flags: 0,
+            display,
+            surface,
+        };
+        let mut vk_surface = NULL_HANDLE;
+        {
+            let pf = instance.platform_fns.as_ref().expect("loaded for a window");
+            // SAFETY: the caller guarantees a live display and surface;
+            // `info` lives across the call. On success the surface is owned
+            // by `instance`.
+            check("vkCreateWaylandSurfaceKHR", unsafe {
+                (pf.create_wayland_surface)(instance.handle, &info, null(), &mut vk_surface)
+            })?;
+        }
+        instance.surface = vk_surface;
+        VkRenderer::for_surface(instance, width, height, atlas, mode)
+    }
+
+    /// The rest of a windowed renderer, once `instance` owns its surface.
+    fn for_surface(
+        instance: Instance,
+        width: u32,
+        height: u32,
+        atlas: &Atlas,
+        mode: PresentMode,
+    ) -> Result<VkRenderer, Error> {
+        let surface = instance.surface;
         let sf = instance.surface_fns.as_ref().expect("loaded for a window");
 
         // The format decides the render pass, so pick it before building:
@@ -2172,19 +2236,26 @@ fn pick_device(
         .ok_or(Error::NoSuitableDevice)
 }
 
+/// The window type of the system this build draws on.
+#[cfg(windows)]
+pub type PlatformWindow = crate::win::Window;
+/// The window type of the system this build draws on.
+#[cfg(target_os = "linux")]
+pub type PlatformWindow = crate::wl::Window;
+
 /// A window and the Vulkan renderer drawing into it, owned together so the
 /// renderer can never outlive the window its surface was made for. The safe
 /// way to put [`VkRenderer`] on screen.
 pub struct VkWindow {
     // Declared first so it drops first: the surface belongs to `window`.
     renderer: VkRenderer,
-    window: crate::win::Window,
+    window: PlatformWindow,
 }
 
 impl VkWindow {
     /// Make a renderer for `window` at its current client size.
     pub fn new(
-        window: crate::win::Window,
+        window: PlatformWindow,
         atlas: &Atlas,
         mode: PresentMode,
     ) -> Result<VkWindow, Error> {
@@ -2194,17 +2265,23 @@ impl VkWindow {
     /// As [`VkWindow::new`], but a failure hands the window back, so the
     /// caller can draw into it another way (after a lost device, say).
     pub fn try_new(
-        window: crate::win::Window,
+        window: PlatformWindow,
         atlas: &Atlas,
         mode: PresentMode,
-    ) -> Result<VkWindow, (Error, crate::win::Window)> {
+    ) -> Result<VkWindow, (Error, PlatformWindow)> {
         let (w, h) = window.client_size();
         // SAFETY: the handles are `window`'s, and `window` is moved into the
         // result next to the renderer, which drops first (field order); on
         // failure the partly built renderer is gone before `window` returns.
-        match unsafe {
-            VkRenderer::for_window(window.hinstance(), window.hwnd(), w, h, atlas, mode)
-        } {
+        #[cfg(windows)]
+        let made =
+            unsafe { VkRenderer::for_window(window.hinstance(), window.hwnd(), w, h, atlas, mode) };
+        // SAFETY: as above, for the window's Wayland display and surface.
+        #[cfg(target_os = "linux")]
+        let made = unsafe {
+            VkRenderer::for_wayland(window.display(), window.surface(), w, h, atlas, mode)
+        };
+        match made {
             Ok(renderer) => Ok(VkWindow { renderer, window }),
             Err(e) => Err((e, window)),
         }
@@ -2212,19 +2289,19 @@ impl VkWindow {
 
     /// Tear the renderer down and keep the window: after the device is lost
     /// (`VK_ERROR_DEVICE_LOST`), before building a new one on it.
-    pub fn into_window(self) -> crate::win::Window {
+    pub fn into_window(self) -> PlatformWindow {
         let VkWindow { renderer, window } = self;
         drop(renderer);
         window
     }
 
     /// The window.
-    pub fn window(&self) -> &crate::win::Window {
+    pub fn window(&self) -> &PlatformWindow {
         &self.window
     }
 
     /// The window, for pumping its events.
-    pub fn window_mut(&mut self) -> &mut crate::win::Window {
+    pub fn window_mut(&mut self) -> &mut PlatformWindow {
         &mut self.window
     }
 

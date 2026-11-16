@@ -150,7 +150,21 @@ pub fn with_log_dir(settings: &str, dir: &Path) -> String {
     out
 }
 
-/// `%LOCALAPPDATA%\foldwave`, where settings and default logs live.
+/// The folder a user's own program data goes under: `%LOCALAPPDATA%` on
+/// Windows; on Linux `$XDG_DATA_HOME`, else `~/.local/share`, as the XDG
+/// base-directory convention has it. `None` when the environment names
+/// neither.
+pub fn user_base() -> Option<OsString> {
+    if cfg!(windows) {
+        return std::env::var_os("LOCALAPPDATA");
+    }
+    let set = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+    set("XDG_DATA_HOME")
+        .or_else(|| set("HOME").map(|home| PathBuf::from(home).join(".local").join("share").into()))
+}
+
+/// `foldwave` under [`user_base`] (`%LOCALAPPDATA%\foldwave`,
+/// `~/.local/share/foldwave`), where settings and default logs live.
 pub fn app_dir(local_app_data: Option<OsString>) -> Option<PathBuf> {
     local_app_data.map(|d| PathBuf::from(d).join("foldwave"))
 }

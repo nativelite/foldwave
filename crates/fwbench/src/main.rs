@@ -1346,21 +1346,39 @@ mod tests {
     }
 }
 
-/// `render` mode: a real window, one backend.
+/// The glyphs `render` draws with: Consolas on Windows (or GDI's, with
+/// `--gdi`), and the JetBrains Mono compiled into fwrender on Linux, which
+/// has no font every machine carries.
 #[cfg(windows)]
+fn render_rasterizer(r: &RenderArgs) -> io::Result<Box<dyn fwrender::Rasterizer>> {
+    if r.gdi {
+        return fwrender::win::GdiRasterizer::new(&r.font, r.px).map(|g| Box::new(g) as _);
+    }
+    fwrender::FontRasterizer::consolas(r.px as f32).map(|mut f| {
+        if r.no_sharpen {
+            f.set_sharpening(fwrender::Sharpening::OFF);
+        }
+        Box::new(f) as _
+    })
+}
+
+/// As above.
+#[cfg(target_os = "linux")]
+fn render_rasterizer(r: &RenderArgs) -> io::Result<Box<dyn fwrender::Rasterizer>> {
+    fwrender::FontRasterizer::from_family(&fwrender::builtin_default(), r.px as f32).map(|mut f| {
+        if r.no_sharpen {
+            f.set_sharpening(fwrender::Sharpening::OFF);
+        }
+        Box::new(f) as _
+    })
+}
+
+/// `render` mode: a real window, one backend.
+#[cfg(any(windows, target_os = "linux"))]
 fn run_render(args: &Args) -> i32 {
     use fwbench::render;
     let r = &args.render;
-    let raster: io::Result<Box<dyn fwrender::Rasterizer>> = if r.gdi {
-        fwrender::win::GdiRasterizer::new(&r.font, r.px).map(|g| Box::new(g) as _)
-    } else {
-        fwrender::FontRasterizer::consolas(r.px as f32).map(|mut f| {
-            if r.no_sharpen {
-                f.set_sharpening(fwrender::Sharpening::OFF);
-            }
-            Box::new(f) as _
-        })
-    };
+    let raster = render_rasterizer(r);
     let mut raster = match raster {
         Ok(g) => g,
         Err(e) => {
@@ -1399,9 +1417,9 @@ fn run_render(args: &Args) -> i32 {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 fn run_render(_: &Args) -> i32 {
-    eprintln!("fwbench: render mode is Windows-only in the M3 spike");
+    eprintln!("fwbench: render mode needs a window, built for Windows and Linux so far");
     1
 }
 
