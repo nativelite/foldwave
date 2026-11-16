@@ -5804,26 +5804,28 @@ keys:
                                     clear(&mut selection, &panes);
                                 }
                                 // No text. Files copied in Explorer paste
-                                // as their paths; anything else (an image)
-                                // is the program's to read, so it gets the
-                                // key: Claude Code attaches a clipboard
-                                // image on Ctrl+V.
+                                // as their paths; an image is the
+                                // program's to read, so it gets the key:
+                                // Claude Code attaches a clipboard image on
+                                // Ctrl+V. Anything else pastes nothing.
                                 Ok(None) => {
                                     let files =
                                         surface.window().clipboard_files().unwrap_or_default();
                                     if files.is_empty() {
-                                        input.push(0x16);
+                                        if surface.window().clipboard_has_image() {
+                                            input.push(0x16);
+                                        }
                                     } else {
                                         let p = &panes[fi];
                                         let bracketed =
                                             p.shared.term.lock().unwrap().bracketed_paste();
-                                        let text =
-                                            select::paths_text(&files, select::is_wsl(&p.program));
+                                        let text = select::paths_text(&files, &p.program);
                                         input.extend_from_slice(&select::paste_bytes(
                                             &text, bracketed,
                                         ));
                                     }
                                     panes[fi].back = 0;
+                                    clear(&mut selection, &panes);
                                 }
                                 Err(e) => say!("fwterm: paste: {e}"),
                             }
@@ -6215,12 +6217,13 @@ keys:
                         if let Some(p) = panes.iter_mut().find(|p| p.id == over) {
                             if !files.is_empty() {
                                 let bracketed = p.shared.term.lock().unwrap().bracketed_paste();
-                                let text = select::paths_text(&files, select::is_wsl(&p.program));
+                                let text = select::paths_text(&files, &p.program);
                                 let bytes = select::paste_bytes(&text, bracketed);
                                 let _ = p.session.lock().unwrap().write(&bytes);
                                 p.back = 0;
                             }
                         }
+                        clear(&mut selection, &panes);
                     }
                     Event::Resized(w, h) if w > 0 && h > 0 => {
                         if let Err(e) = surface.resize(w, h) {

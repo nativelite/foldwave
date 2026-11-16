@@ -869,7 +869,14 @@ impl Window {
         }
     }
 
-    /// The paths of the files dropped on the window since the last call
+    /// Whether the clipboard holds an image (a bitmap: a screenshot, a
+    /// picture copied from a program).
+    pub fn clipboard_has_image(&self) -> bool {
+        // SAFETY: takes a format number; no preconditions.
+        unsafe { IsClipboardFormatAvailable(CF_DIB) != 0 }
+    }
+
+    /// The paths of the files of the latest drop on the window, taken once
     /// (see [`Event::Drop`]).
     pub fn take_dropped(&self) -> Vec<String> {
         std::mem::take(
@@ -1168,11 +1175,9 @@ unsafe extern "system" fn wnd_proc(hwnd: Hwnd, msg: u32, wparam: usize, lparam: 
                 paths
             };
             if !paths.is_empty() {
-                shared
-                    .dropped
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .extend(paths);
+                // The latest drop's paths only: one the caller never took
+                // (a drop it ignored) must not ride along with this one.
+                *shared.dropped.lock().unwrap_or_else(|p| p.into_inner()) = paths;
                 push(Event::Drop(at.x, at.y));
             }
             0

@@ -195,21 +195,40 @@ fn wsl_path(path: &str) -> String {
     path.to_string()
 }
 
+/// A pane program's file name without `.exe`, in lower case.
+fn program_name(program: &[String]) -> String {
+    let first = program.first().map_or("", String::as_str);
+    let name = first.rsplit(['\\', '/']).next().unwrap_or(first);
+    let name = name.to_ascii_lowercase();
+    name.strip_suffix(".exe").unwrap_or(&name).to_string()
+}
+
 /// Files dropped on a pane, or copied in Explorer and pasted, as the text
-/// to paste: their paths, separated by spaces, each quoted if it holds
-/// anything but plain path characters. For a pane running WSL (`wsl`) the
-/// paths are the ones Linux has for them, in single quotes; else Windows
-/// paths in double quotes.
-pub fn paths_text(paths: &[String], wsl: bool) -> String {
-    let plain = |c: char| c.is_alphanumeric() || r"\/:._-+@%~".contains(c);
+/// to paste into a pane running `program`: their paths, separated by
+/// spaces, each quoted the way that program's shell takes literally if it
+/// holds anything but plain path characters. WSL (`wsl`) gets the paths
+/// Linux has for them. WSL and other POSIX shells (`bash`, `sh`, `zsh`,
+/// `ssh`) get single quotes, and a backslash is not plain there;
+/// PowerShell gets single quotes too, where a double-quoted `$` would
+/// expand; anything else (`cmd`) gets double quotes.
+pub fn paths_text(paths: &[String], program: &[String]) -> String {
+    let name = program_name(program);
+    let wsl = is_wsl(program);
+    let posix = wsl || matches!(name.as_str(), "bash" | "sh" | "zsh" | "ssh");
+    let powershell = matches!(name.as_str(), "powershell" | "pwsh");
+    let plain = |c: char| c.is_alphanumeric() || r"/:._-+@%~".contains(c) || (c == '\\' && !posix);
     paths
         .iter()
         .map(|p| {
             let p = if wsl { wsl_path(p) } else { p.clone() };
-            match (p.chars().all(plain), wsl) {
-                (true, _) => p,
-                (false, true) => format!("'{}'", p.replace('\'', r"'\''")),
-                (false, false) => format!("\"{p}\""),
+            if p.chars().all(plain) {
+                p
+            } else if posix {
+                format!("'{}'", p.replace('\'', r"'\''"))
+            } else if powershell {
+                format!("'{}'", p.replace('\'', "''"))
+            } else {
+                format!("\"{p}\"")
             }
         })
         .collect::<Vec<_>>()
@@ -360,19 +379,31 @@ mod tests {
     fn dropped_files_paste_as_paths_the_panes_program_can_read() {
         let files = [
             r"C:\Users\me\shot.png".to_string(),
-            r"D:\My Pictures\it's.png".to_string(),
+            r"D:\My Pictures\it's $(x).png".to_string(),
             r"\\wsl.localhost\Ubuntu\home\me\a b.txt".to_string(),
             r"\\server\share\x.txt".to_string(),
         ];
-        // A Windows program: the paths as they are, quoted where needed.
+        let run = |p: &str| vec![p.to_string()];
+        // cmd: the paths as they are, in double quotes where needed.
         assert_eq!(
-            paths_text(&files, false),
-            r#"C:\Users\me\shot.png "D:\My Pictures\it's.png" "\\wsl.localhost\Ubuntu\home\me\a b.txt" \\server\share\x.txt"#
+            paths_text(&files, &run("cmd.exe")),
+            r#"C:\Users\me\shot.png "D:\My Pictures\it's $(x).png" "\\wsl.localhost\Ubuntu\home\me\a b.txt" \\server\share\x.txt"#
         );
-        // WSL: drives under /mnt, a distribution's files by their own path.
+        // PowerShell: single quotes, so `$(x)` is not run.
         assert_eq!(
-            paths_text(&files, true),
-            r"/mnt/c/Users/me/shot.png '/mnt/d/My Pictures/it'\''s.png' '/home/me/a b.txt' \\server\share\x.txt"
+            paths_text(&files[..2], &run(r"C:\Program Files\PowerShell\7\pwsh.exe")),
+            r"C:\Users\me\shot.png 'D:\My Pictures\it''s $(x).png'"
+        );
+        // WSL: drives under /mnt, a distribution's files by their own path;
+        // a path left with backslashes is quoted, or the shell eats them.
+        assert_eq!(
+            paths_text(&files, &run("wsl.exe")),
+            r"/mnt/c/Users/me/shot.png '/mnt/d/My Pictures/it'\''s $(x).png' '/home/me/a b.txt' '\\server\share\x.txt'"
+        );
+        // Another POSIX shell: Windows paths, quoted for their backslashes.
+        assert_eq!(
+            paths_text(&files[..1], &run("bash.exe")),
+            r"'C:\Users\me\shot.png'"
         );
         assert!(is_wsl(&["wsl.exe".into(), "-d".into(), "Ubuntu".into()]));
         assert!(is_wsl(&[r"C:\Windows\System32\WSL.EXE".into()]));

@@ -330,6 +330,7 @@ extern "system" {
     /// On success the system owns `data`; on failure the caller still does.
     pub fn SetClipboardData(format: u32, data: Handle) -> Handle;
     pub fn GetClipboardData(format: u32) -> Handle;
+    pub fn IsClipboardFormatAvailable(format: u32) -> Bool;
     pub fn GetDC(hwnd: Hwnd) -> Hdc;
     pub fn ReleaseDC(hwnd: Hwnd, hdc: Hdc) -> i32;
     // Windows 10 1607+ (1703+ for the V2 context); foldwave targets Windows 11.
@@ -579,6 +580,8 @@ extern "system" {
 /// Files were dropped on a window that accepts them (`DragAcceptFiles`);
 /// `wparam` is the `HDROP`, released with `DragFinish`.
 pub const WM_DROPFILES: u32 = 0x0233;
+/// Clipboard format: a device-independent bitmap (an image).
+pub const CF_DIB: u32 = 8;
 /// Clipboard format: files copied in Explorer, as an `HDROP`.
 pub const CF_HDROP: u32 = 15;
 
