@@ -222,3 +222,118 @@ Terminal (Direct2D), for remote desktop or no GPU.
 ### Shell integration
 - **OSC 133** (semantic prompts proposal, Per Bothner): A/N/P prompt start, B/I end, C command start, D command end — https://gitlab.freedesktop.org/Per_Bothner/specifications/-/blob/master/proposals/semantic-prompts.md
 - **OSC 633** (VS Code): A/B/C/D, plus E (command line with a nonce) and more; VS Code also accepts OSC 133 A–D — https://code.visualstudio.com/docs/terminal/shell-integration
+
+## The field on 2026-11-16
+
+Input to [`philosophy.md`](philosophy.md). **How these were checked:** the
+session could reach only GitHub, so each fact is from a project's own
+repository, release notes or discussion, read through a summarising fetcher.
+Re-check an exact figure against its URL before quoting it outside this file.
+**Unverified** marks a fact seen only in a search summary. Entries above that
+this section supersedes are listed at its end; they are left as written.
+
+### What nobody measures
+
+- **Input latency is unmeasured where it matters most.** Ghostty's maintainer
+  (2026-01-21): input latency is "the one metric we have never once" reliably
+  measured or optimised. In the same thread a user's Typometer run gave Ghostty
+  1.2.3 about 24 ms average and Zutty about 7 ms —
+  https://github.com/ghostty-org/ghostty/discussions/4837
+- **Typometer** injects OS key events and reads back a screen pixel, so it
+  leaves out the keyboard, USB polling and display scanout. Its README states
+  the compositor floor: Windows' composition adds at least one frame (about
+  17 ms at 60 Hz) and quantises results —
+  https://raw.githubusercontent.com/pavelfatin/typometer/master/README.md
+- **One camera study on Wayland** (240 fps, n = 5, ThinkPad T430, Hyprland),
+  average key-light to character: foot 15.0 ms, Alacritty 16.7, kitty 18.3,
+  WezTerm 30.8, Ghostty 38.3. Its own throughput ranking (kitty first in
+  DOOM-fire, foot first in `cat`) does not match its latency ranking. Its
+  memory column: foot 43 MB, Alacritty 75, kitty 91, WezTerm 130, Ghostty 174 —
+  https://github.com/vizenc/terminal-benchmark
+- kitty ships a 3 ms `input_delay` by default and documents that lower latency
+  (`input_delay 0`, `repaint_delay 2`, `sync_to_monitor no`) costs energy —
+  https://raw.githubusercontent.com/kovidgoyal/kitty/master/docs/performance.rst
+- Windows Terminal's AtlasEngine paces on the DXGI frame-latency waitable
+  object (PR #20723, 2026-09-26, fixed a full present queue after display-off)
+  — https://github.com/microsoft/terminal/pull/20723
+- **Not found for any terminal:** idle wakeups per second, watts, memory per
+  pane, or install size, published with a method. kitty uses CPU % while
+  scrolling as its energy proxy (performance.rst above).
+- **Unverified, not fetched:** Dan Luu's latency table
+  (https://danluu.com/term-latency/), Pavel Fatin's article
+  (https://pavelfatin.com/typing-with-pleasure/), and Chad Austin's 240 Hz
+  camera study on Windows (https://chadaustin.me/2024/02/windows-terminal-latency/:
+  conhost about 33 ms, Windows Terminal 1.18 and WezTerm about 67 ms).
+
+### What the benchmarks in use leave out
+
+| Benchmark | Measures | Leaves out | Source |
+| --- | --- | --- | --- |
+| vtebench | how fast the terminal reads its pty | frames, latency (its own disclaimer) | https://raw.githubusercontent.com/alacritty/vtebench/master/README.md |
+| kitty `kitten __benchmark__` | parser MB/s, rendering suppressed by default | everything after the parser | https://raw.githubusercontent.com/kovidgoyal/kitty/master/docs/performance.rst |
+| DOOM-fire-zig | frames per second of a full-screen animation; self-described as unscientific | latency, memory, energy | https://raw.githubusercontent.com/const-void/DOOM-fire-zig/master/README.md |
+| Ghostty's release figures | replay of about 4 GB of asciinema recordings; lock-hold time per frame | latency (above) | https://raw.githubusercontent.com/ghostty-org/website/main/docs/install/release-notes/1-3-0.mdx |
+
+None measures key-to-photon latency, frame pacing under load, memory or energy.
+
+### Where the others moved
+
+- **Ghostty 1.4.0 (2026-10-27).** Idle scrollback pages are compressed in
+  memory (70–90 % less physical memory for text); the limit is in bytes,
+  default 50 MB, and may be `unlimited`; still in memory. ASCII parsing
+  128 → 725 MB/s on an M4 Max. "The Ghostty GUI has no Windows roadmap anymore";
+  `libghostty-vt` reached 1.0 (2026-11-06) and builds on Windows —
+  https://raw.githubusercontent.com/ghostty-org/website/main/docs/install/release-notes/1-4-0.mdx
+  - Scrollback on disk: marked "Yes" by a collaborator on 2026-04-28, needing
+    "an efficient, migratable format"; no release has it —
+    https://github.com/ghostty-org/ghostty/discussions/8593
+- **kitty 0.50.0 (2026-11-03)** implements the Program Status Protocol, OSC
+  7501 (working, finished, failed, blocked on the user), and restores sessions
+  with their scrollback after logout. 0.49.0 added an AVX-512 UTF-8 path —
+  https://raw.githubusercontent.com/kovidgoyal/kitty/master/docs/changelog.rst
+- **Windows Terminal 1.25** (stable): the kitty keyboard protocol, and window
+  persistence with or without scrollback. Its ConPTY no longer waits for the
+  Device Attributes reply at start (#20536), which E2 above ran into on 1.24.
+  1.26 (preview): workspaces, opt-in OSC 777 notifications. No agent features —
+  https://github.com/microsoft/terminal/releases/tag/v1.25.2733.0,
+  https://github.com/microsoft/terminal/releases/tag/v1.26.2734.0
+- **Warp** is open source (UI crates MIT, the rest AGPL-3.0) and calls itself
+  "an agentic development environment, born out of the terminal" —
+  https://raw.githubusercontent.com/warpdotdev/Warp/master/README.md
+- **Contour 0.8.0 (2026-10-23)**: command blocks with exit marks and folding.
+  0.9.0 (in development): daemon-first sessions and an MCP server —
+  https://raw.githubusercontent.com/contour-terminal/contour/master/metainfo.xml
+- **Zed** runs parallel agents as threads, one git worktree each, a thread
+  being its own agent, an external one or a terminal —
+  https://raw.githubusercontent.com/zed-industries/zed/main/docs/src/ai/parallel-agents.md
+- **Wave** is built on Electron —
+  https://raw.githubusercontent.com/wavetermdev/waveterm/main/package.json
+- **Still true:** no surveyed terminal pages scrollback to disk while running,
+  or indexes it. Ghostty compresses in memory; kitty and Windows Terminal save
+  at session end; Contour keeps history in a daemon.
+
+### Protocols a terminal is judged on in 2026
+
+| Protocol | Who has it | Source |
+| --- | --- | --- |
+| Kitty keyboard protocol | Alacritty, foot, Ghostty, iTerm2, Windows Terminal 1.25, Rio, Warp, WezTerm, xterm.js | https://raw.githubusercontent.com/kovidgoyal/kitty/master/docs/keyboard-protocol.rst |
+| Synchronized output, mode 2026 | Alacritty, Contour, foot, Ghostty, iTerm2, kitty, mintty, Warp, WezTerm, Windows Terminal, xterm.js | https://raw.githubusercontent.com/contour-terminal/vt-extensions/master/synchronized-output.md |
+| In-band resize, mode 2048 | foot, Ghostty, iTerm2, kitty, Contour | https://gist.github.com/rockorager/e695fb2924d36b2bcf1fff4a3704bd83 |
+| Program status, OSC 7501 | kitty 0.50.0; libghostty parses it | kitty changelog above |
+| Text sizing, OSC 66 | kitty, Contour | https://raw.githubusercontent.com/kovidgoyal/kitty/master/docs/text-sizing-protocol.rst |
+| What a modern shell probes (fish) | OSC 133 with click events, OSC 7, 8, 52, kitty keyboard, modes 2004, 1004, 2031, XTVERSION, XTGETTCAP | https://raw.githubusercontent.com/fish-shell/fish-shell/master/doc_src/terminal-compatibility.rst |
+
+Where fwterm stands on each row has not been audited; the engine crates that
+answer it (`vterm`, `ansi`) are in other repositories.
+
+### Entries above that this supersedes
+
+- Ghostty: compression has shipped; `scrollback-limit` is now
+  `scrollback-limit-bytes` and accepts `unlimited`; the C API is released.
+- Windows Terminal: stable is 1.25, not the 1.24 observed on the reference
+  machine; E2's Device Attributes finding should be re-run on a 1.25
+  OpenConsole.
+- OSC 9;4: Microsoft's page calls state 4 "Warning" —
+  https://raw.githubusercontent.com/MicrosoftDocs/terminal/main/TerminalDocs/tutorials/progress-bar-sequences.md
+- Alacritty and OSC 133: its escapes manual does not list it —
+  https://raw.githubusercontent.com/alacritty/alacritty/master/extra/man/alacritty-escapes.7.scd

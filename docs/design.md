@@ -8,6 +8,11 @@
 > [`compute.md`](compute.md), each with a source. Competitors across the whole
 > suite (atrium + rationale + foldwave) are in
 > [competitive-landscape.md](https://github.com/nativelite/ops/blob/main/roadmap/competitive-landscape.md) in nativelite/ops.
+>
+> A review of foldwave as built on 2026-11-16, and a proposed direction for after
+> M5 (what "best" means once the §4 targets are met, experiments E7 to E16, and
+> the founder decisions they need), is in [`philosophy.md`](philosophy.md). It
+> is a proposal and changes nothing here.
 
 ## 1. The idea
 

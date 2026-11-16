@@ -304,3 +304,222 @@ panelog's own. At 64 MiB per launch: 13.8 GiB/s with transfers, 2.2× all 16
 CPU threads, at about 1/30 of their CPU time, and fwterm's frames unchanged
 beside it. Numbers are in design §8.7a. This follows E1's rule: whole batches
 of at least 4 MiB.
+
+## OS mechanisms for placing work (researched 2026-11-16)
+
+Input to [`philosophy.md`](philosophy.md). The question: beyond "which device",
+what does each operating system offer for saying *how cheaply* a piece of work
+should run, for giving memory back, and for getting a frame to the display
+sooner? Every row says whether our own FFI to a library the OS ships reaches it.
+
+**How these were checked.** The session that researched this could reach only
+GitHub, so Microsoft Learn pages were read from the `MicrosoftDocs` repositories
+they are built from, and Khronos pages from `KhronosGroup/Vulkan-Docs`. The URL
+given is the one fetched. **Unverified** marks a fact seen only in a search
+summary. Nothing in this section has been measured on the reference machine;
+the experiments that would are in [`philosophy.md`](philosophy.md).
+
+### Windows
+
+**Efficiency classes (all `kernel32.dll`).**
+
+| Mechanism | What the documentation says | Fit for foldwave | Source |
+| --- | --- | --- | --- |
+| EcoQoS, per thread: `SetThreadInformation(ThreadPowerThrottling)` with `THREAD_POWER_THROTTLING_EXECUTION_SPEED` | Eco "always selects most efficient CPU frequency and schedules to efficient cores" (Windows 11) | indexer, compressor, catch-up replay and retention threads: E-cores and low clocks without pinning | https://raw.githubusercontent.com/MicrosoftDocs/win32/docs/desktop-src/ProcThread/quality-of-service.md, https://raw.githubusercontent.com/MicrosoftDocs/sdk-api/docs/sdk-api-src/content/processthreadsapi/nf-processthreadsapi-setthreadinformation.md |
+| EcoQoS, per process: `SetProcessInformation(ProcessPowerThrottling)` | for work "not contributing to the foreground user experience"; before Windows 11 it maps to LowQoS | a hidden pane's host | https://raw.githubusercontent.com/MicrosoftDocs/sdk-api/docs/sdk-api-src/content/processthreadsapi/nf-processthreadsapi-setprocessinformation.md |
+| QoS follows the window | processes that own a window "or are descendants of window owning processes" get High in focus, Medium when visible, Low when minimized or fully occluded | every agent under fwterm inherits fwterm's window state: a minimized foldwave may slow its agents. Whether this crosses a ConPTY or job boundary is **unverified** and worth measuring | quality-of-service.md above |
+| Background mode: `SetThreadPriority(THREAD_MODE_BACKGROUND_BEGIN)` | lowers the thread's "resource scheduling priorities"; such a thread should avoid shared locks, heaps and handles (priority inversion) | an alternative to EcoQoS for threads that also do disk I/O | https://raw.githubusercontent.com/MicrosoftDocs/sdk-api/docs/sdk-api-src/content/processthreadsapi/nf-processthreadsapi-setthreadpriority.md |
+| I/O priority per handle: `SetFileInformationByHandle(FileIoPriorityHintInfo)`, `IoPriorityHintVeryLow` | "the system uses this value for background I/O"; a hint the driver may ignore | retention deletes, signature rebuilds, cold-segment compression | https://raw.githubusercontent.com/MicrosoftDocs/sdk-api/docs/sdk-api-src/content/winbase/ns-winbase-file_io_priority_hint_info.md |
+| Timer resolution | from Windows 11, a fully occluded or minimized window-owning process is not guaranteed better than the default resolution; `PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION` controls it | frame pacing uses a timer (§11 row 4); behaviour while occluded is untested | https://raw.githubusercontent.com/MicrosoftDocs/sdk-api/docs/sdk-api-src/content/timeapi/nf-timeapi-timebeginperiod.md |
+
+- Microsoft's own energy claim for EcoQoS, "up to 90 % reduction in CPU power
+  consumption", is **unverified** here (search summary of
+  https://devblogs.microsoft.com/sustainable-software/introducing-ecoqos/).
+- Design §8.8 measured that *pinning* threads to P-cores did not help. EcoQoS is
+  the opposite request (keep this work off the fast cores) and is untested.
+
+**Memory give-back (all `kernel32.dll`).**
+
+| Mechanism | Contract | Fit | Source |
+| --- | --- | --- | --- |
+| `OfferVirtualMemory` / `ReclaimVirtualMemory` | offered pages leave the working set and are never written to the pagefile; reclaim says whether the system discarded them. "Only… if the application does not need or can regenerate the data" | a shed pane's frozen emulator and history, which the log rebuilds (§8.8) | https://raw.githubusercontent.com/MicrosoftDocs/sdk-api/docs/sdk-api-src/content/memoryapi/nf-memoryapi-offervirtualmemory.md |
+| `DiscardVirtualMemory` | contents become undefined, the region stays committed | freed history chunks | https://raw.githubusercontent.com/MicrosoftDocs/sdk-api/docs/sdk-api-src/content/memoryapi/nf-memoryapi-discardvirtualmemory.md |
+| Memory priority (`ProcessMemoryPriority`, `ThreadMemoryPriority`, 1–5) | "pages with lower memory priority are trimmed before pages with higher" | hidden panes' hosts, the indexer | https://raw.githubusercontent.com/MicrosoftDocs/sdk-api/docs/sdk-api-src/content/processthreadsapi/ns-processthreadsapi-memory_priority_information.md |
+| `CreateMemoryResourceNotification` | a waitable handle that signals low memory | the governor's memory input, with no polling | https://raw.githubusercontent.com/MicrosoftDocs/sdk-api/docs/sdk-api-src/content/memoryapi/nf-memoryapi-creatememoryresourcenotification.md |
+| Large pages (`MEM_LARGE_PAGES`) | needs `SeLockMemoryPrivilege`; nonpageable and "not subject to job limits" | **out**: it cannot be given back and escapes the pane host's job | https://raw.githubusercontent.com/MicrosoftDocs/win32/docs/desktop-src/Memory/large-page-support.md |
+
+**Storage.**
+
+- **Dev Drive.** A ReFS volume on which Defender scans asynchronously once the
+  drive is trusted ("performance mode"). 50 GB minimum; an existing volume
+  cannot be converted; not C: —
+  https://raw.githubusercontent.com/MicrosoftDocs/windows-dev-docs/docs/hub/dev-drive/index.md
+  - An application can detect one: `FSCTL_QUERY_PERSISTENT_VOLUME_STATE`
+    returns `PERSISTENT_VOLUME_STATE_DEV_VOLUME` (0x2000) and
+    `PERSISTENT_VOLUME_STATE_TRUSTED_VOLUME` (0x4000), through
+    `DeviceIoControl` in `kernel32.dll` —
+    https://raw.githubusercontent.com/MicrosoftDocs/windows-driver-docs-ddi/staging/wdk-ddi-src/content/ntifs/ns-ntifs-_file_fs_persistent_volume_information.md
+  - Microsoft's "up to 30 %" faster builds is **unverified** (search summary of
+    https://blogs.windows.com/windowsdeveloper/2023/06/01/dev-drive-performance-security-and-control-for-developers/).
+  - Why it matters: E3 ([design §8.7b](design.md)) measured Defender at ~14 %
+    of the machine during an 8-agent session. Those are the user's worktrees,
+    not foldwave's files, so foldwave can report it, not change it.
+  - Putting *logs* on ReFS would change the measured basis: E6 and the
+    write-through figures are NTFS.
+- **IoRing** (`CreateIoRing`, `BuildIoRingReadFile`; Windows 11 build 22000;
+  `kernel32.dll`): the fetched documentation lists read, register and cancel
+  operations only. Write and flush operations in later builds are
+  **unverified**. A candidate for batched reads in search and replay, not for
+  the writer, which keeps one write in flight by design (§4.1) —
+  https://raw.githubusercontent.com/MicrosoftDocs/sdk-api/docs/sdk-api-src/content/ioringapi/nf-ioringapi-createioring.md
+- **`SetFileValidData`: out.** Needs an administrator privilege, and the page
+  itself says there is usually no gain outside random writes —
+  https://raw.githubusercontent.com/MicrosoftDocs/sdk-api/docs/sdk-api-src/content/fileapi/nf-fileapi-setfilevaliddata.md
+- **Hole punching** (`FSCTL_SET_SPARSE`, `FSCTL_SET_ZERO_DATA`): buys nothing
+  while generations are deleted whole —
+  https://raw.githubusercontent.com/MicrosoftDocs/sdk-api/docs/sdk-api-src/content/winioctl/ni-winioctl-fsctl_set_zero_data.md
+
+**Display path.**
+
+- Microsoft's ordering of windowed latency, lowest first: a tearing present on
+  a multi-plane overlay, then a waitable swap chain at latency 1 in independent
+  flip, then composed flip. The size of each step is not published —
+  https://raw.githubusercontent.com/MicrosoftDocs/win32/docs/desktop-src/direct3ddxgi/for-best-performance--use-dxgi-flip-model.md
+- The waitable object also "ensures that the application will only render
+  after each VSync, minimizing power consumption" —
+  https://raw.githubusercontent.com/MicrosoftDocs/windows-dev-docs/docs/uwp/gaming/reduce-latency-with-dxgi-1-3-swap-chains.md
+- **Which path does fwterm's Vulkan swapchain get?** NVIDIA's "Vulkan/OpenGL
+  present method" setting chooses between a native (blt-style) surface and one
+  layered on a DXGI swapchain (flip). It is a driver setting, not a Vulkan
+  call, and this description is **unverified** (search summary of
+  https://community.khronos.org/t/vulkan-present-mode-preferred-native-vs-layered-on-dxgi-swapchain/112055).
+  It may explain why FIFO did not pace to the display (§11 row 4); that is a
+  hypothesis. PresentMon's `PresentMode` column tells the modes apart —
+  https://raw.githubusercontent.com/GameTechDev/PresentMon/main/README-ConsoleApplication.md
+- Vulkan extensions, all through `vulkan-1.dll` and all driver-dependent, to be
+  queried at runtime:
+
+  | Extension | Gives | Source |
+  | --- | --- | --- |
+  | `VK_KHR_swapchain_maintenance1` | switch present mode per present without recreating the swapchain (FIFO when idle, mailbox or immediate while typing); deferred image allocation | https://raw.githubusercontent.com/KhronosGroup/Vulkan-Docs/main/appendices/VK_KHR_swapchain_maintenance1.adoc |
+  | `VK_KHR_present_wait2` | block until a present has taken effect, bounding queued frames | https://raw.githubusercontent.com/KhronosGroup/Vulkan-Docs/main/appendices/VK_KHR_present_wait2.adoc |
+  | `VK_EXT_present_timing` | actual present times, and "no earlier than" scheduling. Driver support on 616.92 unchecked | https://raw.githubusercontent.com/KhronosGroup/Vulkan-Docs/main/appendices/VK_EXT_present_timing.adoc |
+  | `VK_NV_low_latency2` | the Reflex sleep-before-input mechanism with no SDK; NVIDIA only | https://raw.githubusercontent.com/KhronosGroup/Vulkan-Docs/main/appendices/VK_NV_low_latency2.adoc |
+
+- **NVIDIA Reflex SDK: out.** Proprietary, object-form redistribution only, and
+  its licence forbids use that would put it under an open-source licence —
+  https://raw.githubusercontent.com/NVIDIA-RTX/Reflex/main/license.txt
+
+**Two GPUs.**
+
+- The reference desktop is not a WDDM "hybrid system": that term needs the
+  panel on the integrated GPU. With both monitors on the RTX 3070, drawing on
+  the Intel GPU would add a cross-adapter copy per present —
+  https://raw.githubusercontent.com/MicrosoftDocs/windows-driver-docs/staging/windows-driver-docs-pr/display/using-cross-adapter-resources-in-a-hybrid-system.md
+- E1 above already found inference costs the renderer nothing on the shared
+  card. So "draw on the integrated GPU, keep the discrete one for compute" has
+  no case on this machine. On a laptop whose panel is on the integrated GPU the
+  integrated GPU is the right place to draw: the discrete one can stay asleep.
+- A Vulkan application chooses its `VkPhysicalDevice` itself; the loader only
+  sorts the list by system preference —
+  https://raw.githubusercontent.com/KhronosGroup/Vulkan-Loader/main/docs/LoaderDriverInterface.md
+
+**System inference surfaces.** None ships in-box as a plain DLL. Windows ML and
+the Windows AI APIs (Phi Silica) come with the Windows App SDK —
+https://raw.githubusercontent.com/MicrosoftDocs/windows-ai-docs/docs/docs/new-windows-ml/distributing-your-app.md.
+Foundry Local is a user-installed server with an OpenAI-compatible HTTP
+endpoint that picks NPU, GPU or CPU itself, so it is a third server beside
+`llama-server` and Ollama in the table above —
+https://raw.githubusercontent.com/microsoft/Foundry-Local/main/README.md
+
+### CPU vector instructions and compression
+
+- `std::arch` x86 intrinsics and `is_x86_feature_detected!` are stable Rust
+  (AVX2 since 1.27, AVX-512 since 1.89), so a vector path needs no dependency —
+  https://raw.githubusercontent.com/rust-lang/rust/master/RELEASES.md
+- Published single-core figures: UTF-8 validation at 13 GB/s (simdjson,
+  https://raw.githubusercontent.com/simdjson/simdjson/master/README.md);
+  `memcpy` at 13.7 GB/s on an i7-9700K (lzbench, in
+  https://raw.githubusercontent.com/lz4/lz4/dev/README.md). So design §8.7b's
+  "CPU SIMD does it at tens of GB/s" is an all-cores figure; per core it is
+  about 10+ GB/s, still ~40× the §4 target.
+- Compression, one thread, Silesia corpus, i7-9700K (lzbench; mixed data, not
+  log text, and not an E-core):
+
+  | Codec | Ratio | Compress | Decompress | Source |
+  | --- | --- | --- | --- | --- |
+  | zstd 1.5.7 level 1 | 2.90 | 510 MB/s | 1,550 MB/s | https://raw.githubusercontent.com/facebook/zstd/dev/README.md |
+  | LZ4 1.11 | 2.11 | 770 MB/s | 4,950 MB/s | https://raw.githubusercontent.com/lz4/lz4/dev/README.md |
+
+  Both formats are open; under the zero-dependency rule either would be our own
+  code, and the LZ4 block format is by far the smaller to write. No open GPU
+  compressor with reproducible compress-side numbers was found (absence
+  **unverified**), which supports the "probably CPU" verdict above.
+
+### macOS
+
+Read from Apple's developer documentation and the XNU sources Apple publishes.
+All of it is plain C in `libSystem`, or Metal and AppKit through the
+Objective-C runtime (`objc_msgSend`, `sel_registerName`, `objc_getClass`),
+which needs no Apple compiler; that reachability is our assessment and is
+**unverified** until tried on a Mac.
+
+| Area | Mechanism | What the documentation says | Source |
+| --- | --- | --- | --- |
+| Efficiency class | QoS classes, `pthread_set_qos_class_self_np` | background "focuses on energy efficiency"; Apple's target is utility or lower "at least 90% of the time when user activity is not occurring" | https://developer.apple.com/library/archive/documentation/Performance/Conceptual/power_efficiency_guidelines_osx/PrioritizeWorkAtTheTaskLevel.html |
+| Efficiency class | QoS and core type | on Apple silicon "the system is more likely to run background tasks on lower performance cores". A hard background-to-E-core rule has no Apple source: **unverified** | https://developer.apple.com/tutorials/data/documentation/apple-silicon/tuning-your-code-s-performance-for-apple-silicon.json |
+| Efficiency class | `setpriority(PRIO_DARWIN_BG)` | lowest scheduling priority, and "disk IO is throttled" | https://raw.githubusercontent.com/apple-oss-distributions/xnu/main/bsd/man/man2/getpriority.2 |
+| Hazard | App Nap | a process with no visible window updates is throttled (timers, I/O, priority). A pane host has no window, so it needs an activity token (`NSProcessInfo beginActivityWithOptions:reason:`) while output flows | https://developer.apple.com/library/archive/documentation/Performance/Conceptual/power_efficiency_guidelines_osx/AppNap.html |
+| Idle | timers | "more than one wakeup per second when it should be idle" is Apple's threshold to investigate | https://developer.apple.com/library/archive/documentation/Performance/Conceptual/power_efficiency_guidelines_osx/Timers.html |
+| Shared memory | Metal, `MTLStorageModeShared` | "Apple GPUs have a unified memory model in which the CPU and the GPU share system memory" | https://developer.apple.com/tutorials/data/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus.json |
+| Shared memory | `newBufferWithBytesNoCopy:length:options:deallocator:` | "wraps an existing contiguous memory allocation"; page-aligned, one VM region. So a compute pass over host memory needs no upload | https://developer.apple.com/tutorials/data/documentation/metal/mtldevice/makebuffer(bytesnocopy:length:options:deallocator:).json |
+| Shaders | `newLibraryWithSource:options:error:` | compiles Metal source at runtime, so nothing is needed at build time | https://developer.apple.com/tutorials/data/documentation/metal/mtldevice/makelibrary(source:options:).json |
+| Display | `CAMetalLayer.displaySyncEnabled`, `presentsWithTransaction` | sync off "presents new content more quickly, but possibly with… screen tearing" | https://developer.apple.com/tutorials/data/documentation/quartzcore/cametallayer/displaysyncenabled.json |
+| Display | direct-to-display | needs full screen and Apple silicon; a windowed terminal is always composited | https://developer.apple.com/tutorials/data/documentation/metal/managing-your-game-window-for-metal-in-macos.json |
+| Log | `fsync` | flushes to the drive, but "the drive itself may not physically write the data… for quite some time"; use `F_FULLFSYNC` | https://raw.githubusercontent.com/apple-oss-distributions/xnu/main/bsd/man/man2/fsync.2 |
+| Log | `F_FULLFSYNC`, `F_BARRIERFSYNC`, `F_NOCACHE` | full flush; a barrier (ordering without a full flush); caching off | https://raw.githubusercontent.com/apple-oss-distributions/xnu/main/bsd/man/man2/fcntl.2 |
+| Memory | `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` | normal, warn, critical; takes a C function pointer, so no blocks are needed | https://raw.githubusercontent.com/apple/swift-corelibs-libdispatch/main/dispatch/source.h |
+| Memory | purgeable memory, `vm_purgable_control` | volatile pages the kernel may discard rather than compress | https://raw.githubusercontent.com/apple-oss-distributions/xnu/main/osfmk/mach/vm_purgable.h |
+| Energy | `proc_pid_rusage`, `rusage_info_v6` | per process: `ri_energy_nj`, `ri_billed_energy`, `ri_interrupt_wkups`, `ri_pkg_idle_wkups`, CPU time per QoS. Readable for the same user's processes without root | https://raw.githubusercontent.com/apple-oss-distributions/xnu/main/bsd/sys/resource.h, https://raw.githubusercontent.com/apple-oss-distributions/xnu/main/bsd/kern/proc_info.c |
+| Process tree | `proc_listchildpids`, `proc_pidinfo`, kqueue `EVFILT_PROC` | accounting and exit events; no `NOTE_TRACK`, so descendants are polled. No job or cgroup analogue was found (**unverified** absence) | https://raw.githubusercontent.com/apple-oss-distributions/xnu/main/libsyscall/wrappers/libproc/libproc.h |
+| Pty | kernel tty buffers | `TTYHOG` 1024; a report that reads from a pty return at most 1024 bytes is **unverified** (https://debbugs.gnu.org/db/75/75574.html). If true, ingest costs a system call per KiB | https://raw.githubusercontent.com/apple-oss-distributions/xnu/main/bsd/sys/tty.h |
+
+- **Vulkan: MoltenVK is now deprecated by Khronos** in favour of KosmicKrisp
+  on Apple silicon, and either is a library an application bundles, not one
+  macOS ships. Design §8.6's "Metal for macOS" stands —
+  https://raw.githubusercontent.com/KhronosGroup/MoltenVK/main/README.md
+- **`F_FULLFSYNC` is slow.** Apple's engineers say it is "basically 'always'
+  going to be relatively slow" (https://developer.apple.com/forums/thread/800906);
+  a community figure of 46 flushes a second on an M1 is **unverified**
+  (https://mjtsai.com/blog/2022/02/17/apple-ssd-benchmarks-and-f_fullsync).
+  The Windows writer's "durable when the write returns" will not carry over
+  unchanged: the durability tier on macOS is a measurement and a decision.
+- **The session's own tax on macOS is exec scanning.** Every `exec` is
+  scanned (https://developer.apple.com/videos/play/wwdc2019/701/). A terminal
+  listed under Privacy & Security > Developer Tools has its child processes
+  excluded, per nextest's documentation; Apple's own description was not
+  found, and whether the exemption passes through a pane host is
+  **unverified** —
+  https://raw.githubusercontent.com/nextest-rs/nextest/main/site/src/docs/installation/macos.md
+
+### The BSDs
+
+- **Vulkan is a package, not base.** FreeBSD's `graphics/mesa-dri` port builds
+  the Intel and AMD Vulkan drivers by default; OpenBSD and NetBSD have a
+  loader port, drivers **unverified**. Strictly, only the CPU renderer is
+  zero-dependency there —
+  https://raw.githubusercontent.com/freebsd/freebsd-ports/main/graphics/mesa-dri/Makefile
+- **A job analogue on FreeBSD:** `procctl(PROC_REAP_ACQUIRE)` adopts every
+  descendant, `PROC_REAP_KILL` signals them; it tracks and kills, it does not
+  limit —
+  https://raw.githubusercontent.com/freebsd/freebsd-src/main/lib/libsys/procctl.2
+- **kqueue `NOTE_TRACK`** follows a process across `fork` on FreeBSD and
+  OpenBSD (Darwin lacks it) —
+  https://raw.githubusercontent.com/freebsd/freebsd-src/main/lib/libsys/kqueue.2
+- **No unprivileged efficiency class:** FreeBSD's idle priority needs root by
+  default —
+  https://raw.githubusercontent.com/freebsd/freebsd-src/main/lib/libsys/rtprio.2
+- **ZFS:** with the default `sync=standard`, a synchronous write is flushed to
+  stable storage, and dataset compression (lz4, zstd) may already be on, so
+  our own compression of cold segments could be doing the work twice —
+  https://raw.githubusercontent.com/openzfs/zfs/master/man/man7/zfsprops.7

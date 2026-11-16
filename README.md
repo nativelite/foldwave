@@ -26,7 +26,8 @@ One of three products that each own a key piece of agentic development:
 | --- | --- |
 | [`docs/design.md`](docs/design.md) | The design, plus founder decisions (§11) and milestones (§10) |
 | [`docs/prior-art.md`](docs/prior-art.md) | Verified facts about 13 open-source terminals: licences, parsers, renderers, scrollback |
-| [`docs/compute.md`](docs/compute.md) | GPU compute: CUDA and vendor-neutral options, and experiment E1 (GPU contention) |
+| [`docs/compute.md`](docs/compute.md) | GPU compute: CUDA and vendor-neutral options, experiment E1 (GPU contention), and what each OS offers for placing work cheaply |
+| [`docs/philosophy.md`](docs/philosophy.md) | A proposal: what "best" means once the targets are met, and the experiments that would prove it |
 
 The competitive landscape for the whole suite is in
 [nativelite/ops `roadmap/competitive-landscape.md`](https://github.com/nativelite/ops/blob/main/roadmap/competitive-landscape.md).
