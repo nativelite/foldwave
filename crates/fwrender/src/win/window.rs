@@ -59,6 +59,9 @@ pub enum Event {
     Move(i32, i32),
     /// The pointer left the client area (`WM_MOUSELEAVE`).
     Leave,
+    /// Files were dropped at client pixel `(x, y)` (`WM_DROPFILES`); their
+    /// paths wait in [`Window::take_dropped`].
+    Drop(i32, i32),
     /// The user asked to close the window (`WM_CLOSE`). The window stays
     /// open; drop the [`Window`] to close it.
     CloseRequested,
@@ -88,6 +91,8 @@ struct Shared {
     /// when `TrackMouseEvent` is armed to report its leaving, and cleared
     /// on `WM_MOUSELEAVE`.
     inside: AtomicBool,
+    /// Paths of files dropped on the window, until [`Window::take_dropped`].
+    dropped: Mutex<Vec<String>>,
 }
 
 // SAFETY: `ready` is a kernel event handle, usable from any thread; the rest
@@ -111,6 +116,7 @@ impl Shared {
             ready,
             cursor: AtomicUsize::new(cursor as usize),
             inside: AtomicBool::new(false),
+            dropped: Mutex::new(Vec::new()),
         })
     }
 
@@ -417,6 +423,9 @@ fn window_thread(
             unsafe { DestroyWindow(hwnd) };
             return Err(e);
         }
+        // SAFETY: `hwnd` is live, on its own thread: files dragged over it
+        // may be dropped (`WM_DROPFILES`).
+        unsafe { DragAcceptFiles(hwnd, 1) };
         // SAFETY: `hwnd` is live. The return value is the previous visibility.
         unsafe { ShowWindow(hwnd, SW_SHOW) };
         Ok(hwnd)
@@ -846,6 +855,32 @@ impl Window {
         }
     }
 
+    /// The files on the clipboard (copied in Explorer), if it holds any.
+    pub fn clipboard_files(&self) -> io::Result<Vec<String>> {
+        let _open = Clipboard::open(self.hwnd)?;
+        // SAFETY: the clipboard is open; the handle is an `HDROP` the
+        // clipboard owns, valid until it closes.
+        unsafe {
+            let drop = GetClipboardData(CF_HDROP);
+            if drop.is_null() {
+                return Ok(Vec::new());
+            }
+            Ok(hdrop_paths(drop))
+        }
+    }
+
+    /// The paths of the files dropped on the window since the last call
+    /// (see [`Event::Drop`]).
+    pub fn take_dropped(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .shared
+                .dropped
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        )
+    }
+
     pub fn waker(&self) -> Waker {
         Waker {
             target: Arc::downgrade(&self.shared),
@@ -961,6 +996,26 @@ impl Drop for Window {
 /// character (Alt+Space carries `' '` and still opens the window menu).
 pub(crate) fn alt_alone_menu(wparam: usize, lparam: isize) -> bool {
     wparam & 0xFFF0 == SC_KEYMENU && lparam == 0
+}
+
+/// The paths an `HDROP` holds (a drop's, or the clipboard's).
+///
+/// # Safety
+/// `drop` is a live `HDROP`.
+unsafe fn hdrop_paths(drop: Handle) -> Vec<String> {
+    // SAFETY: the caller's live HDROP; each buffer holds the length asked
+    // for plus the NUL.
+    unsafe {
+        let count = DragQueryFileW(drop, u32::MAX, std::ptr::null_mut(), 0);
+        (0..count)
+            .filter_map(|i| {
+                let len = DragQueryFileW(drop, i, std::ptr::null_mut(), 0) as usize;
+                let mut buf = vec![0u16; len + 1];
+                let got = DragQueryFileW(drop, i, buf.as_mut_ptr(), buf.len() as u32) as usize;
+                (got > 0).then(|| String::from_utf16_lossy(&buf[..got.min(len)]))
+            })
+            .collect()
+    }
 }
 
 unsafe extern "system" fn wnd_proc(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> isize {
@@ -1099,6 +1154,27 @@ unsafe extern "system" fn wnd_proc(hwnd: Hwnd, msg: u32, wparam: usize, lparam: 
         WM_MOUSELEAVE => {
             shared.inside.store(false, Ordering::Release);
             push(Event::Leave);
+            0
+        }
+        WM_DROPFILES => {
+            let drop = wparam as Handle;
+            let mut at = Point { x: 0, y: 0 };
+            // SAFETY: `wparam` is the HDROP of this message, ours to read
+            // and to release once.
+            let paths = unsafe {
+                let paths = hdrop_paths(drop);
+                DragQueryPoint(drop, &mut at);
+                DragFinish(drop);
+                paths
+            };
+            if !paths.is_empty() {
+                shared
+                    .dropped
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .extend(paths);
+                push(Event::Drop(at.x, at.y));
+            }
             0
         }
         // Over the client area the cursor set with `Window::set_cursor`

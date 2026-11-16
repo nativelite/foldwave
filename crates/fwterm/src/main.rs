@@ -5803,7 +5803,28 @@ keys:
                                     panes[fi].back = 0;
                                     clear(&mut selection, &panes);
                                 }
-                                Ok(None) => {}
+                                // No text. Files copied in Explorer paste
+                                // as their paths; anything else (an image)
+                                // is the program's to read, so it gets the
+                                // key: Claude Code attaches a clipboard
+                                // image on Ctrl+V.
+                                Ok(None) => {
+                                    let files =
+                                        surface.window().clipboard_files().unwrap_or_default();
+                                    if files.is_empty() {
+                                        input.push(0x16);
+                                    } else {
+                                        let p = &panes[fi];
+                                        let bracketed =
+                                            p.shared.term.lock().unwrap().bracketed_paste();
+                                        let text =
+                                            select::paths_text(&files, select::is_wsl(&p.program));
+                                        input.extend_from_slice(&select::paste_bytes(
+                                            &text, bracketed,
+                                        ));
+                                    }
+                                    panes[fi].back = 0;
+                                }
                                 Err(e) => say!("fwterm: paste: {e}"),
                             }
                             drop_char = true;
@@ -6179,6 +6200,27 @@ keys:
                             pane.back.saturating_sub(lines)
                         };
                         pane.shared.pending.store(true, Ordering::Release);
+                    }
+                    // Files dropped on a pane are pasted into it as their
+                    // paths, as a terminal does (off any pane: the focused
+                    // one).
+                    Event::Drop(x, y) => {
+                        let files = surface.window().take_dropped();
+                        let over = pane_at(
+                            &placement.panes,
+                            y.max(0) as usize / m.cell_h as usize,
+                            x.max(0) as usize / m.cell_w as usize,
+                        )
+                        .unwrap_or(focus);
+                        if let Some(p) = panes.iter_mut().find(|p| p.id == over) {
+                            if !files.is_empty() {
+                                let bracketed = p.shared.term.lock().unwrap().bracketed_paste();
+                                let text = select::paths_text(&files, select::is_wsl(&p.program));
+                                let bytes = select::paste_bytes(&text, bracketed);
+                                let _ = p.session.lock().unwrap().write(&bytes);
+                                p.back = 0;
+                            }
+                        }
                     }
                     Event::Resized(w, h) if w > 0 && h > 0 => {
                         if let Err(e) = surface.resize(w, h) {

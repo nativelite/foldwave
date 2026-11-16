@@ -166,6 +166,56 @@ pub fn paste_asks(text: &str, bracketed: bool, full_screen: bool) -> Option<usiz
     (breaks && !bracketed && !full_screen).then(|| text.lines().count().max(1))
 }
 
+/// Whether a pane's program is WSL (`wsl`, `wsl.exe`, with or without a
+/// folder): what runs in it reads Linux paths.
+pub fn is_wsl(program: &[String]) -> bool {
+    program.first().is_some_and(|p| {
+        let name = p.rsplit(['\\', '/']).next().unwrap_or(p);
+        name.eq_ignore_ascii_case("wsl") || name.eq_ignore_ascii_case("wsl.exe")
+    })
+}
+
+/// A Windows path as WSL sees it: `C:\a\b` is `/mnt/c/a/b`, and a file in a
+/// distribution (`\\wsl.localhost\<distro>\home\x`, `\\wsl$\...`) is its own
+/// path there. Anything else is left as it is.
+fn wsl_path(path: &str) -> String {
+    let b = path.as_bytes();
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/') {
+        let drive = (b[0] as char).to_ascii_lowercase();
+        return format!("/mnt/{drive}/{}", path[3..].replace('\\', "/"));
+    }
+    for prefix in [r"\\wsl.localhost\", r"\\wsl$\"] {
+        let head = path.get(..prefix.len());
+        if head.is_some_and(|h| h.eq_ignore_ascii_case(prefix)) {
+            let rest = &path[prefix.len()..];
+            let inside = rest.split_once('\\').map_or("", |(_, p)| p);
+            return format!("/{}", inside.replace('\\', "/"));
+        }
+    }
+    path.to_string()
+}
+
+/// Files dropped on a pane, or copied in Explorer and pasted, as the text
+/// to paste: their paths, separated by spaces, each quoted if it holds
+/// anything but plain path characters. For a pane running WSL (`wsl`) the
+/// paths are the ones Linux has for them, in single quotes; else Windows
+/// paths in double quotes.
+pub fn paths_text(paths: &[String], wsl: bool) -> String {
+    let plain = |c: char| c.is_alphanumeric() || r"\/:._-+@%~".contains(c);
+    paths
+        .iter()
+        .map(|p| {
+            let p = if wsl { wsl_path(p) } else { p.clone() };
+            match (p.chars().all(plain), wsl) {
+                (true, _) => p,
+                (false, true) => format!("'{}'", p.replace('\'', r"'\''")),
+                (false, false) => format!("\"{p}\""),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Text pasted into a terminal: line breaks become carriage returns, which
 /// is what the Enter key sends. When the program asked for bracketed paste
 /// (`?2004h`), it comes wrapped in `ESC [200~` and `ESC [201~`, and any of
@@ -304,6 +354,29 @@ mod tests {
     fn paste_turns_line_breaks_into_enter() {
         assert_eq!(paste_bytes("a\r\nb\nc", false), b"a\rb\rc");
         assert_eq!(paste_bytes("é", false), "é".as_bytes());
+    }
+
+    #[test]
+    fn dropped_files_paste_as_paths_the_panes_program_can_read() {
+        let files = [
+            r"C:\Users\me\shot.png".to_string(),
+            r"D:\My Pictures\it's.png".to_string(),
+            r"\\wsl.localhost\Ubuntu\home\me\a b.txt".to_string(),
+            r"\\server\share\x.txt".to_string(),
+        ];
+        // A Windows program: the paths as they are, quoted where needed.
+        assert_eq!(
+            paths_text(&files, false),
+            r#"C:\Users\me\shot.png "D:\My Pictures\it's.png" "\\wsl.localhost\Ubuntu\home\me\a b.txt" \\server\share\x.txt"#
+        );
+        // WSL: drives under /mnt, a distribution's files by their own path.
+        assert_eq!(
+            paths_text(&files, true),
+            r"/mnt/c/Users/me/shot.png '/mnt/d/My Pictures/it'\''s.png' '/home/me/a b.txt' \\server\share\x.txt"
+        );
+        assert!(is_wsl(&["wsl.exe".into(), "-d".into(), "Ubuntu".into()]));
+        assert!(is_wsl(&[r"C:\Windows\System32\WSL.EXE".into()]));
+        assert!(!is_wsl(&["cmd.exe".into()]) && !is_wsl(&[]));
     }
 
     #[test]

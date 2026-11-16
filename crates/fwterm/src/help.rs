@@ -72,7 +72,13 @@ pub const KEYS: &[(&str, &str)] = &[
         "Ctrl+V, Ctrl+Shift+V",
         "paste; several lines into a program that did not ask for bracketed \
          paste (a shell runs each) ask first: Enter pastes, Esc cancels \
-         (paste_warning = off in the settings file pastes at once)",
+         (paste_warning = off in the settings file pastes at once). Files \
+         copied in Explorer paste as their paths; with an image on the \
+         clipboard the key goes to the program (Claude Code attaches it)",
+    ),
+    (
+        "Drop files on a pane",
+        "pastes their paths into it (Linux paths for a wsl pane)",
     ),
     (
         "Shift+PgUp/PgDn, wheel",

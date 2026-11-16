@@ -278,3 +278,41 @@ fn clipboard_from_the_callers_thread() {
     w.set_clipboard(text).expect("set");
     assert_eq!(w.clipboard().expect("get").as_deref(), Some(text));
 }
+
+#[test]
+fn dropped_files_arrive_as_an_event_and_their_paths() {
+    let mut w = Window::new("fwrender drop", 200, 100).expect("window");
+    // A DROPFILES block as the shell builds one: a 20-byte header (the
+    // list's offset, the drop point, client coordinates, wide characters),
+    // then the paths, each ended by a NUL, and one more NUL.
+    let paths = [r"C:\a b\shot.png", r"D:\y.txt"];
+    let mut list: Vec<u16> = Vec::new();
+    for p in paths {
+        list.extend(p.encode_utf16());
+        list.push(0);
+    }
+    list.push(0);
+    let mut block = Vec::new();
+    for field in [20u32, 30, 40, 0, 1] {
+        block.extend(field.to_le_bytes());
+    }
+    block.extend(list.iter().flat_map(|u| u.to_le_bytes()));
+    // SAFETY (test): a movable block of our own, filled within its size;
+    // the window's procedure releases it (`DragFinish`).
+    unsafe {
+        let mem = sys::GlobalAlloc(sys::GMEM_MOVEABLE, block.len());
+        assert!(!mem.is_null());
+        let dst = sys::GlobalLock(mem) as *mut u8;
+        std::ptr::copy_nonoverlapping(block.as_ptr(), dst, block.len());
+        sys::GlobalUnlock(mem);
+        sys::PostMessageW(w.hwnd() as sys::Hwnd, sys::WM_DROPFILES, mem as usize, 0);
+    }
+    let mut events = Vec::new();
+    let until = Instant::now() + Duration::from_secs(5);
+    while !events.contains(&Event::Drop(30, 40)) {
+        assert!(Instant::now() < until, "no drop event: {events:?}");
+        w.wait(Some(Duration::from_millis(100)), &mut events);
+    }
+    assert_eq!(w.take_dropped(), paths);
+    assert!(w.take_dropped().is_empty(), "taken once");
+}

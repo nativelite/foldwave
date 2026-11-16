@@ -568,7 +568,19 @@ pub const NOTIFYICON_VERSION_4: u32 = 4;
 #[link(name = "shell32")]
 extern "system" {
     pub fn Shell_NotifyIconW(message: u32, data: *mut NotifyIconDataW) -> Bool;
+    pub fn DragAcceptFiles(hwnd: Hwnd, accept: Bool);
+    /// With `index` `u32::MAX`: how many files. With a null `file`: the
+    /// length of path `index` in UTF-16 units, without its NUL.
+    pub fn DragQueryFileW(drop: Handle, index: u32, file: *mut u16, cch: u32) -> u32;
+    pub fn DragQueryPoint(drop: Handle, point: *mut Point) -> Bool;
+    pub fn DragFinish(drop: Handle);
 }
+
+/// Files were dropped on a window that accepts them (`DragAcceptFiles`);
+/// `wparam` is the `HDROP`, released with `DragFinish`.
+pub const WM_DROPFILES: u32 = 0x0233;
+/// Clipboard format: files copied in Explorer, as an `HDROP`.
+pub const CF_HDROP: u32 = 15;
 
 #[link(name = "kernel32")]
 extern "system" {
