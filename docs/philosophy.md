@@ -2,7 +2,7 @@
 
 > **Status:** proposal, 2026-11-16. A review of foldwave as built, and a
 > research direction that follows from its own measurements. **Nothing here is
-> a founder decision**; the ones it raises are listed in §7. Numbers marked
+> a founder decision**; the ones it raises are listed in §8. Numbers marked
 > *measured* are quoted from [`design.md`](design.md) with their section.
 > Facts about other projects and about operating systems are in
 > [`prior-art.md`](prior-art.md) and [`compute.md`](compute.md), each with its
@@ -151,7 +151,60 @@ These extend [design §5](design.md); they replace nothing in it.
    on energy and wakeups it would be the first one anywhere
    ([prior-art](prior-art.md#what-nobody-measures)).
 
-## 5. Research programme
+## 5. One philosophy, every platform
+
+foldwave is Windows first (design §11 row 5) and is meant for Linux and the
+other Unix systems too. The principles above are not Windows ideas. Each
+system has its own name for the same thing, and on several counts the Unix
+systems offer more. Sources for every cell are in
+[compute](compute.md#os-mechanisms-for-placing-work-researched-2026-11-16);
+none of it is measured yet.
+
+| Principle | Windows | Linux | macOS |
+| --- | --- | --- | --- |
+| An efficiency class for derived work | EcoQoS per thread or process | `SCHED_IDLE` per thread; `cpu.idle` per cgroup | QoS utility and background; `PRIO_DARWIN_BG` also throttles disk |
+| The pressure signal | CPU utilization and a low-memory notification | pressure-stall information: stalled time for CPU, memory and I/O, with triggers | a memory-pressure event source |
+| One handle on a pane's whole process tree | a job object (built) | a delegated cgroup, through a systemd scope | none found; process groups and polling |
+| Giving memory back | offer and reclaim | `MADV_FREE`, `MADV_PAGEOUT`, also on another process | purgeable memory, `MADV_FREE` |
+| A write that is durable when it returns | unbuffered write-through (built, measured) | `O_DIRECT` with `O_DSYNC` | only `F_FULLFSYNC`, which is slow; a barrier sync is the middle tier |
+| The filesystem trap | NTFS compression (found, design §4.1) | Btrfs copy-on-write and compression | none identified |
+| A frame as late and as short as possible | per-present mode, present wait, possibly a DXGI path | the same Vulkan extensions; tearing and FIFO depend on the compositor | `CAMetalLayer`, always composited in a window |
+| Compute over memory the GPU already shares | integrated GPUs only | `VK_EXT_external_memory_host` on Intel and AMD | every Apple-silicon Mac, by design |
+| Energy, readable | GPU only (`nvidia-smi`) | CPU counters need root; GPU through NVML | per process, in nanojoules, without root |
+| The transport | a console host in between, or pipes | a kernel pty with 4–8 KiB buffers, or pipes | a kernel pty, possibly 1 KiB a read |
+| What taxes the session | Defender; a Dev Drive softens it | file indexers | scanning of every `exec`; the Developer Tools list softens it |
+
+**What this changes in the plan:**
+
+- **The principles become an interface, the mechanisms a backend.** `resmon`
+  already has a `sys` module per platform. "Run this thread in the efficiency
+  class", "tell me about pressure", "one handle on this tree" and "take this
+  memory if you need it" are four small calls with one implementation per
+  system, in the same shape as the pane-transport interface design §8.9
+  already has.
+- **Linux is where the lever is strongest.** A cgroup per pane gives exact
+  accounting, real limits and a pressure reading per pane, which is more than
+  a Windows job object reports. E9 (the session ledger) is cheaper to build
+  there.
+- **Apple silicon is where the original idea is most literal.** CPU and GPU
+  share memory, so "the GPU reads what the CPU just wrote" costs nothing; the
+  efficiency cores are a documented scheduling target; and energy per process
+  is readable. E16 and the energy half of E8 are naturally measured there
+  first. It also needs a Metal renderer: Khronos has now deprecated MoltenVK,
+  which confirms design §8.6.
+- **Durability is not portable as built.** "Durable when the write returns"
+  holds on Windows and Linux. On macOS it costs a full device flush per write.
+  The crash target (design §4, "up to the last flush") allows a cadence there;
+  which one is a measurement, then a decision.
+- **Two hazards to test early.** On Windows, whether agents under a minimized
+  foldwave are slowed by window-driven QoS (in E11). On macOS, whether App Nap
+  throttles a pane host, which has no window.
+- **One dependency question on Linux.** A Vulkan window on Wayland needs
+  `libwayland-client`. It is a system library in the sense `vulkan-1.dll` is,
+  but it is the founder's reading of the zero-dependency rule that settles it
+  (§8).
+
+## 6. Research programme
 
 Each experiment follows the house rule: a hypothesis, a measurement on the
 reference machine with median, p90/p99 and sample count, and a rule for keeping
@@ -160,7 +213,7 @@ or dropping it. Numbering continues from E6. Order is by expected value.
 | # | Experiment | Hypothesis | Measure | Keep if |
 | --- | --- | --- | --- | --- |
 | E7 | **Key to photon** | fwterm's end-to-end latency is set by the present path, not by its own code (composed pipeline p99 0.68 ms, design §8.0) | A photodiode or a ≥ 240 fps camera on the local display; PresentMon's `PresentMode` to see which path the Vulkan swapchain gets. Then, one at a time: a present mode switched per present (FIFO idle, mailbox or immediate while typing), `VK_KHR_present_wait2`, `VK_NV_low_latency2`, and a DXGI flip-model waitable swap chain as the comparison | it is the instrument; a present-path change stays if it cuts p50 by half a refresh or more, or tightens p99, with idle still at 0 frames |
-| E8 | **Footprint ledger** | foldwave's cost can be stated in a few numbers nobody else publishes | `fwbench` mode: CPU-seconds by core class, context switches and wakeups per second idle, working set, VRAM, GPU watts (`nvidia-smi`), bytes on disk per byte logged; joules where the OS exposes them. The same from outside for other terminals, with `fwprobe` | it is the instrument; it becomes the public scorecard (§6) |
+| E8 | **Footprint ledger** | foldwave's cost can be stated in a few numbers nobody else publishes | `fwbench` mode: CPU-seconds by core class, context switches and wakeups per second idle, working set, VRAM, GPU watts (`nvidia-smi`), bytes on disk per byte logged; joules where the OS exposes them (per process on macOS; the harness with a capability on Linux; GPU only on Windows). The same from outside for other terminals, with `fwprobe` | it is the instrument; it becomes the public scorecard (§7) |
 | E9 | **Session ledger** | the waste worth finding is in the panes, not the terminal (the 6.8 CPU-hour `find`, design §8.7b) | per-pane process-tree CPU, memory and I/O from `resmon`, shown in the strip; a rule for "burning without output"; Defender's share and whether a pane's directory is on a trusted Dev Drive. Replay the runaway case | the rule flags the replayed runaway within minutes with no false alarm across an E3 fleet run, and the recorder costs < 0.1 % of a core |
 | E10 | **One vectorized ingest pass** | the logger's CPU per GiB at least halves with AVX2 line and control-byte scans, the SSE4.2 CRC-32C instruction and a tuned signature build, all on `std::arch` | CPU-s per GiB for the logger, before and after, and the flooding-pane cost (≈0.7 of a core, design §8.8). Then re-run §8.8a's host-signing comparison against the new CPU path | CPU-s per GiB falls ≥ 30 % with byte-identical logs and signatures. Whatever the result, the GPU-or-CPU default is re-judged on it |
 | E11 | **Efficiency class for derived work** | signature builds, catch-up replay, retention and hidden panes' hosts can run in the OS's efficiency class at no cost a person feels, returning fast-core time to the agents | a fleet build's wall time and fwterm's CPU-s by core class, with and without; catch-up time on showing a pane; log write p99. Also: whether agents under a *minimized* foldwave are slowed by Windows' window-driven QoS ([compute](compute.md#windows)) | pane-switch catch-up stays inside its present figure (200 MB in ~0.3 s), write p99 does not move, and fast-core time falls measurably |
@@ -168,7 +221,7 @@ or dropping it. Numbering continues from E6. Order is by expected value.
 | E13 | **Memory given back** | a shed pane's emulator and history can be offered to the OS and rebuilt from the log if taken | working set of 16 panes, 15 hidden, before and after; time to show a pane whose memory was taken; the low-memory notification as a governor input in place of polling | hidden panes' resident memory falls ≥ 50 % and showing one stays inside the catch-up figure |
 | E14 | **The idle tail** | the quiet-machine p99 (4.37 ms idle against 0.68 ms loaded, E5) comes from deep CPU sleep states | key-echo p99 over ≥ 1,000 keys, idle, with and without one core kept shallow for 250 ms after any input; the watts that costs | p99 on a quiet machine drops below the loaded figure for < 1 W average |
 | E15 | **Draw at the reader's rate** | a flooding pane drawn at 30–60 fps is indistinguishable in use from 150 fps and saves GPU power | GPU watts and fwterm CPU at each rate during a flood; the founder's eye on the feel, since typing keeps the full rate (the 250 ms input window already exists, design §8.8) | watts fall measurably and the founder accepts the feel |
-| E16 | **Compute where memory is shared** | on a GPU that shares the machine's memory (an integrated GPU, Apple silicon), the signature build needs no upload, so the ≥ 4 MiB batching rule and the read-back that sank the window path (§8.8a) do not apply | the vendor-neutral Vulkan compute build design §8.7a already calls for, run on the reference machine's Intel GPU over host memory | it beats the E10 CPU path in CPU-s per GiB with frames unchanged |
+| E16 | **Compute where memory is shared** | on a GPU that shares the machine's memory (an integrated GPU, Apple silicon), the signature build needs no upload, so the ≥ 4 MiB batching rule and the read-back that sank the window path (§8.8a) do not apply | the vendor-neutral Vulkan compute build design §8.7a already calls for, over host memory imported with `VK_EXT_external_memory_host`, on the reference machine's Intel GPU; later the Metal no-copy equivalent | it beats the E10 CPU path in CPU-s per GiB with frames unchanged |
 
 **Table stakes, not research.** A terminal is also judged on what it accepts.
 The 2026 list is in [prior-art](prior-art.md#protocols-a-terminal-is-judged-on-in-2026):
@@ -191,7 +244,7 @@ answered it.
 | The Reflex SDK, Windows ML in process, DirectStorage | each needs a proprietary redistributable |
 | Raising GPU utilization as a goal | design §11 row 9 already rules it out; this document agrees |
 
-## 6. The scorecard
+## 7. The scorecard
 
 The claim "best" should be a table anyone can reproduce, with foldwave's row
 beside the others'. Proposed columns, each from E7 or E8:
@@ -208,7 +261,7 @@ beside the others'. Proposed columns, each from E7 or E8:
 | Survives a kill | logs intact of logs written | nobody |
 | Install size, dependencies | MB, count | nobody |
 
-## 7. Open decisions for the founder
+## 8. Open decisions for the founder
 
 Nothing above is assumed. These are the calls it needs:
 
@@ -224,7 +277,14 @@ Nothing above is assumed. These are the calls it needs:
 4. **A camera or photodiode for E7** (already raised, design §10.1).
 5. **Drawing below the display's rate during a flood (E15).** A feel
    question; the measurement only says what it saves.
-6. **A public scorecard (§6).** Whether to publish foldwave's numbers against
+6. **A public scorecard (§7).** Whether to publish foldwave's numbers against
    named terminals, and when.
 7. **A compression codec as its own crate (E12).** Design §8.4 already allows
    for one; this would be the decision record.
+8. **Which Unix comes first, and when.** Linux reuses the Vulkan renderer and
+   has the strongest per-pane controls. macOS needs a Metal renderer but shows
+   the shared-memory idea at its best.
+9. **`libwayland-client` on Linux (§5).** Whether loading a library every
+   Wayland desktop ships counts as a dependency, as `vulkan-1.dll` does not.
+10. **Durability on macOS (§5).** A full flush per write, a barrier, or a
+    cadence.

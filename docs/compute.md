@@ -456,6 +456,160 @@ https://raw.githubusercontent.com/microsoft/Foundry-Local/main/README.md
   compressor with reproducible compress-side numbers was found (absence
   **unverified**), which supports the "probably CPU" verdict above.
 
+### Linux
+
+Read from GitHub copies of the primary sources: the kernel tree
+(`torvalds/linux`), a 2021 snapshot of the man pages (`mkerrisk/man-pages`),
+`axboe/liburing`, `systemd/systemd`, and mirrors of Mesa and the wayland.app
+registry. Everything here is a plain system call or a file under `/proc` or
+`/sys` unless a library is named. Kernel versions marked **unverified** are
+from memory.
+
+**Transport.** A POSIX pty has no console host in between
+([design §8.9](design.md)), but it is not free:
+
+- Each side of a pty gets an 8,192-byte buffer limit, the line discipline's
+  read buffer is 4,096 bytes, and every write takes a workqueue hop before the
+  reader sees it. A pipe holds 65,536 bytes by default and can be resized
+  (`F_SETPIPE_SZ`) —
+  https://github.com/torvalds/linux/blob/master/drivers/tty/pty.c,
+  https://github.com/torvalds/linux/blob/master/drivers/tty/n_tty.c,
+  https://github.com/mkerrisk/man-pages/blob/master/man7/pipe.7
+- So the two-lane decision (design §11 row 6: agents over pipes where they
+  document it) carries over to Linux. No published pty-against-pipe figure was
+  found; it needs `fwbench flood` on Linux.
+
+**Efficiency classes.**
+
+| Mechanism | What the documentation says | Fit | Source |
+| --- | --- | --- | --- |
+| `SCHED_IDLE`, `SCHED_BATCH` | idle is "lower even than a +19 nice value"; neither needs privilege to enter | derived work: signatures, catch-up, retention, compression | https://github.com/mkerrisk/man-pages/blob/master/man7/sched.7 |
+| cgroup v2 `cpu.idle`, `cpu.weight`, `cpu.max` | `cpu.idle = 1` makes a whole cgroup idle-class relative to its peers | a hidden pane's process tree, if the founder allows acting on it | https://github.com/torvalds/linux/blob/master/Documentation/admin-guide/cgroup-v2.rst |
+| Utilization clamping (`SCHED_FLAG_UTIL_CLAMP`) | steers frequency only with the schedutil governor | weak on Intel machines running `intel_pstate` (our inference) | https://github.com/torvalds/linux/blob/master/Documentation/scheduler/sched-util-clamp.rst |
+| Hybrid CPUs | `/sys/devices/system/cpu/cpuX/cpu_capacity`, and `cpu_core/cpus` and `cpu_atom/cpus` under `/sys/bus/event_source/devices`, tell P-cores from E-cores | `resmon::cpu` on Linux | https://github.com/torvalds/linux/blob/master/tools/perf/Documentation/intel-hybrid.txt |
+| I/O priority, `ioprio_set(IOPRIO_CLASS_IDLE)` | unprivileged, but "currently supported by bfq and mq-deadline" only | does nothing on an NVMe drive with scheduler `none`; throttle ourselves or use `io.max` | https://github.com/torvalds/linux/blob/master/Documentation/block/ioprio.rst |
+| Timer slack, `prctl(PR_SET_TIMERSLACK)` | default 50 µs; larger slack "can help reduce system power consumption by minimizing CPU wake-ups" | every thread off the input path | https://github.com/mkerrisk/man-pages/blob/master/man2/prctl.2 |
+
+**Pressure, the governor's input.** `/proc/pressure/cpu`, `memory` and `io`
+(and the same per cgroup) report the share of time work was stalled. A trigger
+written to the file wakes a `poll` when a threshold is crossed, and
+"unprivileged users can also create monitors", with a window that is a
+multiple of 2 s. This is a direct measure of contention, where Windows gives
+only utilization —
+https://github.com/torvalds/linux/blob/master/Documentation/accounting/psi.rst
+
+**A job per pane.** There is no single kill-on-close handle. The nearest:
+
+- A delegated cgroup per pane: `clone3` with `CLONE_INTO_CGROUP` starts the
+  program inside it, `cgroup.kill` ends the whole tree, `memory.high` and
+  `memory.max`, `pids.max` and `cpu.max` bound it, and `cpu.stat`,
+  `memory.peak` and `io.stat` account for it (cgroup-v2.rst above).
+- Without privilege the route to a delegated cgroup is systemd: a transient
+  scope with `Delegate=yes`. The user manager delegates `pids memory cpu` by
+  default; `io` and `cpuset` are not delegated —
+  https://github.com/systemd/systemd/blob/main/docs/CGROUP_DELEGATION.md,
+  https://github.com/systemd/systemd/blob/main/units/user@.service.in
+- `PR_SET_CHILD_SUBREAPER` makes the pane host adopt orphans, and a pidfd
+  (`pidfd_open`) is a pollable, race-free handle on a process —
+  https://github.com/mkerrisk/man-pages/blob/master/man2/prctl.2,
+  https://github.com/mkerrisk/man-pages/blob/master/man2/pidfd_open.2
+- Landlock lets "any process, including unprivileged ones… securely restrict
+  themselves": a pane host can drop what it does not need —
+  https://github.com/torvalds/linux/blob/master/Documentation/userspace-api/landlock.rst
+
+**Memory give-back.** `MADV_FREE` (lazy free), `MADV_COLD` and `MADV_PAGEOUT`
+(reclaim now); `process_madvise` applies the last two to another process
+through a pidfd, so the window can push a hidden pane host's memory out; and a
+delegated cgroup's `memory.reclaim` shrinks a pane on request —
+https://github.com/mkerrisk/man-pages/blob/master/man2/madvise.2,
+https://github.com/mkerrisk/man-pages/blob/master/man2/process_madvise.2
+
+**The log.**
+
+- The equivalent of the Windows writer is `O_DIRECT` with `O_DSYNC`, or
+  `pwritev2` with `RWF_DSYNC` per write. `O_DIRECT` alone "does not give the
+  guarantees of the O_SYNC flag" —
+  https://github.com/mkerrisk/man-pages/blob/master/man2/open.2,
+  https://github.com/mkerrisk/man-pages/blob/master/man2/readv.2
+- io_uring can append and link a write to its sync, but it must be optional:
+  `kernel.io_uring_disabled` can turn it off, and Docker's default seccomp
+  profile does not allow it —
+  https://github.com/torvalds/linux/blob/master/Documentation/admin-guide/sysctl/kernel.rst,
+  https://github.com/moby/profiles/blob/main/seccomp/default.json
+- **Btrfs is Linux's NTFS-compression trap.** Its transparent compression
+  needs copy-on-write, and direct writes on checksummed files fall back to
+  buffered ones on current kernels. A log directory opts out with the `C` (no
+  copy-on-write) and `m` (no compression) attributes, set through
+  `FS_IOC_SETFLAGS` on the empty directory. The log writer should check, as it
+  does for NTFS compression (design §4.1) —
+  https://github.com/kdave/btrfs-progs/blob/devel/Documentation/ch-compression.rst,
+  https://github.com/kdave/btrfs-progs/blob/devel/Documentation/ch-file-attributes.rst
+
+**Energy.**
+
+- The CPU's energy counters (RAPL) are root-only: the powercap `energy_uj`
+  file is created mode 0400, and the perf `power` events count system-wide
+  only and need `CAP_PERFMON` at the default `perf_event_paranoid` —
+  https://github.com/torvalds/linux/blob/master/drivers/powercap/powercap_sys.c,
+  https://github.com/torvalds/linux/blob/master/arch/x86/events/rapl.c
+- So joules are a figure the *harness* reports, run with that capability:
+  package energy before and after a fixed flood and a fixed idle window. The
+  application itself reports proxies: CPU time, and wakeups from
+  `voluntary_ctxt_switches` in `/proc/<pid>/status`.
+- GPU: NVML's `nvmlDeviceGetTotalEnergyConsumption` through
+  `libnvidia-ml.so.1`, which the driver ships; Intel's hwmon `energy1_input` —
+  https://github.com/NVIDIA/go-nvml/blob/main/gen/nvml/nvml.h,
+  https://github.com/torvalds/linux/blob/master/Documentation/ABI/testing/sysfs-driver-intel-i915-hwmon
+
+**Display path.**
+
+- Mesa's Vulkan on Wayland always offers MAILBOX and FIFO, and IMMEDIATE only
+  when the compositor has `tearing-control-v1`; FIFO uses `fifo-v1` and
+  `commit-timing-v1` where present. Mesa lists `VK_EXT_present_timing`,
+  `VK_KHR_present_wait2` and `VK_KHR_swapchain_maintenance1` for the Intel,
+  AMD and open NVIDIA drivers —
+  https://github.com/chaotic-cx/mesa-mirror/blob/main/src/vulkan/wsi/wsi_common_wayland.c,
+  https://github.com/chaotic-cx/mesa-mirror/blob/main/docs/features.txt
+- Compositor support differs: KWin 6.7 has `fifo-v1` and tearing control but
+  not commit timing; Mutter 51 has `fifo-v1` and commit timing but not tearing
+  control; Sway 1.11 has tearing control only —
+  https://github.com/vially/wayland-explorer/tree/main/src/data/compositors
+- **A Wayland window needs `libwayland-client`** if it uses Vulkan's own
+  surface: `VK_KHR_wayland_surface` takes a `wl_display` and Mesa calls the
+  library on it. Every Wayland desktop ships that library, as it ships
+  `libvulkan`. The alternative that needs no library, our own wire protocol
+  with frames exported as dmabufs, is a prototype, not a plan; the CPU
+  renderer over `wl_shm` needs no library at all —
+  https://github.com/KhronosGroup/Vulkan-Docs/blob/main/chapters/VK_KHR_surface/wsi.adoc
+- foot, the latency reference on Wayland, delays a draw by 0.5 ms after
+  output arrives (at most 8.3 ms) so it never draws half an update, and warns
+  that its shared-server mode lets one busy window starve the others: the
+  trade foldwave's pane hosts already avoid —
+  https://github.com/DanteAlighierin/foot/blob/master/doc/foot.ini.5.scd,
+  https://github.com/DanteAlighierin/foot/blob/master/README.md
+
+**Two GPUs, and memory the GPU shares.**
+
+- `VK_EXT_physical_device_drm` matches a Vulkan device to its DRM node, so the
+  integrated GPU can be chosen on purpose. Opening a device on an idle
+  discrete GPU is likely to keep it awake (our inference from the runtime
+  power-management documentation), so foldwave should open only the GPU it
+  uses —
+  https://github.com/KhronosGroup/Vulkan-Docs/blob/main/appendices/VK_EXT_physical_device_drm.adoc,
+  https://github.com/torvalds/linux/blob/master/Documentation/power/runtime_pm.rst
+- `VK_EXT_external_memory_host` imports host memory as Vulkan memory. Mesa
+  lists it for Intel (anv) and AMD (radv); NVIDIA's driver is **unverified**.
+  On an integrated GPU a compute pass could then read log pages with no
+  staging copy, the Vulkan counterpart of Metal's no-copy buffers below —
+  https://github.com/KhronosGroup/Vulkan-Docs/blob/main/appendices/VK_EXT_external_memory_host.adoc
+
+**What loads the session.** There is no always-on scanner by default
+(on-access scanning through fanotify needs `CAP_SYS_ADMIN`). The desktops'
+file indexers are the nearest thing: GNOME's LocalSearch and KDE's Baloo. No
+controlled measurement of their cost on builds was found —
+https://github.com/GNOME/localsearch/blob/main/README.md,
+https://github.com/KDE/baloo/blob/master/README.md
+
 ### macOS
 
 Read from Apple's developer documentation and the XNU sources Apple publishes.
