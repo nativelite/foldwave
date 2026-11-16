@@ -2698,6 +2698,71 @@ take the ship down.
   headless where the agent documents it — now backed by a measured 13×—14×
   throughput margin as well as the absence of the coalescing tick above.
 
+**Linux: the first build and the first numbers (2026-11-16, §11 row 24).**
+The whole workspace was built on Linux for the first time, with the ten engine
+repositories checked out beside it (`ansi-rs`, `vterm-rs`, `pty-rs`,
+`panelog-rs`, `glyphs-rs`, `json-rs`, `abus`, `ipc`, `tmuxproto`,
+`uwidth-rs`).
+
+| Crate | Builds on Linux | Tests on Linux |
+| --- | --- | --- |
+| the ten engine crates | yes | 389 pass, 0 fail (their own suites) |
+| `resmon` | yes, with its new Linux backend | 74 pass |
+| `fwbench`, `fwprobe` | yes | 109 and 12 pass, after one fix (below) |
+| `fwrender` | yes: frame, atlas, CPU renderer | 30 pass; the Vulkan backend and the window are Windows-only |
+| `fwcuda` | yes | 7 pass (no CUDA driver there) |
+| `fwterm` | **no**: it stops at `fwrender::win`, the Win32 window | — |
+
+So what stands between foldwave and a Linux window is the window itself
+(`fwrender`'s Wayland or X11 side and Vulkan's surface on it) and the parts
+of `fwterm` that call Win32 directly. The engine underneath already runs.
+
+- **One Linux bug found and fixed.** `fwbench compose --log single` wrote its
+  4 KiB record header from a plain `Vec`. Windows took it; Linux refuses a
+  direct write from an address that is not sector-aligned (`EINVAL`). The
+  header is now an aligned block (`compose.rs`, `SharedLog`). The log writer
+  itself (`panelog`) was not affected: its tests and the runs below pass.
+- **The numbers below are not the reference machine.** They are single runs
+  on a 4-CPU cloud virtual machine (Xeon at 2.1 GHz, ext4 on a virtual disk,
+  Linux 6.18), release build, `fwbench`. They show that each leg works on
+  Linux and roughly where it stands; none is a §4 claim.
+
+| Measure (`fwbench` mode) | Linux, this machine | Windows, reference machine |
+| --- | --- | --- |
+| Transport, one pane, pty (`flood`) | 71.5 MiB/s | 17.2 (built-in console host) |
+| Transport, 4 panes, pty | 178.7 MiB/s | 65.4 |
+| Transport, one pane, pipe | 1,581 MiB/s | 238.9 (generator-bound there) |
+| Transport, 4 panes, pipe | 7,078 MiB/s | 818.2 |
+| Key echo through a shell, 25 ms between keys, n = 1,000 (`echo`) | p50 0.19, p99 0.69 ms | p50 0.13, p99 4.37 ms (idle, E5) |
+| Key echo, no gap between keys, n = 1,000 | p50 0.03, p99 0.07 ms | p50 15.52 ms (the console's tick) |
+| Key echo while 4 pty panes flood, n = 600 (`combined`) | p50 0.07, p99 1.24 ms | — |
+| Full emulation, one thread (`parse`) | 228.2 MiB/s | 208.2 |
+| Full emulation, 4 threads | 875.4 MiB/s (218.8 each) | 436.3 on 4 P-cores (before spans) |
+| Durable write-through, 1 MiB appends, one in flight (`disk`) | 606 MiB/s, p99 2.3 ms | ≈1,800 sustained, p99 ≈1.1 ms |
+| Composed pipeline, 4 panes, 1 parsed, flat out (`compose`) | 453.5 MiB/s | 1,312–2,429 (16 panes) |
+| Composed at 17 MiB/s a pane | 86 % of pane time idle | ~92 % idle |
+| Kill mid-append, 3 kills (`replay`) | exact prefix, no torn tail, every time | the same (E6) |
+| History, 4 GiB: open; jump p99; rebuild p99 (`history`) | 23.5 ms; 0.117 ms; 7.44 ms | 40 ms at 16 GiB; 0.172; 6.94 |
+
+What they say:
+
+- **Linux has no coalescing tick.** Keys sent back to back echo in 0.03 ms;
+  through Windows' built-in console host they wait out a ≈15 ms tick (above).
+  The p99 < 5 ms target is met on a plain pty with nothing bundled.
+- **Pipes beat a pty by about 22× on Linux too** (1,581 against 71.5 MiB/s for
+  one pane). A pty is the kernel's, but each write still goes through the line
+  discipline and a worker thread ([`compute.md`](compute.md), "Linux"); the
+  noise guard saw that worker as ≈1 core of "other processes" during every pty
+  flood. So the two-lane decision (§11 row 6: agents over pipes where they
+  document it) holds on Linux for the same reason, and a pty pane still
+  carries about four times the per-pane target (17.1 MiB/s).
+- **Durability carries over.** `O_DIRECT` with `O_DSYNC` gave exact prefixes
+  after each kill, as write-through does on Windows.
+- **Not measured:** anything with a window (frames, key to photon), a real
+  disk, a hybrid CPU, 16 panes (the machine has 4 CPUs), and `panelog`'s write
+  rate with checkpoints, which read 96 MiB/s in the history run and wants a
+  proper A/B before it means anything.
+
 ## 9. Package plan
 
 One concern each; names are placeholders.
@@ -2787,7 +2852,7 @@ Founder answers of 2026-09-15.
 | 21 | Toasts | **Founder decision (2026-11-08): Windows notifications too, if they can be done within the rules**; fwterm's own bar toast ships regardless | Two zero-dependency routes to spike, both our own FFI over std: WinRT toasts through COM activation (`RoGetActivationFactory`, `ToastNotificationManager`), which need an AppUserModelID that the installer registers with the Start Menu shortcut (packaging, §10 M5); or the shell's notification-area balloon (`Shell_NotifyIcon`), which Windows 10 and 11 show as a toast and which needs a tray icon but no registration. Pick by the spike; fall back to the bar alone if neither is clean. **Spiked 2026-11-09 (slice 2): the balloon route is built**, `fwrender::win::Window::notify`: `Shell_NotifyIconW` with `NIF_INFO`, the window's own icon as the tray icon (added on the first notification, removed when the window closes) and as the balloon's large icon, no sound; behind `notify = windows` in the settings (default `bar`: fwterm's bar alone). Not yet seen on screen: the founder's beta check decides whether it stays or the WinRT route is tried next. The WinRT route is untried |
 | 22 | Order of the agent-layer slices | **Founder decision (2026-11-08): the order in §8.7c stands**: pane identity, then attention, then fwterm as a ctl client, then fwterm's own shim; the first two start now, since they wait on nothing | Slices 3 and 4 waited on `nativelite-ipc` (row 20) and the shared verb crate (row 19); both existed by 2026-11-09, so no slice is blocked; all four slices were built that day. The beta check in a window (§10 M5 status) is unchanged and runs when the founder is at the machine |
 | 23 | Direction after M5 | **Founder decision (2026-11-16): the direction in [`philosophy.md`](philosophy.md) stands**: with the §4 targets met, speed and efficiency are pursued at the photon (key-to-photon latency), in the footprint (fast-core time, memory, disk, energy, wakeups) and across the session (what the panes' programs cost), by removing work before speeding it up | The founder's correction, recorded with it: foldwave is about speed and efficiency and "the ability to push beyond", as the fold engine it is named for does; the targets are a floor. Experiments E7 to E16 are proposals, each kept or dropped by its own measurement; the decisions still open are in philosophy §8 (report or act, the default signer, a camera for E7, drawing below the display's rate, a public scorecard, a compression crate, `libwayland-client`, targets beyond §4) |
-| 24 | The first Unix | **Founder decision (2026-11-16): Linux first** | It reuses the Vulkan renderer and has the strongest per-pane controls (a cgroup per pane, pressure-stall information; [`compute.md`](compute.md)). First step, **built 2026-11-16**: `resmon`'s Linux backend ([`sys/linux.rs`](../crates/resmon/src/sys/linux.rs)), which the governor and the measurement harness stand on. Processes with their parents, CPU time, memory and I/O from `/proc`; machine load and memory; which CPUs are fast or efficient (`cpu_capacity`, else the `cpu_core` and `cpu_atom` lists), written as the records `cpu::topology` already parses; thread placement (`sched_setaffinity`); volumes and their mount points (`statvfs`, `mountinfo`), a fixed volume being a writable block device on a disk that cannot be removed; a child's CPU clock named by id and start time; and `resmon::pressure`, Linux's pressure-stall information for CPU, memory and I/O, a governor input Windows has no counterpart for (§8.8). No privilege, no library beyond libc through our own `extern` block; 64-bit x86 and ARM. Checked on Linux 6.18 in a 4-CPU container: 74 unit tests (17 new) pass five runs in a row, `resmon 2` attributes the machine, and the crate still type-checks for Windows (`x86_64-pc-windows-gnu`). **Not checked:** a hybrid CPU (the container's are one kind), a machine with real disks (`volume::fixed` listed none there), and the rest of the workspace, whose engine crates are in repositories that session did not have. **A known gap:** `job::KillOnClose` on Linux ends its processes and their process groups when dropped, not when its holder is killed; that needs the pane's program started in a cgroup or with a parent-death signal, which belongs to the spawn in `pty-rs` ([`compute.md`](compute.md), "A job per pane"). macOS needs a Metal renderer (§8.6) and has no date |
+| 24 | The first Unix | **Founder decision (2026-11-16): Linux first** | It reuses the Vulkan renderer and has the strongest per-pane controls (a cgroup per pane, pressure-stall information; [`compute.md`](compute.md)). First step, **built 2026-11-16**: `resmon`'s Linux backend ([`sys/linux.rs`](../crates/resmon/src/sys/linux.rs)), which the governor and the measurement harness stand on. Processes with their parents, CPU time, memory and I/O from `/proc`; machine load and memory; which CPUs are fast or efficient (`cpu_capacity`, else the `cpu_core` and `cpu_atom` lists), written as the records `cpu::topology` already parses; thread placement (`sched_setaffinity`); volumes and their mount points (`statvfs`, `mountinfo`), a fixed volume being a writable block device on a disk that cannot be removed; a child's CPU clock named by id and start time; and `resmon::pressure`, Linux's pressure-stall information for CPU, memory and I/O, a governor input Windows has no counterpart for (§8.8). No privilege, no library beyond libc through our own `extern` block; 64-bit x86 and ARM. Checked on Linux 6.18 in a 4-CPU container: 74 unit tests (17 new) pass five runs in a row, `resmon 2` attributes the machine, and the crate still type-checks for Windows (`x86_64-pc-windows-gnu`). **Not checked:** a hybrid CPU (the container's are one kind) and a machine with real disks (`volume::fixed` listed none there). **The whole workspace was built on Linux the same day** (§8.9, "Linux: the first build and the first numbers"): every crate but `fwterm` builds and passes its tests, and `fwbench` gave the first Linux measurements. **A known gap:** `job::KillOnClose` on Linux ends its processes and their process groups when dropped, not when its holder is killed; that needs the pane's program started in a cgroup or with a parent-death signal, which belongs to the spawn in `pty-rs` ([`compute.md`](compute.md), "A job per pane"). macOS needs a Metal renderer (§8.6) and has no date |
 
 **Experiment E2: built-in console host vs OpenConsole (part of M0).**
 

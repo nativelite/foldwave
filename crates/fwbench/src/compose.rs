@@ -19,7 +19,7 @@
 //! device-level log with pane-tagged records. [`LogMode`] runs either, so the
 //! two can be compared on the same load.
 
-use crate::disk::{aligned, open_writethrough, SECTOR};
+use crate::disk::{aligned, open_writethrough, Aligned, SECTOR};
 use crate::stats::Summary;
 use crate::{parse, scan};
 use std::fs::{self, File};
@@ -147,29 +147,34 @@ impl Composed {
     }
 }
 
-/// The shared log, when [`LogMode::Single`] is in force.
+/// The shared log, when [`LogMode::Single`] is in force: the file and the
+/// header block written before each payload.
 struct SharedLog {
-    file: Mutex<File>,
-    header: Vec<u8>,
+    inner: Mutex<(File, Aligned)>,
 }
 
 impl SharedLog {
     fn new(path: &Path) -> io::Result<SharedLog> {
+        // The header's address must be sector-aligned like every other
+        // unbuffered write: Linux refuses a direct write from a plain `Vec`
+        // (EINVAL), where Windows took it.
+        let mut header = aligned(SECTOR);
+        header.aligned_mut().fill(0);
         Ok(SharedLog {
-            file: Mutex::new(open_writethrough(path, true)?),
-            header: vec![0u8; SECTOR],
+            inner: Mutex::new((open_writethrough(path, true)?, header)),
         })
     }
 
     /// Append one pane-tagged record. The header block keeps every payload
     /// sector-aligned, which unbuffered I/O requires.
     fn append(&self, pane: usize, payload: &[u8]) -> io::Result<Duration> {
-        let mut header = self.header.clone();
-        header[..8].copy_from_slice(&(pane as u64).to_le_bytes());
-        header[8..16].copy_from_slice(&(payload.len() as u64).to_le_bytes());
         let t = Instant::now();
-        let mut file = self.file.lock().expect("log mutex");
-        file.write_all(&header)?;
+        let mut inner = self.inner.lock().expect("log mutex");
+        let (file, header) = &mut *inner;
+        let block = header.aligned_mut();
+        block[..8].copy_from_slice(&(pane as u64).to_le_bytes());
+        block[8..16].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+        file.write_all(block)?;
         file.write_all(payload)?;
         Ok(t.elapsed())
     }
