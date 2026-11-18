@@ -195,7 +195,7 @@ impl Keyboard {
             let code = key + 8;
             let layout = state.key_layout(code)?;
             let sym = state.keymap().key_syms_by_level(code, layout, 0).first()?;
-            Some(sym.to_utf32())
+            Some(sym.0)
         });
         keys::vk_in_layout(key, first)
     }
@@ -353,11 +353,39 @@ impl Inner {
         } else if is(self.seat.map(|s| s.id())) {
             if let wl_seat::Event::Capabilities { capabilities } = wl_seat::Event::decode(event)? {
                 let seat = self.seat.expect("matched above");
-                if capabilities & wl_seat::capability::POINTER != 0 && self.pointer.is_none() {
-                    self.pointer = Some(seat.get_pointer(&mut self.conn)?);
+                // A device can go and another come (a keyboard unplugged
+                // and plugged in, a virtual one for each burst of typing):
+                // the object for one that has gone is dead, and must be let
+                // go so the next one is asked for.
+                let has = |bit| capabilities & bit != 0;
+                // An old seat's devices have no release request.
+                let version = self.conn.object(seat.id()).map_or(1, |(_, v)| v);
+                match (has(wl_seat::capability::POINTER), self.pointer) {
+                    (true, None) => self.pointer = Some(seat.get_pointer(&mut self.conn)?),
+                    (false, Some(pointer)) => {
+                        if version >= wl_pointer::REQ_RELEASE_SINCE {
+                            pointer.release(&mut self.conn)?;
+                        }
+                        self.pointer = None;
+                        self.button_down = false;
+                        if self.pointer_at.take().is_some() {
+                            self.push(Event::Leave);
+                        }
+                    }
+                    _ => {}
                 }
-                if capabilities & wl_seat::capability::KEYBOARD != 0 && self.keyboard.is_none() {
-                    self.keyboard = Some(seat.get_keyboard(&mut self.conn)?);
+                match (has(wl_seat::capability::KEYBOARD), self.keyboard) {
+                    (true, None) => self.keyboard = Some(seat.get_keyboard(&mut self.conn)?),
+                    (false, Some(keyboard)) => {
+                        if version >= wl_keyboard::REQ_RELEASE_SINCE {
+                            keyboard.release(&mut self.conn)?;
+                        }
+                        self.keyboard = None;
+                        self.keys.held = None;
+                        self.keys.mods = 0;
+                        MODS.store(0, Ordering::Relaxed);
+                    }
+                    _ => {}
                 }
             }
         } else if is(self.pointer.map(|p| p.id())) {
@@ -437,6 +465,9 @@ impl Inner {
 
     fn keyboard_event(&mut self, event: wl_keyboard::Event) {
         use wl_keyboard::Event as K;
+        if std::env::var_os("FWRENDER_TRACE_KEYS").is_some() {
+            eprintln!("wl_keyboard: {event:?}");
+        }
         match event {
             K::Keymap { format, fd, size } => {
                 if format == wl_keyboard::keymap_format::XKB_V1 {

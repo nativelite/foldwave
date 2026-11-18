@@ -118,14 +118,49 @@ pub fn system_font_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/usr/share/fonts"))
 }
 
-/// Fonts tried, in order, for characters the main font lacks: MS Gothic
-/// (Japanese), Malgun Gothic (Korean) and Segoe UI Symbol, from the system
-/// font directory.
+/// Fonts tried, in order, for characters the main font lacks. On Windows:
+/// MS Gothic (Japanese), Malgun Gothic (Korean) and Segoe UI Symbol, from
+/// the system font directory. On Linux there is no font every system has,
+/// so the first of each kind that is installed: a Japanese or Chinese face,
+/// a Korean one, and one with symbols. One that is missing, or whose
+/// outlines this crate does not draw, is passed over when the rasterizer is
+/// made.
 pub fn default_fallbacks() -> Vec<FontFile> {
-    let dir = system_font_dir();
-    ["msgothic.ttc", "malgun.ttf", "seguisym.ttf"]
+    if cfg!(windows) {
+        let dir = system_font_dir();
+        return ["msgothic.ttc", "malgun.ttf", "seguisym.ttf"]
+            .iter()
+            .map(|n| FontFile::new(dir.join(n)))
+            .collect();
+    }
+    /// File names by kind, likeliest first; TrueType outlines where a
+    /// family ships both.
+    const KINDS: [&[&str]; 3] = [
+        &[
+            "ipag.ttf",
+            "VL-Gothic-Regular.ttf",
+            "wqy-microhei.ttc",
+            "wqy-zenhei.ttc",
+            "DroidSansFallbackFull.ttf",
+            "NotoSansCJK-Regular.ttc",
+            "NotoSansMonoCJKjp-Regular.otf",
+        ],
+        &["NanumGothic.ttf", "UnDotum.ttf", "baekmuk-dotum.ttf"],
+        &[
+            "DejaVuSans.ttf",
+            "NotoSansSymbols2-Regular.ttf",
+            "FreeSans.ttf",
+        ],
+    ];
+    let dirs = crate::catalog::font_dirs();
+    KINDS
         .iter()
-        .map(|n| FontFile::new(dir.join(n)))
+        .filter_map(|names| {
+            names
+                .iter()
+                .find_map(|name| dirs.iter().map(|d| d.join(name)).find(|p| p.is_file()))
+        })
+        .map(FontFile::new)
         .collect()
 }
 

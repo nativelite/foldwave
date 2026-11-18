@@ -218,3 +218,30 @@ fn frames_go_to_the_compositor_as_dmabufs_or_the_window_is_left_alone() {
     assert_eq!(sink.acquire(), None);
     sink.present(0).expect("a no-op");
 }
+
+/// A probe, run by hand against a compositor that can inject input
+/// (`cargo test -p nativelite-fwrender probe_events -- --ignored --nocapture`
+/// with `wtype` typing meanwhile): prints every event for a few seconds.
+#[test]
+#[ignore]
+fn probe_events() {
+    let Some(mut window) = window("fwrender probe", 400, 200) else {
+        return;
+    };
+    let (w, h) = window.client_size();
+    let cpu = CpuRenderer::new(w, h);
+    let mut presenter = CpuPresenter::new();
+    presenter.present(&window, &cpu, 0..h).expect("present");
+    let mut events = Vec::new();
+    let end = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < end {
+        window.wait(Some(Duration::from_millis(100)), &mut events);
+        for e in events.drain(..) {
+            println!("event: {e:?}");
+            if let Event::Resized(w, h) = e {
+                let cpu = CpuRenderer::new(w, h);
+                presenter.present(&window, &cpu, 0..h).expect("present");
+            }
+        }
+    }
+}

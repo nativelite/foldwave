@@ -24,14 +24,58 @@ pub struct Family {
     pub variable: bool,
 }
 
-/// The folders fonts are installed in: the system's, then the current
-/// user's (`%LOCALAPPDATA%\Microsoft\Windows\Fonts`, Windows 10 1809+).
+/// The folders fonts are installed in. On Windows: the system's, then the
+/// current user's (`%LOCALAPPDATA%\Microsoft\Windows\Fonts`, Windows 10
+/// 1809+). On Linux fonts sit in folders of their own under a few roots
+/// (`/usr/share/fonts`, `/usr/local/share/fonts`, and the user's
+/// `~/.local/share/fonts` and `~/.fonts`): every folder under them, a few
+/// levels down.
 pub fn font_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![system_font_dir()];
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        dirs.push(PathBuf::from(local).join("Microsoft\\Windows\\Fonts"));
+    if cfg!(windows) {
+        let mut dirs = vec![system_font_dir()];
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            dirs.push(PathBuf::from(local).join("Microsoft\\Windows\\Fonts"));
+        }
+        return dirs;
+    }
+    let set = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+    let home = set("HOME").map(PathBuf::from);
+    let mut roots = vec![
+        PathBuf::from("/usr/share/fonts"),
+        PathBuf::from("/usr/local/share/fonts"),
+    ];
+    roots.extend(
+        set("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(".local/share")))
+            .map(|d| d.join("fonts")),
+    );
+    roots.extend(home.map(|h| h.join(".fonts")));
+    let mut dirs = Vec::new();
+    for root in roots {
+        walk(&root, 4, &mut dirs);
     }
     dirs
+}
+
+/// `dir` and the folders under it, `depth` levels down, in a stable order.
+fn walk(dir: &std::path::Path, depth: u32, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    out.push(dir.to_path_buf());
+    if depth == 0 {
+        return;
+    }
+    let mut below: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    below.sort();
+    for d in below {
+        walk(&d, depth - 1, out);
+    }
 }
 
 /// JetBrains Mono 2.304 (SIL OFL 1.1, `fonts/OFL.txt`), compiled in: fwterm's

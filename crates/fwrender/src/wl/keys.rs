@@ -91,13 +91,59 @@ pub fn vk(key: u32) -> Option<u32> {
     })
 }
 
-/// The virtual-key code for a key: the letter or digit its first level
-/// types under the layout (`first`, a keysym), else its place's.
+/// The virtual-key code a keysym stands for, where it has one of its own:
+/// the editing and navigation keys, the function keys, the modifiers, and
+/// the characters Windows gives a key code to.
+fn vk_of_keysym(sym: u32) -> Option<u32> {
+    Some(match sym {
+        0xff08 => VK_BACK,
+        0xff09 | 0xfe20 => VK_TAB,    // Tab, ISO_Left_Tab (Shift+Tab)
+        0xff0d | 0xff8d => VK_RETURN, // Return, KP_Enter
+        0xff1b => VK_ESCAPE,
+        0xffff | 0xff9f => 0x2E,                  // Delete, KP_Delete
+        0xff50 | 0xff95 => 0x24,                  // Home
+        0xff51 | 0xff96 => 0x25,                  // Left
+        0xff52 | 0xff97 => 0x26,                  // Up
+        0xff53 | 0xff98 => 0x27,                  // Right
+        0xff54 | 0xff99 => 0x28,                  // Down
+        0xff55 | 0xff9a => 0x21,                  // Page Up
+        0xff56 | 0xff9b => 0x22,                  // Page Down
+        0xff57 | 0xff9c => 0x23,                  // End
+        0xff63 | 0xff9e => 0x2D,                  // Insert
+        0xffbe..=0xffc9 => 0x70 + (sym - 0xffbe), // F1..F12
+        0xffe1 | 0xffe2 => VK_SHIFT,
+        0xffe3 | 0xffe4 => VK_CONTROL,
+        0xffe9 | 0xffea | 0xffe7 | 0xffe8 => VK_MENU, // Alt, Meta
+        0xffe5 => 0x14,                               // Caps Lock
+        0xffeb | 0xffec => 0x5B,                      // Super
+        0x20 => VK_SPACE,
+        0x2d => 0xBD, // -
+        0x3d => 0xBB, // =
+        0x2c => 0xBC, // ,
+        0x2e => 0xBE, // .
+        0x2f => 0xBF, // /
+        0x3b => 0xBA, // ;
+        0x27 => 0xDE, // '
+        0x60 => 0xC0, // `
+        0x5b => 0xDB, // [
+        0x5c => 0xDC, // \
+        0x5d => 0xDD, // ]
+        _ => return None,
+    })
+}
+
+/// The virtual-key code for a key. What the key means decides: `first` is
+/// the keysym of its first level under the layout. A letter or digit is its
+/// own code, as on Windows; a key with a code of its own (Return, an arrow,
+/// a comma) takes that. Only a key that types something else (`&` on the
+/// top row of a French keyboard) falls back to the code of its place, and a
+/// keymap that numbers its keys its own way, as a virtual keyboard's does,
+/// is then still read rightly for everything it can be.
 pub fn vk_in_layout(key: u32, first: Option<u32>) -> Option<u32> {
     match first.and_then(char::from_u32) {
         Some(c) if c.is_ascii_alphabetic() => Some(c.to_ascii_uppercase() as u32),
         Some(c) if c.is_ascii_digit() => Some(c as u32),
-        _ => vk(key),
+        _ => first.and_then(vk_of_keysym).or_else(|| vk(key)),
     }
 }
 
@@ -208,6 +254,22 @@ mod tests {
         assert_eq!(vk_in_layout(2, Some('&' as u32)), Some('1' as u32));
         assert_eq!(vk_in_layout(103, Some(0xff52)), Some(0x26), "Up");
         assert_eq!(vk_in_layout(30, None), Some('A' as u32));
+    }
+
+    #[test]
+    fn a_key_is_what_it_means_wherever_the_keymap_put_it() {
+        // A virtual keyboard numbers its keys as it likes: key 1 is Return
+        // here, where a real keyboard has Escape.
+        assert_eq!(vk_in_layout(1, Some(0xff0d)), Some(VK_RETURN));
+        assert_eq!(vk_in_layout(2, Some(0xff1b)), Some(VK_ESCAPE));
+        assert_eq!(vk_in_layout(3, Some(0xffe3)), Some(VK_CONTROL));
+        assert_eq!(vk_in_layout(4, Some(0xffc7)), Some(VK_F10));
+        assert_eq!(vk_in_layout(5, Some(',' as u32)), Some(0xBC));
+        assert_eq!(
+            vk_in_layout(6, Some(0xfe20)),
+            Some(VK_TAB),
+            "Shift+Tab's key"
+        );
     }
 
     #[test]
