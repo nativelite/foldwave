@@ -116,3 +116,105 @@ fn cpu_frames_reach_the_compositor_and_follow_a_resize() {
     drop(window);
     drop(presenter);
 }
+
+/// A frame as an exporting renderer hands it over, but backed by an
+/// ordinary file the CPU renderer's pixels are written to. A compositor
+/// drawing in software maps a dmabuf like any file, so this stands in for
+/// the GPU's on a machine with no graphics device.
+fn file_frame(cpu: &CpuRenderer, n: usize) -> crate::vk::Dmabuf {
+    use std::os::unix::fs::FileExt;
+    let path = std::env::temp_dir().join(format!("fwrender-frame-{}-{n}", std::process::id()));
+    let file = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let bytes: Vec<u8> = cpu.pixels().iter().flat_map(|p| p.to_le_bytes()).collect();
+    file.write_all_at(&bytes, 0).unwrap();
+    crate::vk::Dmabuf {
+        fd: file.into(),
+        width: cpu.width(),
+        height: cpu.height(),
+        offset: 0,
+        stride: cpu.width() * 4,
+    }
+}
+
+/// The Wayland half of GPU frames, against a real compositor: it is asked
+/// what it takes, given each frame once, and shown them in turn; a frame it
+/// has finished with comes free again; a new size brings new frames. On a
+/// compositor without dmabufs the request is an error and the window goes
+/// on working, which is what lets a caller fall back.
+#[test]
+fn frames_go_to_the_compositor_as_dmabufs_or_the_window_is_left_alone() {
+    use crate::vk::FrameSink;
+    let Some(mut window) = window("fwrender wl gpu", 9 * 20, 17 * 4) else {
+        return;
+    };
+    let palette = Palette::default();
+    let mut atlas = Atlas::new(M, 256, 256);
+    let mut raster = TestRasterizer { metrics: M };
+    let mut screen = Screen::new(4, 20);
+    screen.write_str(0, 0, "gpu frames", Style::default());
+    let mut frame = Frame::new();
+    frame.update(&screen, true, &palette, &mut atlas, &mut raster);
+    let (w, h) = window.client_size();
+    let mut cpu = CpuRenderer::new(w, h);
+    cpu.draw(&frame, &atlas);
+    let mut events = Vec::new();
+
+    let frames = (0..3).map(|n| file_frame(&cpu, n)).collect();
+    let mut sink = match window.gpu_frames(frames) {
+        Ok(sink) => sink,
+        Err(e) => {
+            println!("no dmabufs on this compositor ({e}); the window is left alone");
+            let mut presenter = CpuPresenter::new();
+            presenter.present(&window, &cpu, 0..h).expect("present");
+            window.wait(Some(Duration::from_millis(30)), &mut events);
+            assert!(!events.contains(&Event::CloseRequested), "{events:?}");
+            return;
+        }
+    };
+
+    // Shown in turn; with all three handed over, one comes back as the
+    // compositor moves on, so there is always one to draw into again.
+    let mut shown = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while shown.len() < 8 {
+        match sink.acquire() {
+            Some(index) => {
+                sink.present(index).expect("present");
+                shown.push(index);
+            }
+            None => assert!(Instant::now() < deadline, "no frame came free: {shown:?}"),
+        }
+        window.wait(Some(Duration::from_millis(20)), &mut events);
+    }
+    println!("frames shown: {shown:?}");
+    assert!(shown[..3].iter().all(|i| *i < 3));
+    assert!(
+        !events.contains(&Event::CloseRequested),
+        "the compositor kept the window: {events:?}"
+    );
+
+    // A new size: new frames replace the old, and are shown.
+    let mut cpu = CpuRenderer::new(9 * 30, 17 * 6);
+    frame.update(&screen, true, &palette, &mut atlas, &mut raster);
+    cpu.draw(&frame, &atlas);
+    window.set_client_size(9 * 30, 17 * 6).expect("resize");
+    sink.rebuild((0..3).map(|n| file_frame(&cpu, n + 3)).collect())
+        .expect("rebuild");
+    let index = sink.acquire().expect("a new frame is free");
+    sink.present(index).expect("present");
+    events.clear();
+    window.wait(Some(Duration::from_millis(40)), &mut events);
+    assert!(!events.contains(&Event::CloseRequested), "{events:?}");
+
+    // A sink that outlives its window does nothing more.
+    drop(window);
+    assert_eq!(sink.acquire(), None);
+    sink.present(0).expect("a no-op");
+}

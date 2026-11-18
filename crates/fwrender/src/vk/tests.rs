@@ -327,13 +327,20 @@ fn a_window_swapchain_draws_resizes_and_draws_again() {
     drop(window);
 }
 
-/// On Linux a window is drawn by the CPU renderer for now: asking for a
-/// Vulkan one says so and hands the window back, which is what lets a
-/// caller fall back.
+/// A Vulkan window on Wayland needs a driver that exports its frames and a
+/// compositor that takes them. Where either refuses, the window comes back,
+/// which is what lets a caller fall back to the CPU renderer; where both
+/// agree, a frame is drawn and shown.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_vulkan_window_on_wayland_is_refused_and_the_window_comes_back() {
-    let atlas = Atlas::new(M, 256, 256);
+fn a_vulkan_window_on_wayland_draws_or_hands_the_window_back() {
+    let palette = Palette::default();
+    let mut atlas = Atlas::new(M, 256, 256);
+    let mut raster = TestRasterizer { metrics: M };
+    let mut s = Screen::new(4, 8);
+    s.write_str(0, 0, "wayland", Style::default());
+    let mut frame = Frame::new();
+    frame.update(&s, true, &palette, &mut atlas, &mut raster);
     let window = match crate::wl::Window::new("fwrender vk test", 96, 80) {
         Ok(w) => w,
         Err(e) => {
@@ -342,8 +349,163 @@ fn a_vulkan_window_on_wayland_is_refused_and_the_window_comes_back() {
         }
     };
     match VkWindow::try_new(window, &atlas, PresentMode::Fifo) {
-        Err((Error::Unsupported(_), window)) => assert_eq!(window.client_size(), (96, 80)),
-        Err((e, _)) => panic!("expected Unsupported, got {e}"),
-        Ok(_) => panic!("a Vulkan window on Wayland is not built"),
+        Err((e, window)) => {
+            assert!(
+                unavailable(&e),
+                "refused for a reason that is not a fault: {e}"
+            );
+            assert_eq!(window.client_size(), (96, 80));
+            println!("no Vulkan frames here ({e}); the window came back");
+        }
+        Ok(mut v) => {
+            println!("vulkan device: {}", v.renderer().device_name());
+            let stats = v.renderer().draw(&frame, &mut atlas).expect("draw");
+            assert!(!stats.skipped, "the first frame is drawn and handed over");
+            let mut events = Vec::new();
+            v.window_mut().poll(&mut events);
+        }
     }
+}
+
+/// A sink that hands out its images in turn and remembers what it was shown.
+#[cfg(target_os = "linux")]
+struct Recorder {
+    next: usize,
+    images: usize,
+    shown: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
+    rebuilt: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+#[cfg(target_os = "linux")]
+impl FrameSink for Recorder {
+    fn acquire(&mut self) -> Option<usize> {
+        let i = self.next;
+        self.next = (self.next + 1) % self.images;
+        Some(i)
+    }
+    fn present(&mut self, index: usize) -> Result<(), Error> {
+        self.shown.borrow_mut().push(index);
+        Ok(())
+    }
+    fn rebuild(&mut self, frames: Vec<Dmabuf>) -> Result<(), Error> {
+        self.rebuilt.set(frames.len());
+        Ok(())
+    }
+}
+
+/// Read a frame out of its dmabuf the way a compositor without a GPU would:
+/// by mapping it. `None` when the driver's dmabuf cannot be mapped.
+#[cfg(target_os = "linux")]
+fn mapped(frame: &Dmabuf) -> Option<Vec<u32>> {
+    use std::os::fd::AsRawFd;
+    extern "C" {
+        fn mmap(
+            addr: *mut std::ffi::c_void,
+            len: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            offset: i64,
+        ) -> *mut std::ffi::c_void;
+        fn munmap(addr: *mut std::ffi::c_void, len: usize) -> i32;
+    }
+    let len = frame.offset as usize + frame.stride as usize * frame.height as usize;
+    // SAFETY: a read-only shared mapping of a descriptor we hold, checked
+    // for failure, read within its length and unmapped before returning.
+    unsafe {
+        let map = mmap(std::ptr::null_mut(), len, 1, 1, frame.fd.as_raw_fd(), 0);
+        if map as isize == -1 {
+            return None;
+        }
+        let bytes = std::slice::from_raw_parts(map.cast::<u8>(), len);
+        let mut out = Vec::with_capacity((frame.width * frame.height) as usize);
+        for y in 0..frame.height as usize {
+            let row = frame.offset as usize + y * frame.stride as usize;
+            for x in 0..frame.width as usize {
+                let p = &bytes[row + x * 4..row + x * 4 + 4];
+                out.push(u32::from_le_bytes([p[0], p[1], p[2], p[3]]));
+            }
+        }
+        munmap(map, len);
+        Some(out)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn exported_frames_hold_what_the_cpu_reference_draws() {
+    let palette = Palette::default();
+    let mut atlas = Atlas::new(M, 256, 256);
+    let mut raster = TestRasterizer { metrics: M };
+    let mut s = Screen::new(5, 12);
+    let (w, h) = (12 * M.cell_w, 5 * M.cell_h);
+    s.write_str(0, 0, "exported", Style::default());
+    s.write_str(2, 3, "frames", styled(Color::Indexed(2), Color::Indexed(4)));
+    let mut frame = Frame::new();
+    frame.update(&s, true, &palette, &mut atlas, &mut raster);
+
+    let mut gpu = match VkRenderer::exporting(w, h, &atlas, 2) {
+        Ok(r) => r,
+        Err(e) if unavailable(&e) => {
+            println!("skipping: no exporting renderer: {e}");
+            return;
+        }
+        Err(e) => panic!("VkRenderer::exporting: {e}"),
+    };
+    let shown = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let rebuilt = std::rc::Rc::new(std::cell::Cell::new(0));
+    gpu.set_sink(Box::new(Recorder {
+        next: 0,
+        images: 2,
+        shown: shown.clone(),
+        rebuilt: rebuilt.clone(),
+    }));
+    let frames = gpu.frames().expect("frames");
+    assert_eq!(frames.len(), 2);
+    assert!(frames
+        .iter()
+        .all(|f| f.stride >= w * 4 && (f.width, f.height) == (w, h)));
+
+    let mut cpu = CpuRenderer::new(w, h);
+    let mut compare = |gpu: &mut VkRenderer, frame: &mut Frame, atlas: &mut Atlas, what: &str| {
+        let stats = gpu.draw(frame, atlas).expect("draw");
+        assert!(!stats.skipped, "{what}: drawn");
+        cpu.draw(frame, atlas);
+        frame.clear_damage();
+        let index = *shown.borrow().last().expect("the sink was shown a frame");
+        let Some(got) = mapped(&gpu.frames().expect("frames")[index]) else {
+            println!("skipping the comparison: this driver's dmabuf cannot be mapped");
+            return;
+        };
+        let worst = got
+            .iter()
+            .zip(cpu.pixels())
+            .flat_map(|(a, b)| {
+                (0..3).map(move |c| (a >> (8 * c) & 0xFF).abs_diff(b >> (8 * c) & 0xFF))
+            })
+            .max()
+            .unwrap();
+        println!(
+            "{what}: image {index}, {} pixels, max channel difference {worst}",
+            got.len()
+        );
+        assert!(worst <= 1, "{what}: channel difference {worst}");
+    };
+    compare(&mut gpu, &mut frame, &mut atlas, "first frame");
+    // The second frame goes to the other image, which has never been drawn:
+    // it must be whole, not only the row that changed.
+    s.write_str(4, 0, "second", Style::default());
+    frame.update(&s, false, &palette, &mut atlas, &mut raster);
+    compare(&mut gpu, &mut frame, &mut atlas, "second frame");
+    assert_eq!(*shown.borrow(), [0, 1]);
+
+    // Nothing changed: nothing is drawn or shown.
+    assert!(gpu.draw(&frame, &mut atlas).expect("draw").skipped);
+    assert_eq!(shown.borrow().len(), 2);
+
+    // A new size: new images, and the sink is told.
+    let (w2, h2) = (10 * M.cell_w, 4 * M.cell_h);
+    gpu.resize(w2, h2).expect("resize");
+    assert_eq!(rebuilt.get(), 2);
+    assert_eq!(gpu.size(), (w2, h2));
 }

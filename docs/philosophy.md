@@ -319,9 +319,7 @@ Nothing above is assumed. These are the calls it needs:
     under `~/.config`, logs under `~/.local/state`).
 14. **A title bar on GNOME.** GNOME draws none for an application. Our own,
     in the grid like the instrument strip, or the `libdecor` library.
-15. **Vulkan frames on Linux.** With our own Wayland library there is no
-    Vulkan surface to draw to, so Linux draws on the CPU renderer. The way
-    back to the GPU is Vulkan images handed to the compositor as dmabufs, with
-    our own frame pacing: whether to build it now, or run on the CPU renderer
-    while the rest of the Linux port catches up. It decides E7 (key to
-    photon) on Linux.
+15. ~~Vulkan frames on Linux.~~ **Built 2026-11-18** (design §8.9): Vulkan
+    images handed to the compositor as dmabufs. The Wayland half is checked
+    against a compositor; the Vulkan export has not run, for want of a
+    graphics device. It needs a first run on a machine with a GPU.

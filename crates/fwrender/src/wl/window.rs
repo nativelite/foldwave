@@ -12,8 +12,10 @@
 //! a time, and turned into [`Event`]s.
 
 use super::keys;
+use super::linux_dmabuf::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1, ZwpLinuxDmabufV1};
 use crate::cpu::CpuRenderer;
 pub use crate::event::{Cursor, Event, TaskbarProgress};
+use crate::vk::{Dmabuf, FrameSink};
 use std::cell::RefCell;
 use std::ffi::{c_char, c_int, c_long, c_void};
 use std::fs::File;
@@ -22,12 +24,13 @@ use std::ops::Range;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use wayland::protocol::wayland::{
     wl_buffer, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm, WlBuffer, WlCompositor,
-    WlKeyboard, WlPointer, WlSeat, WlShm, WlSurface,
+    WlKeyboard, WlPointer, WlRegistry, WlSeat, WlShm, WlSurface,
 };
 use wayland::protocol::xdg_shell::{
     xdg_surface, xdg_toplevel, xdg_wm_base, XdgSurface, XdgToplevel, XdgWmBase,
@@ -232,9 +235,24 @@ impl Keyboard {
     }
 }
 
+/// `DRM_FORMAT_XRGB8888`: the bytes of this crate's `0xAARRGGBB`.
+const FOURCC_XRGB8888: u32 = 0x3432_5258;
+/// `DRM_FORMAT_MOD_LINEAR`: rows one after another, nothing else.
+const MOD_LINEAR: u64 = 0;
+/// `DRM_FORMAT_MOD_INVALID`: "the layout the driver gives by default".
+const MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+/// The dmabuf global is bound no higher than this: from version 4 a client
+/// must read the formats from a shared table instead of plain events.
+const DMABUF_VERSION: u32 = 3;
+
 /// The connection and everything learned from it.
 struct Inner {
     conn: Connection,
+    registry: WlRegistry,
+    /// The compositor's dmabuf global, if it has one: its name and version.
+    dmabuf: Option<(u32, u32)>,
+    /// The window has been dropped: nothing more is sent for it.
+    closed: bool,
     shm: WlShm,
     wm_base: XdgWmBase,
     surface: WlSurface,
@@ -498,7 +516,8 @@ impl Inner {
 ///
 /// A window is used from the thread that created it; dropping it closes it.
 pub struct Window {
-    inner: RefCell<Inner>,
+    /// Shared with whoever shows GPU frames in the window ([`GpuFrames`]).
+    inner: Rc<RefCell<Inner>>,
     /// What [`Waker`]s write to, and the end [`Window::wait`] sleeps on.
     wake_tx: Arc<UnixStream>,
     wake_rx: UnixStream,
@@ -525,7 +544,7 @@ impl Window {
         wake_rx.set_nonblocking(true)?;
         let inner = Window::open(title, width.max(1), height.max(1)).map_err(other)?;
         Ok(Window {
-            inner: RefCell::new(inner),
+            inner: Rc::new(RefCell::new(inner)),
             wake_tx: Arc::new(wake_tx),
             wake_rx,
             alive: Arc::new(()),
@@ -584,8 +603,12 @@ impl Window {
         // be acknowledged before anything is drawn.
         surface.commit(&mut conn)?;
 
+        let dmabuf = find("zwp_linux_dmabuf_v1");
         let mut inner = Inner {
             conn,
+            registry,
+            dmabuf,
+            closed: false,
             shm,
             wm_base,
             surface,
@@ -730,7 +753,7 @@ impl Window {
     /// `events`. Never blocks.
     pub fn poll(&mut self, events: &mut Vec<Event>) {
         self.pump(Some(Duration::ZERO));
-        events.append(&mut self.inner.get_mut().events);
+        events.append(&mut self.inner.borrow_mut().events);
     }
 
     /// As [`Window::poll`], but sleep until something happens or `timeout`
@@ -742,29 +765,24 @@ impl Window {
             let now = Instant::now();
             let left = deadline.map(|d| d.saturating_duration_since(now));
             // Wake for the next repeat of a held key, if that comes first.
-            let repeat = self
-                .inner
-                .get_mut()
-                .keys
-                .held
-                .map(|h| h.next.saturating_duration_since(now));
+            let held = self.inner.borrow().keys.held;
+            let repeat = held.map(|h| h.next.saturating_duration_since(now));
             let sleep = match (left, repeat) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
             };
             self.pump(sleep);
-            let inner = self.inner.get_mut();
-            if !inner.events.is_empty() || left.is_some_and(|l| l.is_zero()) {
+            if !self.inner.borrow().events.is_empty() || left.is_some_and(|l| l.is_zero()) {
                 break;
             }
         }
-        events.append(&mut self.inner.get_mut().events);
+        events.append(&mut self.inner.borrow_mut().events);
     }
 
     /// One turn of the loop: flush, sleep at most `sleep` for the
     /// compositor or a waker, read and handle, and repeat a held key.
     fn pump(&mut self, sleep: Option<Duration>) {
-        let inner = self.inner.get_mut();
+        let inner = &mut *self.inner.borrow_mut();
         if inner.lost {
             // Nothing more will come; do not spin on a dead socket.
             if let Some(sleep) = sleep.filter(|_| inner.events.is_empty()) {
@@ -833,7 +851,8 @@ impl Window {
 
 impl Drop for Window {
     fn drop(&mut self) {
-        let inner = self.inner.get_mut();
+        let inner = &mut *self.inner.borrow_mut();
+        inner.closed = true;
         if inner.lost {
             return;
         }
@@ -844,6 +863,237 @@ impl Drop for Window {
         let _ = inner.surface.destroy(conn);
         let _ = inner.wm_base.destroy(conn);
         let _ = conn.flush();
+    }
+}
+
+/// Shows an exporting Vulkan renderer's frames in a [`Window`]: each of the
+/// renderer's images, handed to the compositor once as a dmabuf
+/// (`zwp_linux_dmabuf_v1`), then attached whenever it holds a new frame.
+/// This is how the GPU draws a Wayland window without Vulkan's own surface.
+///
+/// **Written, and not yet run with a real buffer**: the machine it was
+/// written on has no graphics device, so nothing there can make a dmabuf.
+/// Everything the compositor can refuse is asked for before a frame is
+/// drawn, and a refusal is an error from [`Window::gpu_frames`], so a caller
+/// falls back to [`CpuPresenter`].
+pub struct GpuFrames {
+    inner: Rc<RefCell<Inner>>,
+    dmabuf: ZwpLinuxDmabufV1,
+    /// The modifier the compositor is told: how the rows are laid out.
+    modifier: u64,
+    /// One for each of the renderer's images, and whether the compositor
+    /// still holds it.
+    buffers: Vec<(WlBuffer, bool)>,
+    size: (u32, u32),
+}
+
+impl std::fmt::Debug for GpuFrames {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuFrames")
+            .field("buffers", &self.buffers.len())
+            .field("size", &self.size)
+            .finish()
+    }
+}
+
+/// Which modifier to describe row-by-row frames with, from what the
+/// compositor listed for the format: plain rows if it names them, else the
+/// driver's default if it takes that; `None` if it takes neither. A
+/// compositor too old to list modifiers (`listed` is `None`) takes the
+/// default.
+fn pick_modifier(listed: Option<&[u64]>) -> Option<u64> {
+    match listed {
+        None => Some(MOD_INVALID),
+        Some(m) if m.contains(&MOD_LINEAR) => Some(MOD_LINEAR),
+        Some(m) if m.contains(&MOD_INVALID) => Some(MOD_INVALID),
+        Some(_) => None,
+    }
+}
+
+impl Window {
+    /// Hand an exporting renderer's images to the compositor, to show its
+    /// frames in this window. Fails, changing nothing the window shows,
+    /// when the compositor has no dmabuf support, does not take 32-bit
+    /// row-by-row frames, or refuses a buffer.
+    pub fn gpu_frames(&self, frames: Vec<Dmabuf>) -> io::Result<GpuFrames> {
+        let inner = &mut *self.inner.borrow_mut();
+        let (name, version) = inner
+            .dmabuf
+            .ok_or_else(|| other("the compositor has no zwp_linux_dmabuf_v1"))?;
+        let version = version.min(DMABUF_VERSION);
+        let dmabuf: ZwpLinuxDmabufV1 = inner
+            .registry
+            .bind(&mut inner.conn, name, version)
+            .map_err(other)?;
+        // The compositor lists what it takes as soon as the global is bound.
+        let (mut format, mut modifiers) = (false, Vec::new());
+        inner.conn.roundtrip().map_err(other)?;
+        while let Some(event) = inner.conn.next_event().map_err(other)? {
+            if !event.is_for(&dmabuf) {
+                inner.handle(event).map_err(other)?;
+                continue;
+            }
+            match zwp_linux_dmabuf_v1::Event::decode(event).map_err(other)? {
+                zwp_linux_dmabuf_v1::Event::Format { format: f } => {
+                    format |= f == FOURCC_XRGB8888;
+                }
+                zwp_linux_dmabuf_v1::Event::Modifier {
+                    format: f,
+                    modifier_hi,
+                    modifier_lo,
+                } if f == FOURCC_XRGB8888 => {
+                    format = true;
+                    modifiers.push(u64::from(modifier_hi) << 32 | u64::from(modifier_lo));
+                }
+                _ => {}
+            }
+        }
+        let listed = (version >= 3).then_some(&modifiers[..]);
+        let modifier = match (format, pick_modifier(listed)) {
+            (true, Some(m)) => m,
+            _ => {
+                let _ = dmabuf.destroy(&mut inner.conn);
+                return Err(other(
+                    "the compositor does not take 32-bit row-by-row dmabufs",
+                ));
+            }
+        };
+        let mut out = GpuFrames {
+            inner: self.inner.clone(),
+            dmabuf,
+            modifier,
+            buffers: Vec::new(),
+            size: (0, 0),
+        };
+        out.create(inner, frames)?;
+        Ok(out)
+    }
+}
+
+impl GpuFrames {
+    /// Make a `wl_buffer` of each frame, waiting for the compositor to
+    /// accept or refuse each one.
+    fn create(&mut self, inner: &mut Inner, frames: Vec<Dmabuf>) -> io::Result<()> {
+        let mut made = Vec::with_capacity(frames.len());
+        let mut size = self.size;
+        for frame in &frames {
+            let conn = &mut inner.conn;
+            let params = self.dmabuf.create_params(conn).map_err(other)?;
+            params
+                .add(
+                    conn,
+                    frame.fd.as_fd(),
+                    0,
+                    frame.offset,
+                    frame.stride,
+                    (self.modifier >> 32) as u32,
+                    self.modifier as u32,
+                )
+                .map_err(other)?;
+            params
+                .create(
+                    conn,
+                    frame.width as i32,
+                    frame.height as i32,
+                    FOURCC_XRGB8888,
+                    0,
+                )
+                .map_err(other)?;
+            // `created` or `failed` answers; anything else is the window's.
+            let mut answer = None;
+            inner.conn.roundtrip().map_err(other)?;
+            while let Some(event) = inner.conn.next_event().map_err(other)? {
+                if event.is_for(&params) {
+                    answer = Some(zwp_linux_buffer_params_v1::Event::decode(event).map_err(other)?);
+                } else {
+                    inner.handle(event).map_err(other)?;
+                }
+            }
+            let _ = params.destroy(&mut inner.conn);
+            match answer {
+                Some(zwp_linux_buffer_params_v1::Event::Created { buffer }) => {
+                    made.push((buffer, false));
+                }
+                _ => {
+                    for (buffer, _) in made {
+                        let _ = buffer.destroy(&mut inner.conn);
+                    }
+                    return Err(other("the compositor refused a Vulkan frame's dmabuf"));
+                }
+            }
+            size = (frame.width, frame.height);
+        }
+        self.buffers = made;
+        self.size = size;
+        Ok(())
+    }
+
+    fn lost() -> crate::vk::Error {
+        crate::vk::Error::Unsupported("the Wayland connection was lost")
+    }
+}
+
+impl FrameSink for GpuFrames {
+    fn acquire(&mut self) -> Option<usize> {
+        let inner = &mut *self.inner.borrow_mut();
+        if inner.closed || inner.lost {
+            return None;
+        }
+        for id in inner.released.drain(..) {
+            if let Some(b) = self.buffers.iter_mut().find(|(b, _)| b.id() == id) {
+                b.1 = false;
+            }
+        }
+        self.buffers.iter().position(|(_, busy)| !busy)
+    }
+
+    fn present(&mut self, index: usize) -> Result<(), crate::vk::Error> {
+        let inner = &mut *self.inner.borrow_mut();
+        let Some((buffer, busy)) = self.buffers.get_mut(index) else {
+            return Ok(());
+        };
+        if inner.closed || inner.lost {
+            return Ok(());
+        }
+        let surface = inner.surface;
+        let conn = &mut inner.conn;
+        let version = conn.object(surface.id()).map_or(1, |(_, v)| v);
+        let (w, h) = (self.size.0 as i32, self.size.1 as i32);
+        let sent = (|| {
+            surface.attach(conn, Some(*buffer), 0, 0)?;
+            if version >= 4 {
+                surface.damage_buffer(conn, 0, 0, w, h)?;
+            } else {
+                surface.damage(conn, 0, 0, w, h)?;
+            }
+            surface.commit(conn)?;
+            conn.flush()
+        })();
+        match sent {
+            Ok(()) => {
+                *busy = true;
+                Ok(())
+            }
+            Err(_) => {
+                inner.lose();
+                Err(GpuFrames::lost())
+            }
+        }
+    }
+
+    fn rebuild(&mut self, frames: Vec<Dmabuf>) -> Result<(), crate::vk::Error> {
+        let inner_rc = self.inner.clone();
+        let inner = &mut *inner_rc.borrow_mut();
+        if inner.closed || inner.lost {
+            return Ok(());
+        }
+        // The compositor keeps what it still shows; the objects can go.
+        for (buffer, _) in std::mem::take(&mut self.buffers) {
+            let _ = buffer.destroy(&mut inner.conn);
+        }
+        self.create(inner, frames).map_err(|_| {
+            crate::vk::Error::Unsupported("the compositor refused a Vulkan frame's dmabuf")
+        })
     }
 }
 
@@ -1170,6 +1420,23 @@ xkb_keymap {
         assert_eq!(keys.typed(KEY_1), "", "the sequence has begun");
         assert_eq!(keys.typed(KEY_Q), "ä");
         assert_eq!(keys.typed(KEY_Q), "a", "and is over");
+    }
+
+    #[test]
+    fn row_by_row_frames_are_described_by_a_modifier_the_compositor_listed() {
+        assert_eq!(
+            pick_modifier(Some(&[7, MOD_LINEAR, MOD_INVALID])),
+            Some(MOD_LINEAR)
+        );
+        assert_eq!(pick_modifier(Some(&[7, MOD_INVALID])), Some(MOD_INVALID));
+        assert_eq!(
+            pick_modifier(Some(&[7])),
+            None,
+            "only a tiled layout: refused"
+        );
+        assert_eq!(pick_modifier(Some(&[])), None);
+        // Before version 3 a compositor lists no modifiers at all.
+        assert_eq!(pick_modifier(None), Some(MOD_INVALID));
     }
 
     #[test]

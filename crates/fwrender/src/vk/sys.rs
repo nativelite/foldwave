@@ -161,6 +161,11 @@ pub const ST_MEMORY_BARRIER: VkEnum = 46;
 pub const ST_SWAPCHAIN_CREATE_INFO_KHR: VkEnum = 1_000_001_000;
 pub const ST_PRESENT_INFO_KHR: VkEnum = 1_000_001_001;
 pub const ST_WIN32_SURFACE_CREATE_INFO_KHR: VkEnum = 1_000_009_000;
+pub const ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO: VkEnum = 1_000_072_001;
+pub const ST_EXPORT_MEMORY_ALLOCATE_INFO: VkEnum = 1_000_072_002;
+pub const ST_MEMORY_GET_FD_INFO_KHR: VkEnum = 1_000_074_002;
+/// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT`.
+pub const EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT: VkFlags = 0x200;
 
 /// `VK_MAKE_API_VERSION(0, 1, 0, 0)`: major in bits 22..28.
 pub const VK_API_VERSION_1_0: u32 = 1 << 22;
@@ -207,6 +212,7 @@ pub const SHARING_MODE_EXCLUSIVE: VkEnum = 0;
 pub const IMAGE_TYPE_2D: VkEnum = 1;
 pub const IMAGE_VIEW_TYPE_2D: VkEnum = 1;
 pub const IMAGE_TILING_OPTIMAL: VkEnum = 0;
+pub const IMAGE_TILING_LINEAR: VkEnum = 1;
 pub const SAMPLE_COUNT_1_BIT: VkFlags = 0x1;
 pub const COMPONENT_SWIZZLE_IDENTITY: VkEnum = 0;
 pub const IMAGE_ASPECT_COLOR_BIT: VkFlags = 0x1;
@@ -269,6 +275,14 @@ pub const KHR_WIN32_SURFACE: &str = "VK_KHR_win32_surface\0";
 #[cfg(windows)]
 pub const KHR_PLATFORM_SURFACE: &str = KHR_WIN32_SURFACE;
 pub const KHR_SWAPCHAIN: &str = "VK_KHR_swapchain\0";
+// Exporting an image's memory as a dmabuf (Linux). The first two are
+// instance extensions and the rest device extensions; all five are core or
+// near-universal since Vulkan 1.1, and named here so a 1.0 instance can ask.
+pub const KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2: &str = "VK_KHR_get_physical_device_properties2\0";
+pub const KHR_EXTERNAL_MEMORY_CAPABILITIES: &str = "VK_KHR_external_memory_capabilities\0";
+pub const KHR_EXTERNAL_MEMORY: &str = "VK_KHR_external_memory\0";
+pub const KHR_EXTERNAL_MEMORY_FD: &str = "VK_KHR_external_memory_fd\0";
+pub const EXT_EXTERNAL_MEMORY_DMA_BUF: &str = "VK_EXT_external_memory_dma_buf\0";
 
 // ---------------------------------------------------------------- structures
 
@@ -934,6 +948,47 @@ pub struct VkSemaphoreCreateInfo {
     pub flags: VkFlags,
 }
 
+/// Chained to an image's create info: its memory may be exported.
+#[repr(C)]
+pub struct VkExternalMemoryImageCreateInfo {
+    pub sType: VkEnum,
+    pub pNext: *const c_void,
+    pub handleTypes: VkFlags,
+}
+
+/// Chained to an allocation: the memory may be exported.
+#[repr(C)]
+pub struct VkExportMemoryAllocateInfo {
+    pub sType: VkEnum,
+    pub pNext: *const c_void,
+    pub handleTypes: VkFlags,
+}
+
+#[repr(C)]
+pub struct VkMemoryGetFdInfoKHR {
+    pub sType: VkEnum,
+    pub pNext: *const c_void,
+    pub memory: VkDeviceMemory,
+    pub handleType: VkFlags,
+}
+
+#[repr(C)]
+pub struct VkImageSubresource {
+    pub aspectMask: VkFlags,
+    pub mipLevel: u32,
+    pub arrayLayer: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct VkSubresourceLayout {
+    pub offset: VkDeviceSize,
+    pub size: VkDeviceSize,
+    pub rowPitch: VkDeviceSize,
+    pub arrayPitch: VkDeviceSize,
+    pub depthPitch: VkDeviceSize,
+}
+
 #[repr(C)]
 pub struct VkWin32SurfaceCreateInfoKHR {
     pub sType: VkEnum,
@@ -1115,6 +1170,8 @@ fns!(DeviceFns {
     destroy_image: "vkDestroyImage" = fn(VkDevice, VkImage, Alloc);
     get_image_memory_requirements: "vkGetImageMemoryRequirements" =
         fn(VkDevice, VkImage, *mut VkMemoryRequirements);
+    get_image_subresource_layout: "vkGetImageSubresourceLayout" =
+        fn(VkDevice, VkImage, *const VkImageSubresource, *mut VkSubresourceLayout);
     bind_image_memory: "vkBindImageMemory" =
         fn(VkDevice, VkImage, VkDeviceMemory, VkDeviceSize) -> VkResult;
     create_image_view: "vkCreateImageView" =
@@ -1194,6 +1251,12 @@ fns!(SwapchainFns {
     acquire_next_image: "vkAcquireNextImageKHR" =
         fn(VkDevice, VkSwapchainKHR, u64, VkSemaphore, VkFence, *mut u32) -> VkResult;
     queue_present: "vkQueuePresentKHR" = fn(VkQueue, *const VkPresentInfoKHR) -> VkResult;
+});
+
+// `VK_KHR_external_memory_fd`: loaded only for a renderer that exports.
+fns!(ExportFns {
+    get_memory_fd: "vkGetMemoryFdKHR" =
+        fn(VkDevice, *const VkMemoryGetFdInfoKHR, *mut i32) -> VkResult;
 });
 
 // ------------------------------------------------------------------- loader

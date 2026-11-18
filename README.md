@@ -96,9 +96,10 @@ as a first cut: `cargo build --release --bin fwterm`, then
 `target/release/fwterm`. It needs nothing installed: Wayland is spoken by
 [`nativelite-wayland`](https://github.com/nativelite/wayland-rs) and the
 keyboard read by [`nativelite-xkb`](https://github.com/nativelite/xkb-rs),
-nativelite's own, and the binary links libc alone. For now the window is
-drawn by the CPU renderer. What works and what does not yet (no GPU drawing,
-no clipboard, no title bar on GNOME, no installer) is in
+nativelite's own, and the binary links libc alone. The GPU draws the window
+where the driver and the compositor both handle dmabufs (written, and not
+yet run on a real GPU); otherwise the CPU renderer does. What works and what
+does not yet (no clipboard, no title bar on GNOME, no installer) is in
 [`docs/design.md`](docs/design.md) §8.9.
 
 ## Install (Windows)

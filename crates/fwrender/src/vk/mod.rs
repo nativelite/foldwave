@@ -57,6 +57,43 @@ use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 use sys::*;
 
+/// How many images a window's exporting renderer draws into in turn: one
+/// on screen, one waiting, one to draw.
+#[cfg(target_os = "linux")]
+const EXPORT_IMAGES: usize = 3;
+
+/// Why a renderer cannot export its frames.
+const NO_EXPORT: &str = "the Vulkan driver cannot export frames as dmabufs";
+
+/// One image of an exporting renderer, as a window system receives it: a
+/// dmabuf of 32-bit pixels, blue first (`XRGB8888`), one plane, row by row.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct Dmabuf {
+    /// The memory.
+    pub fd: std::os::fd::OwnedFd,
+    /// Pixels across.
+    pub width: u32,
+    /// Pixels down.
+    pub height: u32,
+    /// Where the first row starts, in bytes.
+    pub offset: u32,
+    /// Bytes from one row to the next.
+    pub stride: u32,
+}
+
+/// Who shows an exporting renderer's frames ([`VkRenderer::exporting`]).
+pub trait FrameSink {
+    /// The index of an image nobody is showing, to draw the next frame
+    /// into; `None` when all are held.
+    fn acquire(&mut self) -> Option<usize>;
+    /// Image `index` holds a finished frame: show it.
+    fn present(&mut self, index: usize) -> Result<(), Error>;
+    /// The images were replaced (a new size): these are the new ones.
+    #[cfg(target_os = "linux")]
+    fn rebuild(&mut self, frames: Vec<Dmabuf>) -> Result<(), Error>;
+}
+
 /// How a window's swapchain presents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresentMode {
@@ -199,7 +236,7 @@ impl Drop for Instance {
     }
 }
 
-fn create_instance(window: bool) -> Result<Instance, Error> {
+fn create_instance(window: bool, export: bool) -> Result<Instance, Error> {
     let gipa = sys::load().map_err(|e| match e {
         LoadError::Library(code) => Error::LibraryNotFound(code),
         LoadError::Symbol(s) => Error::MissingSymbol(s),
@@ -237,6 +274,29 @@ fn create_instance(window: bool) -> Result<Instance, Error> {
                 return Err(Error::Unsupported(
                     "VK_KHR_surface or the window system's surface extension",
                 ));
+            }
+            extensions.push(want.as_ptr());
+        }
+    }
+
+    if export {
+        // What a 1.0 instance must enable before a device may export memory.
+        let available = enumerate(
+            "vkEnumerateInstanceExtensionProperties",
+            VkExtensionProperties {
+                extensionName: [0; 256],
+                specVersion: 0,
+            },
+            // SAFETY: as for a window, above.
+            |n, p| unsafe { (entry.enumerate_instance_extension_properties)(null(), n, p) },
+        )?;
+        for want in [
+            KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2,
+            KHR_EXTERNAL_MEMORY_CAPABILITIES,
+        ] {
+            let name = want.trim_end_matches('\0');
+            if !available.iter().any(|e| c_name(&e.extensionName) == name) {
+                return Err(Error::Unsupported(NO_EXPORT));
             }
             extensions.push(want.as_ptr());
         }
@@ -409,6 +469,12 @@ pub struct VkRenderer {
 
     offscreen: Option<Offscreen>,
     window: Option<Window>,
+    /// The images of a renderer that exports its frames: each drawn in turn
+    /// and handed to whoever shows them ([`VkRenderer::exporting`]).
+    exports: Vec<Offscreen>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    export_fns: Option<ExportFns>,
+    sink: Option<Box<dyn FrameSink>>,
     /// Something invisible to the frame changed (resize, new swapchain, a
     /// frame that never reached the screen): the next draw must not skip.
     needs_draw: bool,
@@ -438,8 +504,8 @@ impl VkRenderer {
         if width == 0 || height == 0 {
             return Err(Error::InvalidArgument("offscreen size must be non-zero"));
         }
-        let instance = create_instance(false)?;
-        let mut r = VkRenderer::build(instance, FORMAT_B8G8R8A8_UNORM, atlas, false)?;
+        let instance = create_instance(false, false)?;
+        let mut r = VkRenderer::build(instance, FORMAT_B8G8R8A8_UNORM, atlas, false, false)?;
         r.width = width;
         r.height = height;
         let o = r.make_offscreen(width, height)?;
@@ -465,7 +531,7 @@ impl VkRenderer {
         atlas: &Atlas,
         mode: PresentMode,
     ) -> Result<VkRenderer, Error> {
-        let mut instance = create_instance(true)?;
+        let mut instance = create_instance(true, false)?;
         let info = VkWin32SurfaceCreateInfoKHR {
             sType: ST_WIN32_SURFACE_CREATE_INFO_KHR,
             pNext: null(),
@@ -527,7 +593,7 @@ impl VkRenderer {
             PRESENT_MODE_FIFO_KHR
         };
 
-        let mut r = VkRenderer::build(instance, pick.format, atlas, true)?;
+        let mut r = VkRenderer::build(instance, pick.format, atlas, true, false)?;
         r.width = width;
         r.height = height;
         let fns = {
@@ -563,6 +629,172 @@ impl VkRenderer {
         Ok(r)
     }
 
+    /// A renderer that draws into `images` images of `width x height` whose
+    /// memory leaves the process as dmabufs ([`VkRenderer::frames`]), for a
+    /// window system that takes frames that way. There is no swapchain:
+    /// [`VkRenderer::set_sink`] names who shows the frames, and each
+    /// [`VkRenderer::draw`] asks it for a free image, draws into it, waits
+    /// for the GPU to finish, and hands it over.
+    ///
+    /// The images are laid out row by row (`VK_IMAGE_TILING_LINEAR`), the
+    /// one layout that can be described to a receiver with nothing more
+    /// than a row length. A driver that cannot export gives
+    /// [`Error::Unsupported`].
+    #[cfg(target_os = "linux")]
+    pub fn exporting(
+        width: u32,
+        height: u32,
+        atlas: &Atlas,
+        images: usize,
+    ) -> Result<VkRenderer, Error> {
+        if width == 0 || height == 0 || images == 0 {
+            return Err(Error::InvalidArgument(
+                "an exporting renderer needs a size and an image",
+            ));
+        }
+        let instance = create_instance(false, true)?;
+        let mut r = VkRenderer::build(instance, FORMAT_B8G8R8A8_UNORM, atlas, false, true)?;
+        let (dev, gdpa) = (r.device, r.instance.fns.get_device_proc_addr);
+        // SAFETY: a live device and a NUL-terminated name.
+        r.export_fns = Some(
+            ExportFns::load(|name| unsafe { gdpa(dev, name.as_ptr()) })
+                .map_err(|_| Error::Unsupported(NO_EXPORT))?,
+        );
+        r.width = width;
+        r.height = height;
+        for _ in 0..images {
+            // A driver may list the extensions and still have nothing to
+            // back a dmabuf with (a software driver with no kernel support):
+            // it says so here, and that is "cannot export", not a fault.
+            let target = r
+                .make_target(width, height, true)
+                .map_err(|_| Error::Unsupported(NO_EXPORT))?;
+            r.exports.push(target);
+        }
+        Ok(r)
+    }
+
+    /// Who shows an exporting renderer's frames.
+    #[cfg(target_os = "linux")]
+    pub fn set_sink(&mut self, sink: Box<dyn FrameSink>) {
+        self.sink = Some(sink);
+        self.needs_draw = true;
+    }
+
+    /// Every image of an exporting renderer as a dmabuf, in order: the
+    /// index [`FrameSink`] is asked for and told. Each call hands out new
+    /// descriptors to the same memory.
+    #[cfg(target_os = "linux")]
+    pub fn frames(&self) -> Result<Vec<Dmabuf>, Error> {
+        use std::os::fd::FromRawFd;
+        let fns = self
+            .export_fns
+            .as_ref()
+            .ok_or(Error::InvalidArgument("frames needs an exporting renderer"))?;
+        let mut out = Vec::with_capacity(self.exports.len());
+        for o in &self.exports {
+            let info = VkMemoryGetFdInfoKHR {
+                sType: ST_MEMORY_GET_FD_INFO_KHR,
+                pNext: null(),
+                memory: o.memory,
+                handleType: EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT,
+            };
+            let mut fd = -1i32;
+            // SAFETY: live device and memory allocated for export with this
+            // handle type; a valid out-pointer.
+            check("vkGetMemoryFdKHR", unsafe {
+                (fns.get_memory_fd)(self.device, &info, &mut fd)
+            })?;
+            // SAFETY: on success the call returns a new descriptor that is
+            // the caller's to close.
+            let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+            let which = VkImageSubresource {
+                aspectMask: IMAGE_ASPECT_COLOR_BIT,
+                mipLevel: 0,
+                arrayLayer: 0,
+            };
+            let mut layout = VkSubresourceLayout::default();
+            // SAFETY: a live linear image; valid pointers.
+            unsafe {
+                (self.dev.get_image_subresource_layout)(self.device, o.image, &which, &mut layout)
+            };
+            out.push(Dmabuf {
+                fd,
+                width: self.width,
+                height: self.height,
+                offset: layout.offset as u32,
+                stride: layout.rowPitch as u32,
+            });
+        }
+        Ok(out)
+    }
+
+    /// New images at a new size for an exporting renderer; the sink is
+    /// given the new frames.
+    fn resize_exports(&mut self, width: u32, height: u32) -> Result<(), Error> {
+        let count = self.exports.len();
+        // Whoever still shows an old frame holds its memory through the
+        // dmabuf; the image itself can go.
+        for mut o in std::mem::take(&mut self.exports) {
+            self.free_offscreen(&mut o);
+        }
+        self.width = width;
+        self.height = height;
+        for _ in 0..count {
+            let target = self.make_target(width, height, true)?;
+            self.exports.push(target);
+        }
+        #[cfg(target_os = "linux")]
+        if self.sink.is_some() {
+            let frames = self.frames()?;
+            if let Some(sink) = self.sink.as_mut() {
+                sink.rebuild(frames)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One frame of an exporting renderer: into a free image, finished, and
+    /// handed to the sink. With no image free (whoever shows them still
+    /// holds them all) the frame's contents are kept for the next draw.
+    fn draw_export(
+        &mut self,
+        frame: &Frame,
+        atlas: &Atlas,
+        band: Option<Range<u32>>,
+        regrid: bool,
+        mut stats: DrawStats,
+    ) -> Result<DrawStats, Error> {
+        let index = self.sink.as_mut().and_then(|s| s.acquire());
+        let Some(index) = index.filter(|i| *i < self.exports.len()) else {
+            self.stage(frame, atlas, band, regrid, &mut stats)?;
+            self.needs_draw = true;
+            stats.skipped = true;
+            return Ok(stats);
+        };
+        let t = Instant::now();
+        self.stage(frame, atlas, band, regrid, &mut stats)?;
+        // The image is the offscreen target for the length of this draw.
+        let target = std::mem::replace(&mut self.exports[index], Offscreen::EMPTY);
+        let before = self.offscreen.replace(target);
+        let drawn = self
+            .record_and_submit(frame, None, 0, &mut stats)
+            // The receiver reads the image as soon as it is handed over.
+            .and_then(|()| self.wait_fence());
+        if let Some(target) = std::mem::replace(&mut self.offscreen, before) {
+            self.exports[index] = target;
+        }
+        stats.record_submit = t.elapsed();
+        drawn?;
+        self.needs_draw = false;
+        let t = Instant::now();
+        if let Some(sink) = self.sink.as_mut() {
+            sink.present(index)?;
+        }
+        stats.present = t.elapsed();
+        Ok(stats)
+    }
+
     /// The physical device's name, e.g. `NVIDIA GeForce RTX 3070`.
     pub fn device_name(&self) -> &str {
         &self.device_name
@@ -590,6 +822,9 @@ impl VkRenderer {
             return Err(Error::InvalidArgument("offscreen size must be non-zero"));
         }
         self.wait_fence()?;
+        if !self.exports.is_empty() {
+            return self.resize_exports(width, height);
+        }
         if let Some(mut o) = self.offscreen.take() {
             self.free_offscreen(&mut o);
         }
@@ -630,6 +865,10 @@ impl VkRenderer {
         // One frame in flight: after this, the GPU reads none of the host
         // memory written below.
         self.wait_fence()?;
+
+        if !self.exports.is_empty() {
+            return self.draw_export(frame, atlas, band, regrid, stats);
+        }
 
         let mut image_index = 0;
         let mut window = self.window.take();
@@ -787,6 +1026,7 @@ impl VkRenderer {
         format: VkEnum,
         atlas: &Atlas,
         window: bool,
+        export: bool,
     ) -> Result<VkRenderer, Error> {
         let (physical, queue_family, device_name) = pick_device(&instance, window)?;
         let ifn = &instance.fns;
@@ -808,7 +1048,17 @@ impl VkRenderer {
             queueCount: 1,
             pQueuePriorities: &priority,
         };
-        let extensions = [KHR_SWAPCHAIN.as_ptr()];
+        let extensions: Vec<*const u8> = if window {
+            vec![KHR_SWAPCHAIN.as_ptr()]
+        } else if export {
+            vec![
+                KHR_EXTERNAL_MEMORY.as_ptr(),
+                KHR_EXTERNAL_MEMORY_FD.as_ptr(),
+                EXT_EXTERNAL_MEMORY_DMA_BUF.as_ptr(),
+            ]
+        } else {
+            Vec::new()
+        };
         let info = VkDeviceCreateInfo {
             sType: ST_DEVICE_CREATE_INFO,
             pNext: null(),
@@ -817,7 +1067,7 @@ impl VkRenderer {
             pQueueCreateInfos: &queue_info,
             enabledLayerCount: 0,
             ppEnabledLayerNames: null(),
-            enabledExtensionCount: if window { 1 } else { 0 },
+            enabledExtensionCount: extensions.len() as u32,
             ppEnabledExtensionNames: extensions.as_ptr(),
             pEnabledFeatures: null(),
         };
@@ -825,6 +1075,14 @@ impl VkRenderer {
         // SAFETY: `info` and what it points to live across the call.
         check("vkCreateDevice", unsafe {
             (ifn.create_device)(physical, &info, null(), &mut device)
+        })
+        .map_err(|e| match e {
+            // A driver without the export extensions says so here.
+            Error::Vulkan {
+                code: VK_ERROR_EXTENSION_NOT_PRESENT,
+                ..
+            } if export => Error::Unsupported(NO_EXPORT),
+            e => e,
         })?;
         let gdpa = ifn.get_device_proc_addr;
         // SAFETY: a live device and NUL-terminated names.
@@ -874,6 +1132,9 @@ impl VkRenderer {
             grid: None,
             offscreen: None,
             window: None,
+            exports: Vec::new(),
+            export_fns: None,
+            sink: None,
             needs_draw: true,
             drawn: false,
             instance,
@@ -1252,6 +1513,7 @@ impl VkRenderer {
             h,
             FORMAT_R8_UNORM,
             IMAGE_USAGE_TRANSFER_DST_BIT | IMAGE_USAGE_SAMPLED_BIT,
+            false,
         )?;
         self.atlas_image = image;
         self.atlas_memory = memory;
@@ -1306,8 +1568,14 @@ impl VkRenderer {
     }
 
     fn make_offscreen(&self, width: u32, height: u32) -> Result<Offscreen, Error> {
+        self.make_target(width, height, false)
+    }
+
+    /// A colour target: one read back through a buffer, or (`export`) one
+    /// whose memory can leave the process as a dmabuf and needs no buffer.
+    fn make_target(&self, width: u32, height: u32, export: bool) -> Result<Offscreen, Error> {
         let mut o = Offscreen::EMPTY;
-        match self.fill_offscreen(&mut o, width, height) {
+        match self.fill_offscreen(&mut o, width, height, export) {
             Ok(()) => Ok(o),
             Err(e) => {
                 self.free_offscreen(&mut o);
@@ -1316,21 +1584,30 @@ impl VkRenderer {
         }
     }
 
-    fn fill_offscreen(&self, o: &mut Offscreen, width: u32, height: u32) -> Result<(), Error> {
+    fn fill_offscreen(
+        &self,
+        o: &mut Offscreen,
+        width: u32,
+        height: u32,
+        export: bool,
+    ) -> Result<(), Error> {
         let (image, memory) = self.device_image(
             width,
             height,
             self.format,
             IMAGE_USAGE_COLOR_ATTACHMENT_BIT | IMAGE_USAGE_TRANSFER_SRC_BIT,
+            export,
         )?;
         o.image = image;
         o.memory = memory;
         o.view = self.image_view(image, self.format)?;
         o.framebuffer = self.framebuffer(o.view, width, height)?;
-        o.readback = self.host_buffer(
-            width as u64 * height as u64 * 4,
-            BUFFER_USAGE_TRANSFER_DST_BIT,
-        )?;
+        if !export {
+            o.readback = self.host_buffer(
+                width as u64 * height as u64 * 4,
+                BUFFER_USAGE_TRANSFER_DST_BIT,
+            )?;
+        }
         Ok(())
     }
 
@@ -1868,14 +2145,28 @@ impl VkRenderer {
     }
 
     /// Allocate memory for `req`, trying each property set in `prefs` in turn.
-    fn allocate(&self, req: &VkMemoryRequirements, prefs: &[VkFlags]) -> Result<u64, Error> {
+    fn allocate(
+        &self,
+        req: &VkMemoryRequirements,
+        prefs: &[VkFlags],
+        export: bool,
+    ) -> Result<u64, Error> {
+        let exported = VkExportMemoryAllocateInfo {
+            sType: ST_EXPORT_MEMORY_ALLOCATE_INFO,
+            pNext: null(),
+            handleTypes: EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT,
+        };
         let index = prefs
             .iter()
             .find_map(|&p| self.memory_type(req.memoryTypeBits, p))
             .ok_or(Error::Unsupported("no suitable memory type"))?;
         let info = VkMemoryAllocateInfo {
             sType: ST_MEMORY_ALLOCATE_INFO,
-            pNext: null(),
+            pNext: if export {
+                (&exported as *const VkExportMemoryAllocateInfo).cast()
+            } else {
+                null()
+            },
             allocationSize: req.size,
             memoryTypeIndex: index,
         };
@@ -1909,7 +2200,7 @@ impl VkRenderer {
             let mut req = VkMemoryRequirements::default();
             unsafe { (self.dev.get_buffer_memory_requirements)(self.device, b.buffer, &mut req) };
             let host = MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT;
-            b.memory = self.allocate(&req, &[host])?;
+            b.memory = self.allocate(&req, &[host], false)?;
             check("vkBindBufferMemory", unsafe {
                 (self.dev.bind_buffer_memory)(self.device, b.buffer, b.memory, 0)
             })?;
@@ -1947,10 +2238,22 @@ impl VkRenderer {
         height: u32,
         format: VkEnum,
         usage: VkFlags,
+        export: bool,
     ) -> Result<(VkImage, VkDeviceMemory), Error> {
+        // An exported image is laid out row by row, so whoever receives it
+        // needs only its row length to read it.
+        let external = VkExternalMemoryImageCreateInfo {
+            sType: ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+            pNext: null(),
+            handleTypes: EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT,
+        };
         let info = VkImageCreateInfo {
             sType: ST_IMAGE_CREATE_INFO,
-            pNext: null(),
+            pNext: if export {
+                (&external as *const VkExternalMemoryImageCreateInfo).cast()
+            } else {
+                null()
+            },
             flags: 0,
             imageType: IMAGE_TYPE_2D,
             format,
@@ -1962,7 +2265,11 @@ impl VkRenderer {
             mipLevels: 1,
             arrayLayers: 1,
             samples: SAMPLE_COUNT_1_BIT,
-            tiling: IMAGE_TILING_OPTIMAL,
+            tiling: if export {
+                IMAGE_TILING_LINEAR
+            } else {
+                IMAGE_TILING_OPTIMAL
+            },
             usage,
             sharingMode: SHARING_MODE_EXCLUSIVE,
             queueFamilyIndexCount: 0,
@@ -1977,7 +2284,7 @@ impl VkRenderer {
         let mut req = VkMemoryRequirements::default();
         unsafe { (self.dev.get_image_memory_requirements)(self.device, image, &mut req) };
         let bound = self
-            .allocate(&req, &[MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0])
+            .allocate(&req, &[MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0], export)
             .and_then(|memory| {
                 // SAFETY: a fresh image and allocation sized by its
                 // requirements.
@@ -2081,6 +2388,9 @@ impl Drop for VkRenderer {
                 (self.dev.destroy_semaphore)(d, w.image_available, null());
             }
             if let Some(mut o) = self.offscreen.take() {
+                self.free_offscreen(&mut o);
+            }
+            for mut o in std::mem::take(&mut self.exports) {
                 self.free_offscreen(&mut o);
             }
             let mut instances = std::mem::replace(&mut self.instances, HostBuffer::EMPTY);
@@ -2253,17 +2563,22 @@ impl VkWindow {
         #[cfg(windows)]
         let made =
             unsafe { VkRenderer::for_window(window.hinstance(), window.hwnd(), w, h, atlas, mode) };
-        // Vulkan's own Wayland surface takes the C library's display and
-        // the driver calls that library on it; foldwave speaks Wayland with
-        // its own. Until Vulkan frames are handed to the compositor directly
-        // (as dmabufs), a window on Linux is drawn by the CPU renderer, and
-        // a caller that falls back to it does so here.
+        // Vulkan's own Wayland surface takes the C library's display, which
+        // foldwave does not load. The renderer draws into images of its own
+        // and the window hands them to the compositor as dmabufs. Either
+        // side may refuse (a driver that cannot export, a compositor
+        // without dmabufs); the window then comes back for the CPU renderer.
         #[cfg(target_os = "linux")]
         let made: Result<VkRenderer, Error> = {
-            let _ = (w, h, atlas, mode);
-            Err(Error::Unsupported(
-                "a Vulkan frame in a Wayland window (not built yet); use the CPU renderer",
-            ))
+            let _ = mode;
+            VkRenderer::exporting(w, h, atlas, EXPORT_IMAGES).and_then(|mut renderer| {
+                let frames = renderer.frames()?;
+                let sink = window.gpu_frames(frames).map_err(|_| {
+                    Error::Unsupported("the compositor did not take Vulkan frames as dmabufs")
+                })?;
+                renderer.set_sink(Box::new(sink));
+                Ok(renderer)
+            })
         };
         match made {
             Ok(renderer) => Ok(VkWindow { renderer, window }),
