@@ -48,14 +48,25 @@ pub const EVERY_IDLE: Duration = Duration::from_secs(10);
 /// is tried again (ctl off, or not up yet): 10 s at [`EVERY`].
 pub const CTL_RETRY_LOOKS: u32 = 5;
 
-/// The folder atrium keeps its sessions in: `ATRIUM_STATE_DIR`, else
-/// `%LOCALAPPDATA%\atrium\sessions` (atrium's `session_store::root_from`).
+/// The folder atrium keeps its sessions in, by atrium's own rule
+/// (`session_store::root_from`): `ATRIUM_STATE_DIR`, else
+/// `%LOCALAPPDATA%\atrium\sessions` on Windows; elsewhere `atrium/sessions`
+/// under `$XDG_STATE_HOME` when that is an absolute path, else under
+/// `~/.local/state`.
 pub fn sessions_root(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     let set = |k: &str| var(k).filter(|v| !v.is_empty());
     if let Some(dir) = set("ATRIUM_STATE_DIR") {
         return Some(PathBuf::from(dir));
     }
-    set("LOCALAPPDATA").map(|d| PathBuf::from(d).join("atrium").join("sessions"))
+    let base = if cfg!(windows) {
+        set("LOCALAPPDATA").map(PathBuf::from)
+    } else {
+        set("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| set("HOME").map(|h| PathBuf::from(h).join(".local").join("state")))
+    };
+    base.map(|d| d.join("atrium").join("sessions"))
 }
 
 /// A running atrium: its process, its snapshot and the bus file beside it.
@@ -608,22 +619,42 @@ mod tests {
                     .map(|(_, v)| OsString::from(*v))
             }
         };
+        // The override wins everywhere, and an empty one is ignored, as
+        // atrium does.
         assert_eq!(
-            sessions_root(env(&[("LOCALAPPDATA", r"C:\Users\u\AppData\Local")])),
-            Some(PathBuf::from(r"C:\Users\u\AppData\Local\atrium\sessions"))
+            sessions_root(env(&[("ATRIUM_STATE_DIR", "over"), ("HOME", "/h")])),
+            Some(PathBuf::from("over"))
         );
-        assert_eq!(
-            sessions_root(env(&[
-                ("ATRIUM_STATE_DIR", r"D:\s"),
-                ("LOCALAPPDATA", r"C:\x")
-            ])),
-            Some(PathBuf::from(r"D:\s"))
-        );
-        assert_eq!(
-            sessions_root(env(&[("ATRIUM_STATE_DIR", ""), ("LOCALAPPDATA", r"C:\x")])),
-            Some(PathBuf::from(r"C:\x\atrium\sessions")),
-            "an empty override is ignored, as atrium does"
-        );
+        let under = |base: &str| PathBuf::from(base).join("atrium").join("sessions");
+        if cfg!(windows) {
+            assert_eq!(
+                sessions_root(env(&[("LOCALAPPDATA", r"C:\Users\u\AppData\Local")])),
+                Some(PathBuf::from(r"C:\Users\u\AppData\Local\atrium\sessions"))
+            );
+            assert_eq!(
+                sessions_root(env(&[("ATRIUM_STATE_DIR", ""), ("LOCALAPPDATA", r"C:\x")])),
+                Some(under(r"C:\x"))
+            );
+        } else {
+            assert_eq!(
+                sessions_root(env(&[("XDG_STATE_HOME", "/state"), ("HOME", "/h")])),
+                Some(under("/state"))
+            );
+            assert_eq!(
+                sessions_root(env(&[("HOME", "/h")])),
+                Some(under("/h/.local/state"))
+            );
+            assert_eq!(
+                sessions_root(env(&[("XDG_STATE_HOME", "relative"), ("HOME", "/h")])),
+                Some(under("/h/.local/state")),
+                "a relative XDG_STATE_HOME is invalid and ignored"
+            );
+            assert_eq!(
+                sessions_root(env(&[("ATRIUM_STATE_DIR", ""), ("HOME", "/h")])),
+                Some(under("/h/.local/state"))
+            );
+            assert_eq!(sessions_root(env(&[])), None);
+        }
     }
 
     #[test]

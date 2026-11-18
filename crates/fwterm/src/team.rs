@@ -399,10 +399,17 @@ pub fn main(args: &[String]) -> u8 {
     outcome.code
 }
 
-/// Where the shim lives: `%LOCALAPPDATA%\foldwave\shim`, beside the settings.
+/// Where the shim lives: `shim` beside the settings
+/// (`%LOCALAPPDATA%\foldwave\shim`, `~/.local/share/foldwave/shim`).
 pub fn shim_dir(app: &Path) -> PathBuf {
     app.join("shim")
 }
+
+/// The shim's file name: what Claude Code looks for on `PATH`.
+pub const SHIM_NAME: &str = if cfg!(windows) { "tmux.exe" } else { "tmux" };
+
+/// What separates the folders of `PATH`.
+const PATH_SEPARATOR: char = if cfg!(windows) { ';' } else { ':' };
 
 /// Make `<app>\shim\tmux.exe` a current copy of `exe` (fwterm itself): a hard
 /// link when the volume allows, a copy otherwise; refreshed when fwterm
@@ -411,7 +418,7 @@ pub fn shim_dir(app: &Path) -> PathBuf {
 pub fn ensure_shim(exe: &Path, app: &Path) -> Result<PathBuf, String> {
     let dir = shim_dir(app);
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let shim = dir.join("tmux.exe");
+    let shim = dir.join(SHIM_NAME);
     let want = std::fs::metadata(exe).map_err(|e| format!("{}: {e}", exe.display()))?;
     if let Ok(have) = std::fs::metadata(&shim) {
         let same = have.len() == want.len() && have.modified().ok() == want.modified().ok();
@@ -452,7 +459,7 @@ pub fn pane_env(
     let mut new_path = dir.to_string_lossy().into_owned();
     if let Some(old) = path.map(|p| p.to_string_lossy()) {
         if !old.is_empty() {
-            new_path.push(';');
+            new_path.push(PATH_SEPARATOR);
             new_path.push_str(&old);
         }
     }
@@ -508,10 +515,12 @@ pub fn version_at_least(version_output: &str, min: (u64, u64, u64)) -> bool {
 
 /// Whether `argv` starts Claude Code.
 pub fn is_claude(argv: &[String]) -> bool {
+    // The file name whichever way the path is written: a Windows path is
+    // still one when this is tested elsewhere.
     argv.first().is_some_and(|a| {
-        Path::new(a)
-            .file_stem()
-            .is_some_and(|st| st.eq_ignore_ascii_case("claude"))
+        let file = a.rsplit(['\\', '/']).next().unwrap_or(a);
+        let stem = file.rsplit_once('.').map_or(file, |(stem, _)| stem);
+        stem.eq_ignore_ascii_case("claude")
     })
 }
 
@@ -667,20 +676,32 @@ mod tests {
 
     #[test]
     fn the_pane_env_leads_path_with_the_shim_or_sets_nothing() {
-        let shim = Path::new(r"C:\u\AppData\Local\foldwave\shim\tmux.exe");
-        let env = pane_env(4242, 3, "abc", Some(shim), Some(OsStr::new(r"C:\bin")));
+        let dir = Path::new("base").join("foldwave").join("shim");
+        let shim = dir.join(SHIM_NAME);
+        let shim = shim.as_path();
+        let dir = dir.display().to_string();
+        let env = pane_env(4242, 3, "abc", Some(shim), Some(OsStr::new("bin")));
         let get = |k: &str| {
             env.iter()
                 .find(|(key, _)| key == k)
                 .map(|(_, v)| v.as_str())
         };
-        assert_eq!(get("TMUX"), Some(r"\\.\pipe\foldwave-ctl-4242,4242,0"));
+        // The address of the window's channel: a pipe on Windows, a socket
+        // elsewhere.
+        assert_eq!(
+            get("TMUX"),
+            Some(format!("{},4242,0", address(4242)).as_str())
+        );
+        if cfg!(windows) {
+            assert_eq!(get("TMUX"), Some(r"\\.\pipe\foldwave-ctl-4242,4242,0"));
+        }
         assert_eq!(get("TMUX_PANE"), Some("%3"));
         assert_eq!(get("FOLDWAVE_TOKEN"), Some("abc"));
         assert_eq!(get("CLAUDE_CODE_TMUX_TRUECOLOR"), Some("1"));
         assert_eq!(
             get("PATH"),
-            Some(r"C:\u\AppData\Local\foldwave\shim;C:\bin")
+            Some(format!("{dir}{PATH_SEPARATOR}bin").as_str()),
+            "the shim's folder leads, with this system's separator"
         );
         assert_eq!(env.len(), 5);
         let no_old = pane_env(1, 0, "t", Some(shim), None);
@@ -689,7 +710,7 @@ mod tests {
                 .iter()
                 .find(|(k, _)| k == "PATH")
                 .map(|(_, v)| v.as_str()),
-            Some(r"C:\u\AppData\Local\foldwave\shim")
+            Some(dir.as_str())
         );
         assert!(
             pane_env(1, 0, "t", None, None).is_empty(),
@@ -708,7 +729,7 @@ mod tests {
         let exe = root.join("fwterm.exe");
         std::fs::write(&exe, b"one").unwrap();
         let shim = ensure_shim(&exe, &root).unwrap();
-        assert_eq!(shim, root.join("shim").join("tmux.exe"));
+        assert_eq!(shim, root.join("shim").join(SHIM_NAME));
         assert_eq!(std::fs::read(&shim).unwrap(), b"one");
         // A changed binary is placed anew; an unchanged one is kept.
         std::thread::sleep(std::time::Duration::from_millis(20));

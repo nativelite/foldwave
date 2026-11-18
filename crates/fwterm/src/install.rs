@@ -444,6 +444,9 @@ mod tests {
         d
     }
 
+    // The Windows installer: its paths, shortcut and registry entry are
+    // Windows' own, so this runs where they mean something.
+    #[cfg(windows)]
     #[test]
     fn places_and_the_setup_name() {
         let p = places(
@@ -524,6 +527,9 @@ mod tests {
         assert!(shortcut(r"\\server\share\x.exe", "", "", "").is_err());
     }
 
+    // The Windows installer: its paths, shortcut and registry entry are
+    // Windows' own, so this runs where they mean something.
+    #[cfg(windows)]
     #[test]
     fn the_uninstall_entry_escapes_paths_and_counts_kib() {
         let p = places(Path::new(r"C:\L"), Path::new(r"C:\R"), Path::new(r"C:\H"));
@@ -537,6 +543,9 @@ mod tests {
         assert_eq!(&reg_bytes("W")[..4], &[0xFF, 0xFE, b'W', 0]);
     }
 
+    // The Windows installer: its paths, shortcut and registry entry are
+    // Windows' own, so this runs where they mean something.
+    #[cfg(windows)]
     #[test]
     fn install_copies_moves_a_changed_file_aside_and_uninstall_removes_only_its_own() {
         let root = scratch("cycle");

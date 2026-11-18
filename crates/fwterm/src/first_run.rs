@@ -24,11 +24,87 @@ pub struct Shell {
     pub marks: bool,
 }
 
-/// The shells on this machine, the likeliest first: PowerShell 7, Windows
-/// PowerShell, Command Prompt, Git Bash, WSL. `var` reads an environment
-/// variable and `exists` says whether a file is there. Never empty: with
-/// nothing found, Command Prompt by name.
+/// The shells on this machine, the likeliest first. `var` reads an
+/// environment variable and `exists` says whether a file is there. Never
+/// empty.
 pub fn find_shells(
+    var: &dyn Fn(&str) -> Option<String>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Vec<Shell> {
+    if cfg!(windows) {
+        find_shells_windows(var, exists)
+    } else {
+        find_shells_unix(var, exists)
+    }
+}
+
+/// On Linux and other Unix systems: the user's own shell (`$SHELL`) first,
+/// then the others found on `PATH`, each saved by name so `PATH` finds it
+/// again. None marks its prompts for fwterm; each can be taught to (OSC 133)
+/// in its own configuration. With nothing found, `/bin/sh`.
+pub fn find_shells_unix(
+    var: &dyn Fn(&str) -> Option<String>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Vec<Shell> {
+    /// File name, the name shown, and the arguments it is started with.
+    const KNOWN: [(&str, &str, &str); 7] = [
+        ("bash", "Bash", ""),
+        ("zsh", "Zsh", ""),
+        ("fish", "fish", ""),
+        ("nu", "Nushell", ""),
+        ("pwsh", "PowerShell", "-NoLogo"),
+        ("dash", "dash", ""),
+        ("sh", "sh", ""),
+    ];
+    let path = var("PATH").unwrap_or_default();
+    let on_path = |exe: &str| {
+        path.split(':')
+            .filter(|d| !d.is_empty())
+            .any(|d| exists(&Path::new(d).join(exe)))
+    };
+    let command = |exe: &str, args: &str| {
+        if args.is_empty() {
+            quote(exe)
+        } else {
+            format!("{} {args}", quote(exe))
+        }
+    };
+    let mut out: Vec<Shell> = Vec::new();
+    // The user's own, by its full path: it is what they chose to log in to.
+    let own = var("SHELL").filter(|s| !s.is_empty() && exists(Path::new(s)));
+    let own_file = own
+        .as_deref()
+        .and_then(|s| Path::new(s).file_name()?.to_str().map(str::to_string));
+    if let Some(own) = &own {
+        let known = KNOWN.iter().find(|k| Some(k.0) == own_file.as_deref());
+        out.push(Shell {
+            name: known.map_or("Your shell", |k| k.1),
+            command: command(own, known.map_or("", |k| k.2)),
+            marks: false,
+        });
+    }
+    for (exe, name, args) in KNOWN {
+        if Some(exe) != own_file.as_deref() && on_path(exe) {
+            out.push(Shell {
+                name,
+                command: command(exe, args),
+                marks: false,
+            });
+        }
+    }
+    if out.is_empty() {
+        out.push(Shell {
+            name: "sh",
+            command: "/bin/sh".into(),
+            marks: false,
+        });
+    }
+    out
+}
+
+/// On Windows: PowerShell 7, Windows PowerShell, Command Prompt, Git Bash,
+/// WSL. With nothing found, Command Prompt by name.
+pub fn find_shells_windows(
     var: &dyn Fn(&str) -> Option<String>,
     exists: &dyn Fn(&Path) -> bool,
 ) -> Vec<Shell> {
@@ -36,12 +112,16 @@ pub fn find_shells(
     let programs = var("ProgramFiles").unwrap_or_else(|| "C:\\Program Files".into());
     // Found on PATH: saved by name, so PATH finds it again at launch (a
     // Store install's folder carries its version and moves on update).
+    // Windows paths are put together as text, backslash and all, so this
+    // reads the same wherever it is built and tested.
+    let under =
+        |dir: &str, rest: &str| PathBuf::from(format!("{}\\{rest}", dir.trim_end_matches('\\')));
     let on_path = |exe: &str| {
         var("PATH")
             .unwrap_or_default()
             .split(';')
             .filter(|d| !d.trim().is_empty())
-            .any(|d| exists(&Path::new(d.trim()).join(exe)))
+            .any(|d| exists(&under(d.trim(), exe)))
             .then(|| PathBuf::from(exe))
     };
     let at = |p: PathBuf| exists(&p).then_some(p);
@@ -63,34 +143,32 @@ pub fn find_shells(
     };
     add(
         "PowerShell 7",
-        on_path("pwsh.exe").or_else(|| at(Path::new(&programs).join("PowerShell\\7\\pwsh.exe"))),
+        on_path("pwsh.exe").or_else(|| at(under(&programs, "PowerShell\\7\\pwsh.exe"))),
         "-NoLogo",
         false,
     );
     add(
         "Windows PowerShell",
-        at(Path::new(&system).join("System32\\WindowsPowerShell\\v1.0\\powershell.exe")),
+        at(under(
+            &system,
+            "System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        )),
         "-NoLogo",
         false,
     );
     add(
         "Command Prompt",
-        at(Path::new(&system).join("System32\\cmd.exe")),
+        at(under(&system, "System32\\cmd.exe")),
         "",
         true,
     );
     add(
         "Git Bash",
-        at(Path::new(&programs).join("Git\\bin\\bash.exe")),
+        at(under(&programs, "Git\\bin\\bash.exe")),
         "--login -i",
         false,
     );
-    add(
-        "WSL",
-        at(Path::new(&system).join("System32\\wsl.exe")),
-        "",
-        false,
-    );
+    add("WSL", at(under(&system, "System32\\wsl.exe")), "", false);
     if out.is_empty() {
         out.push(Shell {
             name: "Command Prompt",
@@ -99,6 +177,15 @@ pub fn find_shells(
         });
     }
     out
+}
+
+/// Where logs go when no drive is chosen, as this system names it.
+fn default_logs() -> &'static str {
+    if cfg!(windows) {
+        "%LOCALAPPDATA%\\foldwave\\logs"
+    } else {
+        "~/.local/share/foldwave/logs"
+    }
 }
 
 /// `s` in double quotes when it holds a space.
@@ -682,7 +769,7 @@ pub fn render(fr: &FirstRun, w: usize, h: usize) -> Vec<Vec<Cell>> {
                 }
                 Some(d) => format!("Logs go to {}", d.display()),
                 None => {
-                    "Logs go to %LOCALAPPDATA%\\foldwave\\logs until a drive is measured".into()
+                    format!("Logs go to {} until a drive is measured", default_logs())
                 }
             };
             for l in wrap(&whither, width).into_iter().take(2) {
@@ -797,7 +884,7 @@ mod tests {
             "PATH" => Some("C:\\Windows\\System32;C:\\Program Files\\PowerShell\\7".to_string()),
             _ => None,
         };
-        find_shells(&var, &|p: &Path| files.contains(p))
+        find_shells_windows(&var, &|p: &Path| files.contains(p))
     }
 
     fn drives() -> Vec<Drive> {
@@ -807,7 +894,16 @@ mod tests {
             total: 1000 * GB,
             probe: Probe::Waiting,
         };
-        vec![d("C:\\", 50 * GB), d("D:\\", 400 * GB), d("E:\\", 364 * GB)]
+        if cfg!(windows) {
+            vec![d("C:\\", 50 * GB), d("D:\\", 400 * GB), d("E:\\", 364 * GB)]
+        } else {
+            vec![d("/", 50 * GB), d("/data", 400 * GB), d("/fast", 364 * GB)]
+        }
+    }
+
+    /// Where the third drive's logs go, as this platform writes the path.
+    fn logs_on_third() -> PathBuf {
+        drives()[2].root.join("foldwave").join("logs")
     }
 
     fn first_run() -> FirstRun {
@@ -839,7 +935,7 @@ mod tests {
         // Not on PATH: its usual folder, in full.
         let bare = |k: &str| (k != "PATH").then(|| "C:\\Program Files".to_string());
         let files = [PathBuf::from("C:\\Program Files\\PowerShell\\7\\pwsh.exe")];
-        let s2 = find_shells(&bare, &|p: &Path| files.iter().any(|f| f == p));
+        let s2 = find_shells_windows(&bare, &|p: &Path| files.iter().any(|f| f == p));
         assert_eq!(
             s2[0].command,
             "\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -NoLogo"
@@ -847,8 +943,54 @@ mod tests {
         assert!(s[2].marks && !s[0].marks, "only cmd marks its own prompts");
         assert_eq!(split_command("  cmd.exe  "), ["cmd.exe"]);
         assert_eq!(split_command("a \"\" b"), ["a", "", "b"]);
-        let none = find_shells(&|_| None, &|_| false);
+        let none = find_shells_windows(&|_| None, &|_| false);
         assert_eq!(none[0].command, "cmd.exe", "never empty");
+    }
+
+    #[test]
+    fn unix_shells_are_the_users_own_then_the_others_on_path() {
+        let files: HashSet<PathBuf> = [
+            "/usr/bin/bash",
+            "/usr/bin/zsh",
+            "/usr/local/bin/fish",
+            "/bin/sh",
+            "/opt/odd shell/xsh",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        let exists = |p: &Path| files.contains(p);
+        let var = |k: &str| match k {
+            "SHELL" => Some("/usr/bin/zsh".to_string()),
+            "PATH" => Some("/usr/local/bin:/usr/bin::/bin".to_string()),
+            _ => None,
+        };
+        let s = find_shells_unix(&var, &exists);
+        let names: Vec<_> = s.iter().map(|s| s.name).collect();
+        assert_eq!(names, ["Zsh", "Bash", "fish", "sh"], "the user's own first");
+        assert_eq!(s[0].command, "/usr/bin/zsh", "their own by its path");
+        assert_eq!(s[1].command, "bash", "the others by name");
+        assert!(s.iter().all(|s| !s.marks), "none marks its own prompts");
+
+        // A shell this list does not know is still the user's own, and a
+        // path with a space is quoted so it splits back whole.
+        let odd = |k: &str| match k {
+            "SHELL" => Some("/opt/odd shell/xsh".to_string()),
+            "PATH" => Some("/bin".to_string()),
+            _ => None,
+        };
+        let s = find_shells_unix(&odd, &exists);
+        assert_eq!((s[0].name, s[1].name), ("Your shell", "sh"));
+        assert_eq!(split_command(&s[0].command), ["/opt/odd shell/xsh"]);
+
+        // A SHELL that is not there is not offered; nothing at all: /bin/sh.
+        let gone = |k: &str| (k == "SHELL").then(|| "/nowhere/zsh".to_string());
+        let s = find_shells_unix(&gone, &|_| false);
+        assert_eq!(
+            (s.len(), s[0].command.as_str()),
+            (1, "/bin/sh"),
+            "never empty"
+        );
     }
 
     #[test]
@@ -867,7 +1009,7 @@ mod tests {
         f.cap_gib = 40;
         assert!(!f.has_room(&f.drives[0].clone()));
         assert_eq!(f.chosen(), Some(2), "C: is too full for 40 GB");
-        assert_eq!(f.log_dir(), Some(PathBuf::from("E:\\foldwave\\logs")));
+        assert_eq!(f.log_dir(), Some(logs_on_third()));
         f.picked = Some(1);
         assert_eq!(f.chosen(), Some(1), "a pick wins");
         f.update(1, Probe::Failed("access denied".into()));
@@ -919,7 +1061,7 @@ mod tests {
             v,
             [
                 ("shell", Some("C:\\Windows\\System32\\cmd.exe".into())),
-                ("log_dir", Some("E:\\foldwave\\logs".into())),
+                ("log_dir", Some(logs_on_third().display().to_string())),
                 ("log_cap_gib", Some("3".into())),
                 ("theme", Some("classic".into())),
                 ("instruments", Some("off".into())),
@@ -955,7 +1097,10 @@ mod tests {
         let Action::Finish(v) = f.key(Key::Enter) else {
             panic!("finishes");
         };
-        assert_eq!(v[1], ("log_dir", Some("E:\\foldwave\\logs".into())));
+        assert_eq!(
+            v[1],
+            ("log_dir", Some(logs_on_third().display().to_string()))
+        );
     }
 
     #[test]
@@ -1003,7 +1148,8 @@ mod tests {
         let s = all(&g);
         assert!(s.contains("Where should pane logs live?"), "{s}");
         assert!(s.contains("MEASURING") && s.contains("WAITING"), "{s}");
-        assert!(s.contains("(•) E:\\") && s.contains("FASTEST"), "{s}");
+        let third = format!("(•) {}", drives()[2].root.display());
+        assert!(s.contains(&third) && s.contains("FASTEST"), "{s}");
         assert!(s.contains("451 MiB/s durable · p99 2.8 ms"), "{s}");
         assert!(
             g.iter().flatten().any(|c| c.1 == Paint::Meter)
@@ -1012,7 +1158,10 @@ mod tests {
         );
         assert!(s.contains("‹ 10 › GB of logs"), "{s}");
         assert!(
-            s.contains("Logs go to E:\\foldwave\\logs (fastest so far)"),
+            s.contains(&format!(
+                "Logs go to {} (fastest so far)",
+                logs_on_third().display()
+            )),
             "{s}"
         );
         f.key(Key::Enter);
