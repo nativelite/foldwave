@@ -233,11 +233,19 @@ fn probe_events() {
     let mut presenter = CpuPresenter::new();
     presenter.present(&window, &cpu, 0..h).expect("present");
     let mut events = Vec::new();
-    let end = Instant::now() + Duration::from_secs(6);
+    let end = Instant::now() + Duration::from_secs(10);
     while Instant::now() < end {
         window.wait(Some(Duration::from_millis(100)), &mut events);
         for e in events.drain(..) {
             println!("event: {e:?}");
+            // `c` copies and `v` reads the clipboard, to try both ways
+            // against `wl-paste` and `wl-copy`.
+            if e == Event::Char('c') {
+                println!("copy: {:?}", window.set_clipboard("copied from foldwave ✓"));
+            }
+            if e == Event::Char('v') {
+                println!("clipboard: {:?}", window.clipboard());
+            }
             if let Event::Resized(w, h) = e {
                 let cpu = CpuRenderer::new(w, h);
                 presenter.present(&window, &cpu, 0..h).expect("present");

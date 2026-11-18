@@ -29,8 +29,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use wayland::protocol::wayland::{
-    wl_buffer, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm, WlBuffer, WlCompositor,
-    WlKeyboard, WlPointer, WlRegistry, WlSeat, WlShm, WlSurface,
+    wl_buffer, wl_data_device, wl_data_offer, wl_data_source, wl_keyboard, wl_pointer, wl_registry,
+    wl_seat, wl_shm, WlBuffer, WlCompositor, WlDataDevice, WlDataDeviceManager, WlDataOffer,
+    WlDataSource, WlKeyboard, WlPointer, WlRegistry, WlSeat, WlShm, WlSurface,
 };
 use wayland::protocol::xdg_shell::{
     xdg_surface, xdg_toplevel, xdg_wm_base, XdgSurface, XdgToplevel, XdgWmBase,
@@ -69,6 +70,18 @@ const DOUBLE_CLICK_PX: i32 = 4;
 /// The versions bound, no higher than this code handles.
 const COMPOSITOR_VERSION: u32 = 4;
 const SEAT_VERSION: u32 = 5;
+const DATA_DEVICE_VERSION: u32 = 3;
+/// The names text goes by on the clipboard, best first: UTF-8 by its
+/// proper name, then what older programs ask for.
+const TEXT_TYPES: [&str; 4] = [
+    "text/plain;charset=utf-8",
+    "UTF8_STRING",
+    "text/plain",
+    "STRING",
+];
+/// The most clipboard text read, and the longest wait for it.
+const CLIPBOARD_LIMIT: u64 = 64 << 20;
+const CLIPBOARD_WAIT: Duration = Duration::from_secs(2);
 
 /// Shift, Ctrl and Alt as the keyboard last reported them, for
 /// [`shift_down`] and the others, which take no window.
@@ -273,6 +286,18 @@ struct Inner {
     last_click: Option<(Instant, i32, i32)>,
     /// Buffers the compositor has finished with, for the presenter.
     released: Vec<u32>,
+    /// The clipboard: this seat's data device, when the compositor has one.
+    data_manager: Option<WlDataDeviceManager>,
+    data_device: Option<WlDataDevice>,
+    /// The serial of the last key or click, which setting the clipboard
+    /// must name: only a program the user is using may set it.
+    serial: u32,
+    /// What this window put on the clipboard, while it is still there.
+    copied: Option<(WlDataSource, Arc<str>)>,
+    /// Offers the compositor has introduced, each with the types it has.
+    offers: Vec<(WlDataOffer, Vec<String>)>,
+    /// The offer that is the clipboard now, if another program set it.
+    selection: Option<WlDataOffer>,
     /// The connection failed; said once, as a close request.
     lost: bool,
 }
@@ -327,7 +352,8 @@ impl Inner {
 
     /// Turn one protocol event into window events and replies.
     fn handle(&mut self, event: wayland::Event) -> Result<(), wayland::Error> {
-        let is = |id: Option<u32>| id == Some(event.object);
+        let object = event.object;
+        let is = |id: Option<u32>| id == Some(object);
         if event.is_for(&self.wm_base) {
             let xdg_wm_base::Event::Ping { serial } = xdg_wm_base::Event::decode(event)?;
             self.wm_base.pong(&mut self.conn, serial)?;
@@ -392,6 +418,50 @@ impl Inner {
             self.pointer_event(wl_pointer::Event::decode(event)?);
         } else if is(self.keyboard.map(|k| k.id())) {
             self.keyboard_event(wl_keyboard::Event::decode(event)?);
+        } else if is(self.data_device.map(|d| d.id())) {
+            match wl_data_device::Event::decode(event)? {
+                wl_data_device::Event::DataOffer { id } => self.offers.push((id, Vec::new())),
+                wl_data_device::Event::Selection { id } => {
+                    // The clipboard changed hands: every other offer is over.
+                    for (offer, types) in std::mem::take(&mut self.offers) {
+                        if Some(offer.id()) == id.map(|o| o.id()) {
+                            self.offers.push((offer, types));
+                        } else {
+                            offer.destroy(&mut self.conn)?;
+                        }
+                    }
+                    self.selection = id;
+                }
+                // Dragging things onto the window is not handled.
+                _ => {}
+            }
+        } else if is(self.copied.as_ref().map(|(source, _)| source.id())) {
+            match wl_data_source::Event::decode(event)? {
+                wl_data_source::Event::Send { fd, .. } => {
+                    // Another program is pasting. It reads at its own pace,
+                    // so the text is written on a thread of its own.
+                    let text = self.copied.as_ref().expect("matched above").1.clone();
+                    std::thread::spawn(move || {
+                        let _ = File::from(fd).write_all(text.as_bytes());
+                    });
+                }
+                wl_data_source::Event::Cancelled => {
+                    // Something else is on the clipboard now.
+                    if let Some((source, _)) = self.copied.take() {
+                        source.destroy(&mut self.conn)?;
+                    }
+                }
+                _ => {}
+            }
+        } else if event.interface.name == wl_data_offer::INTERFACE.name {
+            if let wl_data_offer::Event::Offer { mime_type } = wl_data_offer::Event::decode(event)?
+            {
+                // Recorded against its offer; one for an offer already gone
+                // is dropped.
+                if let Some((_, types)) = self.offers.iter_mut().find(|(o, _)| o.id() == object) {
+                    types.push(mime_type);
+                }
+            }
         } else if event.interface.name == wl_buffer::INTERFACE.name {
             self.released.push(event.object);
         }
@@ -427,7 +497,13 @@ impl Inner {
                     self.push(Event::Move(x, y));
                 }
             }
-            P::Button { button, state, .. } if button == BTN_LEFT => {
+            P::Button {
+                button,
+                state,
+                serial,
+                ..
+            } if button == BTN_LEFT => {
+                self.serial = serial;
                 let (x, y) = self.pointer_at.unwrap_or((0, 0));
                 if state != wl_pointer::button_state::PRESSED {
                     self.button_down = false;
@@ -480,7 +556,10 @@ impl Inner {
                 self.keys.mods = 0;
                 MODS.store(0, Ordering::Relaxed);
             }
-            K::Key { key, state, .. } => {
+            K::Key {
+                key, state, serial, ..
+            } => {
+                self.serial = serial;
                 if state == wl_keyboard::key_state::PRESSED {
                     self.key_down(key);
                     let (rate, delay) = self.keys.repeat;
@@ -507,7 +586,7 @@ impl Inner {
                     Duration::from_millis(delay.max(0) as u64),
                 );
             }
-            K::Enter { .. } => {}
+            K::Enter { serial, .. } => self.serial = serial,
         }
     }
 
@@ -542,8 +621,8 @@ impl Inner {
 /// surface needs the C `libwayland-client`, which foldwave does not load),
 /// a title bar where the desktop draws none (GNOME; the window is then a
 /// bare rectangle), sizes on a scaled display (the surface is one pixel a
-/// point, so a desktop scaled to 200 % enlarges it), the clipboard, dropped
-/// files and pointer shapes.
+/// point, so a desktop scaled to 200 % enlarges it), dropped files and
+/// pointer shapes.
 ///
 /// A window is used from the thread that created it; dropping it closes it.
 pub struct Window {
@@ -622,6 +701,17 @@ impl Window {
             None => None,
         };
 
+        let data_manager: Option<WlDataDeviceManager> = match find("wl_data_device_manager") {
+            Some((name, version)) => {
+                Some(registry.bind(&mut conn, name, version.min(DATA_DEVICE_VERSION))?)
+            }
+            None => None,
+        };
+        let data_device = match (data_manager, seat) {
+            (Some(manager), Some(seat)) => Some(manager.get_data_device(&mut conn, seat)?),
+            _ => None,
+        };
+
         let surface = compositor.create_surface(&mut conn)?;
         let xdg = wm_base.get_xdg_surface(&mut conn, surface)?;
         let toplevel = xdg.get_toplevel(&mut conn)?;
@@ -657,6 +747,12 @@ impl Window {
             button_down: false,
             last_click: None,
             released: Vec::new(),
+            data_manager,
+            data_device,
+            serial: 0,
+            copied: None,
+            offers: Vec::new(),
+            selection: None,
             lost: false,
         };
         while !inner.configured {
@@ -745,25 +841,98 @@ impl Window {
     /// Does nothing, as [`Window::set_frame_colors`] set nothing.
     pub fn reset_frame_colors(&self) {}
 
-    /// Fails as unsupported: the clipboard is not built on Linux yet.
-    pub fn set_clipboard(&self, _text: &str) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "the clipboard is not built on Wayland yet",
-        ))
+    /// Put `text` on the clipboard. It stays this window's to hand out: the
+    /// text goes to another program only when that program pastes, so it is
+    /// gone if foldwave closes first, unless the desktop runs a clipboard
+    /// manager, as most do.
+    ///
+    /// A compositor honours this only from the program the user is using:
+    /// with no key or click yet, or no keyboard focus, it is ignored.
+    pub fn set_clipboard(&self, text: &str) -> io::Result<()> {
+        let inner = &mut *self.inner.borrow_mut();
+        let (Some(manager), Some(device)) = (inner.data_manager, inner.data_device) else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the compositor has no clipboard for this seat",
+            ));
+        };
+        let conn = &mut inner.conn;
+        let sent = (|| {
+            let source = manager.create_data_source(conn)?;
+            for kind in TEXT_TYPES {
+                source.offer(conn, kind)?;
+            }
+            device.set_selection(conn, Some(source), inner.serial)?;
+            conn.flush()?;
+            Ok::<_, wayland::Error>(source)
+        })();
+        match sent {
+            Ok(source) => {
+                if let Some((old, _)) = inner.copied.replace((source, text.into())) {
+                    let _ = old.destroy(&mut inner.conn);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                inner.lose();
+                Err(other(e))
+            }
+        }
     }
 
-    /// `None`: the clipboard is not built on Linux yet.
+    /// The clipboard's text, or `None` when it holds none: what this window
+    /// copied, or what another program offers, read from it now. A program
+    /// that does not answer within two seconds is given up on.
     pub fn clipboard(&self) -> io::Result<Option<String>> {
-        Ok(None)
+        let inner = &mut *self.inner.borrow_mut();
+        if let Some((_, text)) = &inner.copied {
+            return Ok(Some(text.to_string()));
+        }
+        let Some(offer) = inner.selection else {
+            return Ok(None);
+        };
+        let types = inner
+            .offers
+            .iter()
+            .find(|(o, _)| o.id() == offer.id())
+            .map_or(&[][..], |(_, types)| &types[..]);
+        let Some(kind) = TEXT_TYPES.iter().find(|k| types.iter().any(|t| t == *k)) else {
+            return Ok(None);
+        };
+        // The other program writes into one end of this pair; ours is read
+        // until it closes its end.
+        let (mut ours, theirs) = UnixStream::pair()?;
+        let asked = offer
+            .receive(&mut inner.conn, kind, theirs.as_fd())
+            .and_then(|()| inner.conn.flush());
+        drop(theirs);
+        if let Err(e) = asked {
+            inner.lose();
+            return Err(other(e));
+        }
+        ours.set_read_timeout(Some(CLIPBOARD_WAIT))?;
+        let mut bytes = Vec::new();
+        match (&mut ours).take(CLIPBOARD_LIMIT).read_to_end(&mut bytes) {
+            Ok(_) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
+            // Silence for too long: whatever arrived is not the whole text.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
     }
 
-    /// Empty, as [`Window::clipboard`].
+    /// Empty: copied files are not read on Linux yet.
     pub fn clipboard_files(&self) -> io::Result<Vec<String>> {
         Ok(Vec::new())
     }
 
-    /// `false`, as [`Window::clipboard`].
+    /// `false`: copied images are not read on Linux yet.
     pub fn clipboard_has_image(&self) -> bool {
         false
     }
