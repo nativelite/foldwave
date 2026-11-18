@@ -2711,7 +2711,7 @@ repositories checked out beside it (`ansi-rs`, `vterm-rs`, `pty-rs`,
 | `fwbench`, `fwprobe` | yes | 109 and 12 pass, after one fix (below) |
 | `fwrender` | yes: frame, atlas, CPU renderer | 30 pass; the Vulkan backend and the window are Windows-only |
 | `fwcuda` | yes | 7 pass (no CUDA driver there) |
-| `fwterm` | not at first: it stopped at `fwrender::win`, the Win32 window. **Yes since the Wayland window, the same day** (below) | 155 pass, 12 fail; all 12 assert Windows paths, shells or the installer (below) |
+| `fwterm` | not at first: it stopped at `fwrender::win`, the Win32 window. **Yes since the Wayland window, the same day** (below) | 165 pass since 2026-11-18 (155 at first, with 12 failing on Windows paths and shells; below) |
 
 So what stood between foldwave and a Linux window was the window itself and
 the parts of `fwterm` that call Win32 directly. The engine underneath
@@ -2848,12 +2848,56 @@ libraries:
 | The Windows build | still type-checks, tests included (`x86_64-pc-windows-gnu`) |
 | With no compositor | the window tests skip and pass |
 
-**What this does not show.** Nobody has looked at it: the compositor was
-headless and no screenshot could be taken (its screenshot tool fails on a
-headless output). No key or click was sent, since nothing there can inject
-them, so input is checked only through its tables. Frame rates under a
-software driver mean nothing. All of it wants a person at a Linux desktop
-with a GPU.
+**Seen, typed into, and four bugs found by it (2026-11-18).** The first
+checks ran on a compositor with no keyboard or pointer at all, so nothing had
+been seen and no key had gone through one. A second compositor closes that:
+sway 1.9 with its headless backend has a seat, takes injected keys (`wtype`),
+has a clipboard other programs reach (`wl-copy`, `wl-paste`) and can be
+photographed (`grim`). fwterm was run on it and looked at:
+
+![fwterm on Linux: a shell typed into, with colours, styles, box drawing and Japanese through a fallback face](img/linux-shell.png)
+
+![The first run on Linux, with the shells found there](img/linux-first-run.png)
+
+| What was done | Result |
+| --- | --- |
+| The first run, start to finish, by keyboard | the shells found (the user's own first), `/` measured at 188 MiB/s durable, settings saved to `fwterm.conf`, fwterm started on them |
+| A shell typed into: commands, their output, colours, bold, italic, underline, box drawing | drawn as on Windows |
+| 409 key events of typed text, with Return, Ctrl+C, arrows and function keys | every character and key arrived, in order |
+| The bytes a program receives for typed box-drawing and CJK characters, and Ctrl+D | exact |
+| Clipboard: another program's text read; ours pasted by another program; a newer copy replacing ours; 400 KB pasted | all correct; in fwterm, Ctrl+V of one line and of several (a bracketed paste) |
+| `python dev.py check` on Linux | green for the first time: fwterm 165 tests, fwrender 48, fwbench 121, resmon 82 |
+
+The bugs, none of which a test without a real seat could have shown:
+
+- **Keys stopped for good once the keyboard had gone once.** A seat can lose
+  its keyboard and gain another (one unplugged and plugged in; a virtual one
+  for each burst of typing). The window kept the object of the one that had
+  gone and never asked for the next. It now lets a device go when the seat
+  says it has, and asks again.
+- **A key was read by where it sits, not what it means.** Return from a
+  virtual keyboard, which numbers its keys its own way, was no key at all.
+  A key's code now comes from its keysym; only a key that types something
+  with no code of its own falls back to its place.
+- **No fallback fonts.** They were looked for by their Windows file names in
+  one flat folder. Linux keeps fonts in folders of their own under a few
+  roots; those are walked, and the first installed Japanese or Chinese,
+  Korean and symbol faces are used. A face with PostScript outlines (most of
+  Noto's CJK files) is still refused by `glyphs`, which is the gap that
+  remains.
+- **A running atrium could never have been found.** fwterm looked for
+  atrium's sessions under `%LOCALAPPDATA%` on Linux; atrium keeps them under
+  `$XDG_STATE_HOME` or `~/.local/state`. It now follows atrium's own rule.
+
+Also made Linux's own that day: the first run's shell list (it offered
+Command Prompt), the shim's name (`tmux`, not `tmux.exe`) and `PATH`'s
+separator. The three tests of the Windows installer are scoped to Windows.
+
+**What this still does not show.** A person has not used it: the keys were
+injected and the screen photographed by a program. No pointer event has gone
+through a compositor (clicks, drags, the wheel are checked only as code). The
+GPU has not drawn a frame (above). Frame rates on a software renderer mean
+nothing. All of it wants a person at a Linux desktop with a GPU.
 
 **Not built on Linux yet:**
 
@@ -2863,9 +2907,10 @@ with a GPU.
 | Frame pacing on Linux | the compositor's frame callbacks; `fifo-v1` and `commit-timing-v1` where offered |
 | A title bar on GNOME, which draws none for an application | our own, drawn in the grid like the strip; or `libdecor` |
 | Sharp text on a scaled display | `fractional-scale-v1` and `viewporter`; today the surface is one pixel a point |
-| Clipboard, dropped files, pointer shapes | `wl_data_device`, `cursor-shape-v1` |
+| Copied files and images on the clipboard, dropped files, pointer shapes | the rest of `wl_data_device`; `cursor-shape-v1` |
+| CJK through faces with PostScript outlines | CFF outlines in `glyphs` |
 | Notifications, taskbar progress | the desktop portal, or nothing |
-| First run's shell list, the installer, the `tmux` shim's name and `PATH` | Linux forms of each: these are the 12 fwterm tests that fail on Linux, each asserting a Windows path, shell or installer file |
+| An installer, a desktop entry and an icon | a `.desktop` file and the icon in the places a desktop looks; today fwterm is run from where it was built |
 | X11 | a second window backend, if wanted |
 | The program outliving a killed window | a cgroup or parent-death signal at spawn (§11 row 24) |
 

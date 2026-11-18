@@ -316,7 +316,8 @@ Nothing above is assumed. These are the calls it needs:
 13. **Where foldwave's folder lives on Linux.** Built as
     `$XDG_DATA_HOME/foldwave`, else `~/.local/share/foldwave`, for settings
     and default logs together; the convention would split them (settings
-    under `~/.config`, logs under `~/.local/state`).
+    under `~/.config`, logs under `~/.local/state`, which is where atrium
+    keeps its sessions).
 14. **A title bar on GNOME.** GNOME draws none for an application. Our own,
     in the grid like the instrument strip, or the `libdecor` library.
 15. ~~Vulkan frames on Linux.~~ **Built 2026-11-18** (design §8.9): Vulkan

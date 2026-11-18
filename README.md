@@ -99,7 +99,7 @@ keyboard read by [`nativelite-xkb`](https://github.com/nativelite/xkb-rs),
 nativelite's own, and the binary links libc alone. The GPU draws the window
 where the driver and the compositor both handle dmabufs (written, and not
 yet run on a real GPU); otherwise the CPU renderer does. What works and what
-does not yet (no clipboard, no title bar on GNOME, no installer) is in
+does not yet (no title bar on GNOME, no installer, no pointer shapes) is in
 [`docs/design.md`](docs/design.md) §8.9.
 
 ## Install (Windows)
